@@ -119,6 +119,10 @@ int main(void){
   for(int i=0;i<512;i++) bits[i] = (i%3)?'0':'1';   // exercise both nibble paths
   bits[512]=0;
 #define CAP 128
+  /* Must be a preprocessor constant, not a const size_t: it sizes a static array below, and a
+     function-scope const is not a constant expression in C. As a variable it becomes a VLA --
+     clang folds it with a warning, gcc rejects it, and the suite then compiles nowhere but
+     clang. */
   /* Canary sits immediately after the buffer; an off-by-one lands on it. */
   static unsigned char guard[CAP+16];
   int bad = 0;

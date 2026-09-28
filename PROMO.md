@@ -1,180 +1,93 @@
 # FOBworks for SGP
 
-This is firmware I wrote for the SGP Card Mini — the May 2026 stock, which is an
-ESP32-S3-MINI-1-N8 with 8 MB of flash and no PSRAM. It uses the CC1101 that is already on the
-card. There is also a Ra-02 SX1278 on there, and the firmware puts it to sleep so the CC1101
-can have the data pin to itself. I wrote it for this board and nothing else.
+This firmware targets the SGP Card Mini stock acquired in May 2026: an ESP32-S3-MINI-1-N8 with 8 MB flash and no PSRAM. It uses the card's CC1101 for sub-GHz work. The board also carries a Ra-02 SX1278. GPIO 48 is connected to the SX1278's DIO0; the CC1101's GDO0 is not routed to a readable GPIO, and putting the SX1278 to sleep does not restore that connection. This firmware targets this board revision only.
 
-When it boots, the card brings up its own network called `SGP Card Mini` and serves a dashboard
-at `http://192.168.4.1`. The access code it wants is printed to USB serial on first boot; the
-same code gets you into the React dashboard, over USB or over WiFi. Both sets of steps are in
-`README.md`.
+The card creates a Wi-Fi network named `SGP Card Mini` and serves its dashboard at `http://192.168.4.1`. At startup, it prints the Wi-Fi credentials and access code over USB serial. The same code is used by the separate React dashboard, which can connect over USB or Wi-Fi. That dashboard is not included in this repository; see `README.md` for the connection steps.
 
-The home screen is a mode picker, and there are four modes. The word "Mode" in the header
-brings the picker back. Holding the user button for three seconds puts the card to sleep, and
-holding it for three seconds wakes it again.
+The home screen lists four modes. Tap **Mode** in the header to return to the list. Hold the user button for 3 seconds to put the card to sleep; hold it again for 3 seconds to wake it.
 
-Two of the four modes are guided attacks that transmit. Those are C1 and C2, the sequencers
-behind FOBcatch and FOBback. I built them so they are hard to set off by accident: each one
-needs an explicit arm, the arm is spent by a single start, and if the preconditions are not met
-it refuses rather than trying to make do.
+FOBcatch and FOBback are guided transmit sequences. C1 and C2 are their respective sequencers. Each requires an explicit arm, consumes it after one shot, and refuses to run if its preconditions are not met.
 
 ## FOBscan
 
-This is the workbench, and most of what the card does lives on its six tabs: capture, sweep,
-decode, prediction, keys, library, and Bluetooth.
+FOBscan is the workbench for capture, sweep, decode, prediction, key management, the signal library, and Bluetooth. These tools are arranged across six tabs.
 
-Capture starts and stops a listen, picks OOK or 2FSK, and shows you the last burst the radio
-heard. Scan walks through the card's channels, or you can lock it to one. Decode is the
-read-out — protocol, serial, button, counter, and whether the frame actually checked. Predict
-shows the next counter the decoder expects, based on the frames it still has in memory. Keys is
-where you add, test, or clear a saved manufacturer key. Library lists every capture still on
-the card, grouped by protocol and serial.
+**Capture** starts and stops listening, selects OOK or 2FSK, and shows the latest burst. **Scan** cycles through the card's channels or stays on one channel. **Decode** reports the protocol, serial, button, counter, and frame-check result. **Predict** shows the next counter inferred from frames in memory. **Keys** lets you add, test, or clear a saved manufacturer key. **Library** lists captures stored on the card, grouped by protocol and serial.
 
-From idle, one tap of the card button starts FOBscan with the screen dark. The LED breathes
-orange. When a decode sticks, the pixel flashes white and then goes back to breathing. Another
-tap stops it.
+From idle, one button tap starts FOBscan without the screen. The LED pulses orange; a kept decode flashes the pixel white before orange pulsing resumes. Tap again to stop.
 
 ## FOBclone
 
-This walks you through one vehicle. You pick a make, then a model, then a year, and the card
-sets the band and modulation for that entry and waits. You press the fob near the card. The
-screen lists each frame it kept, and it will offer to send a saved frame back, including the
-next predicted counter when the decoder has worked one out.
+A guided scan for a selected vehicle. Choose the make, model, and year; the card sets the profile's band and modulation and waits for a fob press. The screen lists captured frames and can send a saved frame back, including the next predicted counter when the decoder can provide one.
 
-If you would rather not open the dashboard, two taps from idle start the same listen. The LED
-breathes blue while it searches. Once a fob has been recognised, one tap sends the saved frame.
-While it is still searching, one tap steps the band preset, and two taps stop it.
+From idle, two taps start this scan without the dashboard. The LED pulses blue while the card listens. After it recognizes a fob, one tap sends the saved frame. Before recognition, one tap changes the band preset. Two taps stop the scan.
 
 ## FOBcatch
 
-A quieter version of FOBclone, without the send-back step. Pick the make, model, and year, and
-the card arms that profile. Press the fob. The screen holds the capture and lets you name it if
-you want a bookmark. Replay sends the saved frame.
+FOBcatch listens using a selected vehicle profile. Choose the make, model, and year, then press the fob. The screen keeps the capture and lets you name it; **Replay** sends the saved frame.
 
 ## FOBback
 
-A guided resync, for receivers that will accept a short run of saved codes. Pick the make and
-the vehicle, and the card listens while you press the fob until it says it has enough frames.
-Replay then sends that run back in the order it was captured. The card does not change
-frequency while it is collecting.
+FOBback is a guided resynchronization sequence for receivers that accept a short run of saved codes. Choose the make and vehicle, then press the fob until the card has enough frames. **Replay** sends the saved frames in capture order. The card holds its frequency while collecting them.
 
-The sequence underneath is the C2 RollBack sequencer. It sends exactly two codes, the older one
-first, with a gap you can set between 40 and 2000 ms. That range is not arbitrary: too short
-and the receiver reads it as one press, too long and you fall outside its resync window.
+FOBback uses the C2 RollBack sequencer. It sends exactly two codes, older first, with a configurable gap of 40–2000 ms. A shorter gap can look like a single press; a longer one may exceed the receiver's resynchronization window. The sequencer refuses to run when:
 
-It will refuse two things rather than guess at them. If it is holding fewer than two codes,
-there is nothing to send. And if the pair it has share a counter, or the counters are not in
-order, a same-code pair cannot resync anything — so it declines and tells you why instead of
-transmitting.
+- fewer than two codes are available;
+- the counters are equal or out of order. Sending the same code twice cannot resynchronize the receiver, so the sequencer reports the problem instead of transmitting.
 
-Captures get trimmed down to a single frame before they are stored. A real press puts the frame
-out several times over, and if you replay a three-repeat block the receiver sees three presses,
-advances its counter by three, and the sequence the attack depends on is gone.
+Before storage, each capture is trimmed to one frame. A physical press usually repeats the frame; replaying a three-repeat block could appear to the receiver as three presses, advancing its counter by three and breaking the sequence.
 
-Codes can also come from a stored frame — a FOBworks RAW file or a `.sub` capture — through
-`fbk_import`. That is how I test a transmit without needing a live capture.
+You can also load a stored frame through `fbk_import`, using a FOBworks RAW file or a `.sub` capture. This lets you test a transmit without making a live capture.
 
 ## Signal library
 
-Every decode you keep lands here, grouped by protocol and serial. The card writes each one to
-the microSD as a FOBworks RAW file and the screen reads that library back. You can merge two
-groups when they turn out to be the same fob read two different ways, hide the raw captures
-that never matched a decoder, and export the lot as JSON. The file name starts with
-`fobworks_library_`.
+Kept decodes appear here, grouped by protocol and serial. The card writes each to the microSD as a FOBworks RAW file and reads the library back for display. You can merge groups that contain readings from the same fob, hide captures that no decoder matched, and export the library as JSON. Exported filenames begin with `fobworks_library_`.
 
-A capture can also be saved as a FOBworks RAW file on its own: a short header, the frequency,
-and the pulse list. Post that file back to the card and it will transmit those pulses on the
-frequency written in the file.
+A standalone FOBworks RAW file contains a short header, frequency, and pulse list. Send the file back to the card to transmit those pulses at the frequency recorded in it.
 
 ## Key recovery
 
-This is for a KeeLoq fob you already own. You press the same button two to five times while the
-card listens. Recovery tries the built-in table and any key you have saved, and it only keeps a
-candidate if every press decrypts to the same serial, the same button, and a counter that steps
-forward. A hit on a filler pattern in the built-in table is labelled as a pattern match, not a
-result. A key you saved on the card is the one that counts. A miss stays a miss — the card does
-not invent a manufacturer key out of thin air.
+Key recovery is intended for a KeeLoq fob you own. Press the same button two to five times while the card listens. Recovery checks the built-in table and any keys saved on the card. It keeps a candidate only if every press decrypts to the same serial and button with a counter that advances. A match to a filler pattern in the built-in table is labeled **pattern match**; a saved key is reported separately. If no key matches, recovery reports no match. It does not derive a manufacturer key from a transmission.
 
-The table it works from has 73 real entries in it, not invented patterns. Four of the Kia
-decoders in this firmware have never fired on a real capture, and 31 of the 41 decoders are
-silent against the corpus I have — most of those are gate and garage protocols the corpus does
-not contain. `tools/corpus_regression.py` reproduces that tally, and its header comment records
-what it found.
+The built-in table contains 73 entries. In the corpus used for this project, four Kia decoders have not matched a real capture; 31 of 41 decoders have no match at all, mostly because the corpus contains few gate and garage signals. `tools/corpus_regression.py` reproduces these counts, and its header comment records the results.
 
-A candidate has to decrypt identically across two consecutive frames before it is reported as
-found. One frame is not enough, because the check is only 12 bits — a single frame can be
-matched by a wrong key roughly one time in four thousand, and transmitting a code derived from
-a wrong key desynchronises the real fob.
+Recovery reports a candidate only when it decrypts two consecutive frames consistently. A single frame is not enough: this check uses 12 bits, so a wrong key may match one frame about once in 4,000 tries. Transmitting a code derived from a wrong key could desynchronize the fob.
 
-On serial, `key_probe` tests one candidate you already have against the last few KeeLoq frames
-without starting a full recovery, and `key_recover_offline` runs the same recovery over a hop
-list you paste in, with no radio involved at all.
+The serial command `key_probe` tests one candidate key against recent KeeLoq frames without starting a full recovery. `key_recover_offline` runs the same recovery against a supplied hop list, without using the radio.
 
 ## C1 RollJam
 
-The capture-and-replay sequence, exposed as `rolljam_*` on serial and in the dashboard. It jams
-the fob's first press so the receiver never hears it, captures that press, jams again while the
-fob is pressed a second time, captures the second one, and then replays the **first** code into
-the second jamming window. The owner sees the door unlock on the second press, and the card is
-left holding the second code — valid, and unused.
+The C1 capture-and-replay sequence is exposed through the `rolljam_*` serial commands and the dashboard. It jams the first fob press so the receiver does not hear it, then captures it. During the second press, it jams and captures again, then replays the **first** code during the second jamming window. The intended result is that the door unlocks on the second press while the card retains the second, unused code.
 
-Because this one both jams and transmits, it has more guards than the rest:
+Because RollJam jams and transmits, it has several safeguards:
 
-- An explicit arm, refused while a sequence is already running, and spent by a single start so a
-  double tap cannot fire it twice.
-- Both captures have to decode to different counters in the right order. If they do not, nothing is
-  transmitted and you get the reason.
-- The jam stops on **every** exit path — timeout, either capture failing, the same-code refusal,
-  the transmit path, and success — and on boot, before anything that could hang. A jam that
-  outlives a reset is the worst thing this feature could do, so that path gets checked first.
+- It requires an explicit arm. Arming is refused while a sequence is running, and one start consumes the arm so a double tap cannot trigger another run.
+- Both captures must decode to different counters in the expected order. Otherwise, it reports the reason and does not transmit.
+- Jamming stops on every exit path: timeout, capture failure, same-code refusal, transmission, success, and boot. Stopping it before other boot work begins limits the risk of a jam continuing through a reset.
 
-Two things limit it. One CC1101 cannot jam and listen at the same time, so the sequence drops
-the carrier for each capture window; that interleave is the part that has to hold up on real
-hardware. And on this board the jam runs out of the TX FIFO in packet mode, with
-`jam_status` reporting underruns — read that first if a sequence fails, because a carrier that
-gapped and a receiver that refused look identical from the outside and are not the same
-problem.
+The CC1101 cannot jam and listen simultaneously. The sequence drops the carrier during each capture window; that timing still needs to be confirmed on hardware. Jamming uses packet-mode TX from the FIFO, and `jam_status` reports underruns. Check it when a sequence fails: a gap in the carrier is different from a receiver rejecting a frame.
 
 ## Bluetooth
 
-Scan lists the advertisements the card can hear. Pair opens a short advertising window under
-the name `SGP Card Mini` so a phone can bond. Paired devices shows the bond list. The card does
-not hand out identity keys.
+**Scan** lists advertisements the card can hear. **Pair** opens a short advertising window named `SGP Card Mini` so a phone can bond. **Paired devices** shows the bond list. The card does not expose identity keys.
 
-## Using it
+## A basic capture workflow
 
-There is nothing exotic about the way I run it. The card goes on USB and the access code comes
-off the serial log at 115200 baud. After that it is the same few steps every time.
+1. Connect the SGP Card Mini over USB and read the access code from the serial log at 115200 baud.
+2. Join `SGP Card Mini` and open `http://192.168.4.1`. If the separate React dashboard is available, you can connect over USB or Wi-Fi instead; `README.md` has the instructions.
+3. Enter the access code to reach the mode picker.
+4. Open FOBscan, leave the sweep running, and press a button on a fob you own near the card.
+5. Check the decoded protocol family, serial, button, and counter.
+6. Save the capture to the library. Export the library if you need a copy off the card.
 
-1. Join `SGP Card Mini` and open `http://192.168.4.1` — or run the React dashboard and connect over
-   USB or WiFi. `README.md` covers both.
-2. Enter the access code, and the mode picker appears.
-3. Open FOBscan, leave the sweep running, and press a button on my own fob next to the card.
-4. Decode shows the family, the serial, the button, and the counter.
-5. Save the capture into the library. If I want a copy off the card, export the library.
-
-Everything else in the firmware is a variation on those five steps.
+The basic workflow is to capture a transmission, inspect the decode, and save it.
 
 ## What this revision can and cannot do
 
-The first two matter most.
+Replay, jamming, and both sequencers drive the CC1101's power amplifier from its TX FIFO. A separate receiver decoded one transmitted frame as a Kia unlock and identified its protocol and button.
 
-**Transmit works.** Replay, jamming, and both sequencers drive the CC1101's own PA from its TX
-FIFO. A frame transmitted this way was picked up and decoded by a separate receiver as a valid
-Kia unlock, protocol and button identified.
+Capture currently falls back to polling RSSI at roughly 1600 µs because the CC1101's demodulated data output is not connected to a readable GPIO. That is slower than a 400 µs Kia V3/V4 short pulse, so captures may contain uniform pulses without bit edges. The firmware rejects them with `no-bit-edges` rather than passing them to the decoders. Routing GDO0 or GDO2 to an available GPIO would improve capture.
 
-**Capture is coarse.** The CC1101's demodulated data output is not connected to anything
-readable on this board, so capture falls back to polling RSSI at about 1600 µs. That is slower
-than a Kia V3/V4 short pulse of 400 µs, which means a capture can come back as uniform pulses
-with no bit edges in them at all. The firmware refuses those and reports `no-bit-edges` rather
-than passing them to the decoders. Routing GDO0 or GDO2 to a free GPIO is what fixes it.
+The board has no low-frequency front end. The CC1101 cannot handle 125 kHz passive-entry wake-up or Hitag2, Megamos, and DST40 immobilisers below 300 MHz.
 
-**There is no low-frequency front end.** The 125 kHz passive-entry wake-up, and the Hitag2,
-Megamos, and DST40 immobilisers, all sit below what this radio covers.
-
-**Nothing here has been tested against a car.** The sequences, the encoders, and the frame
-trimming are tested host-side, and the waveform is verified externally. Whether a paired receiver
-accepts any of it is untested — I do not have one to try. The Flipper can confirm that a frame
-came out correct, but it is not paired to anything and has no counter to check, so it will parse
-the same frame whether the receiver on the other end would open or refuse.
+**The firmware has not been tested against a car.** The sequences, encoders, and frame trimming have host-side tests, and an external receiver has decoded the transmitted waveform. Whether a paired vehicle receiver accepts any sequence remains untested. Decoding a waveform does not establish acceptance: a decoder has no paired state and cannot distinguish a receiver's acceptance from rejection.
