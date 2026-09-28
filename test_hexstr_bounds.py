@@ -118,7 +118,7 @@ int main(void){
   char bits[513];
   for(int i=0;i<512;i++) bits[i] = (i%3)?'0':'1';   // exercise both nibble paths
   bits[512]=0;
-  const size_t CAP = 128;
+#define CAP 128
   /* Canary sits immediately after the buffer; an off-by-one lands on it. */
   static unsigned char guard[CAP+16];
   int bad = 0;
