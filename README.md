@@ -93,7 +93,7 @@ One caveat: if you serve the dashboard over **HTTPS**, the browser blocks plain 
 | `CITATIONS_AND_REFERENCES.md` | The documents this sketch is written against. |
 | `LICENSE` | GNU General Public License v3.0. |
 | `bench_*.py` | Serial-side bench helpers: `bench_serial_log.py` logs and filters the card's JSON stream, `bench_send.py` sends commands, `bench_c2_capture.py` drives a capture. |
-| `test_*.py` | 15 host-side checks. See **Tests** below. |
+| `test_*.py` | 16 host-side checks. See **Tests** below. |
 
 `FOBworks_SGP_Dashboard/` is the React dashboard, unpacked from its source archive. It is not needed to flash or use the firmware over WiFi with the card's own page.
 
@@ -116,7 +116,7 @@ Libraries: Adafruit NeoPixel 1.12 or newer, ArduinoJson 7.x. SD, SPI, Wire, Pref
 
 Open `FOBworks_for_SGP.ino` from this folder and upload it to the SGP Card Mini. `loop_stack.cpp` must be in the same folder or the build will not link.
 
-Current build: **56% flash, 45% RAM.**
+Current build: **53% flash, 46% RAM.**
 
 ## First run
 
@@ -150,7 +150,7 @@ Beyond the four modes' commands (`capture`, `decode`, `replay`, `replay_predicte
 
 ## Tests
 
-15 Python suites, all host-side, no hardware and no network. Each one greps or extracts the real firmware source rather than trusting a summary, so they fail when the source stops matching the documentation.
+16 Python suites, all host-side, no hardware and no network. Each one greps or extracts the real firmware source rather than trusting a summary, so they fail when the source stops matching the documentation.
 
 ```bash
 cd FOBworks_for_SGP
@@ -171,15 +171,16 @@ for t in test_*.py; do python3 "$t"; done
 | `test_raw_polarity.py` | Capture polarity survives export and replay |
 | `test_a2_reporting.py` | The Kia V3/V4 verdict is not overstated; duplicates collapse |
 | `test_hexstr_bounds.py`, `test_sub_replay_body_limit.py` | Buffer bounds |
+| `test_review_v373_fixes.py` | The findings from the external v3.73 review stay fixed: WS recipients authenticate before subscribing, replies carry a connection identity, the capture budget is one-shot, and no published doc points at a file that is not shipped |
 
 ## Hardware limits on this revision
 
-Worth stating plainly, because two of these shape what the tool can do.
+Two of these shape what the tool can do, so they are worth getting straight first.
 
 **GDO0 is not connected.** The CC1101's demodulated data output is not routed to a readable GPIO on this board — GPIO 48 is the SX1278's DIO0. The vendor's own firmware says so (`"GDO0 NO está cableado al ESP32 en este PCB"`). Consequences:
 
 - **Capture falls back to polling RSSI**, which samples at roughly 1600 µs. That is slower than a Kia V3/V4 short pulse of 400 µs, so a capture can come back as uniform pulses with no bit edges in it. The firmware refuses those with `no-bit-edges` rather than feeding them to the decoders.
-- **Transmit does not depend on GDO0.** Packet mode drives the CC1101's own PA from the TX FIFO, so replay, jamming and the sequencers work. This was verified by an external receiver decoding a transmitted frame.
+- **Transmit does not depend on GDO0.** Packet mode drives the CC1101's own PA from the TX FIFO, so replay, jamming, and the sequencers all work. I verified this by having a separate receiver decode a transmitted frame.
 - Routing GDO0 (chip pin 6) or GDO2 (pin 3) to a free GPIO fixes capture quality. GDO2 is easier to reach but is output-only, so it gives capture without transmit.
 
 **There is no low-frequency front end.** The CC1101 covers 300–928 MHz. Passive-entry LF wake-up at 125 kHz, and the Hitag2, Megamos and DST40 immobilisers below 300 MHz, are out of reach on this hardware.
