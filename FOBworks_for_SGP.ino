@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — standalone firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v3.73
+// Version  : FOBworks for SGP v3.74
 // Device   : SGP Card Mini, May 2026 stock (ESP32-S3-MINI-1-N8, 8 MB flash,
 //            no PSRAM, USB CDC on boot)
 // RF Front : Texas Instruments CC1101 — async OOK + 2FSK, 300–928 MHz
@@ -232,6 +232,40 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
 // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+// v3.74 (2026-09-27) — four findings from an external review of v3.73.
+//
+//   [SECURITY] WebSocket replies reached clients that never authenticated. wsRemember() ran
+//     on the handshake, before any credential was supplied, and serialEmit() -- the single
+//     outbound funnel -- broadcast to every registered fd. The token gated EXECUTION but not
+//     RECEIPT, so anyone who could reach port 81 received decode results and key-related
+//     replies produced by clients that had authenticated. A slot now carries an authed flag,
+//     set only when a valid token arrives on a text frame; broadcast skips unauthenticated
+//     slots, and a command reply is routed back to the slot that sent it (wsReplyTo) instead
+//     of being broadcast. A client that never authenticates now receives nothing.
+//
+//   [TX] The GDO0 toggle test could not prove the CC1101 path. On this board revision GPIO 48
+//     is the SX1278's DIO0 and the CC1101's GDO0 is not routed at all (research/15; the vendor
+//     firmware says the same), so a toggle can come from the LoRa side. Selecting the async
+//     path on that basis drives a pin that is not the CC1101's TX data input and transmits
+//     nothing. startJam() and replayRaw() now default to the packet-mode FIFO path, which
+//     needs no GDO0, and use async only when gdo0ForceAsync is set for a board where GDO0 is
+//     genuinely wired. This corrects earlier notes that treated sleeping or resetting the
+//     SX1278 as a GDO0 fix; doc 15's measurement supersedes that.
+//
+//   [CAPTURE] A requested short capture could run for three seconds. timeoutMs bounds the
+//     WAIT for a signal, but the edge-recording deadline was hardcoded at 3 s, so a caller
+//     asking for 250 ms still recorded up to 3 s when a signal stayed above the trigger
+//     threshold. The Ch-B fallback capture -- whose purpose is to catch the tail of a press
+//     that has already ended -- is exactly that case. The edge budget is now a separate
+//     one-shot value (capMaxMsOverride); all existing callers keep the 3 s default.
+//
+//   [API] /api/can_send echoed the raw ?id= text into its JSON response without escaping, and
+//     strtoul's partial parse accepted non-hex suffixes ("7DFZZZ" parsed as 0x7DF). The id is
+//     now validated as 1-8 hex digits and the response echoes the parsed value canonically, so
+//     neither a malformed value nor a typo can alter the response or the transmitted id.
+//
+// All four were verified statically and by mutation (test_review_v373_fixes.py); none could be
+// exercised at runtime here, which needs two WebSocket clients and a board with GDO0 routed.
 // v3.73 (2026-09-27) — WiFi WebSocket transport: the dashboard's WiFi mode can connect.
 //
 //   [BUG] There was no WebSocket server at all. The WiFi dashboard opens
@@ -1293,7 +1327,7 @@
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v3.73"
+#define FW_VER        "FOBworks for SGP v3.74"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
@@ -1460,6 +1494,17 @@ void jamTick();          // keeps a FIFO-driven jam alive; called from loop()
 static void cc_setCaptureOOK();
 bool replayRaw(float mhz,uint16_t* data,int len,int reps,bool startHigh);
 bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int reps);
+// Extra wall-clock budget for the EDGE phase only (ms). 0 = the 3000 ms default.
+// Set immediately before a capture that needs a short window, then it self-clears on
+// the next capture. See the note at the head of captureSignal().
+uint32_t capMaxMsOverride = 0;
+
+// Opt-in for the CC1101 async (GDO0) TX path. Off by default: on this board revision the
+// CC1101's GDO0 is not routed to a readable GPIO, so GPIO 48 toggling does not mean the
+// async path can transmit. Set true only on a revision where GDO0 really is wired.
+// research/15 records the measurement; the vendor firmware says the same.
+bool gdo0ForceAsync = false;
+
 bool captureSignal(uint16_t timeoutMs,uint32_t gapUs);
 
 // Forward declarations: these are defined further down, but the C2/C1 sequencers,
@@ -1773,14 +1818,30 @@ void readBatt(){
   Wire.requestFrom(MAX17048_ADDR,2); if(Wire.available()>=2){uint16_t r=(Wire.read()<<8)|Wire.read(); battPct=r/256.0;}
 }
 void addLog(const String& s){ Serial.println(s); }
+// Forward declarations for the WebSocket outbound path. serialEmit() is defined here but
+// the WebSocket table lives below, so these must be visible first. serialTokenMatches() is
+// declared for the same reason: wsHandler() now authenticates a slot on receipt, and it is
+// defined below wsHandler().
+volatile int wsReplyTo = -1;
+static void wsSendToSlot(int slot, const String& json);
+static void wsBroadcast(const String& json);
+static bool serialTokenMatches(const JsonDocument& command);
+
 void serialEmit(const String& json){
   Serial.println(json);
-  // Mirror every outbound event to any connected WebSocket client. This is the single
-  // outbound funnel for the whole firmware (ticks, heartbeats, decode results, every
-  // command reply), so tapping it here gives the WiFi dashboard the same stream the USB
-  // one gets, with no per-event changes and nothing to keep in sync as events are added.
+  // Mirror every outbound event to WebSocket clients. This is the single outbound funnel for
+  // the whole firmware (ticks, heartbeats, decode results, every command reply), so tapping it
+  // here gives the WiFi dashboard the same stream the USB one gets, with no per-event changes
+  // and nothing to keep in sync as events are added.
+  //
+  // Routing: a reply to a WiFi command goes back to the client that sent it, and nowhere else
+  // (wsReplyTo names that slot -- see wsPump()). Everything else -- serial commands, timers,
+  // capture results -- is broadcast, but only to clients that have authenticated.
+  //
   // Declared here, defined with the rest of the WebSocket code below.
-  wsBroadcast(json);
+  int slot=wsReplyTo;
+  if(slot>=0) wsSendToSlot(slot,json);
+  else        wsBroadcast(json);
 }
 
 // ─── WebSocket command/event transport (port 81) ──────────────────────────────
@@ -1804,34 +1865,73 @@ void serialEmit(const String& json){
 #define WS_MAX_CLIENTS 4
 #define WS_CMD_Q       4            // queued inbound commands (loop() drains each pass)
 httpd_handle_t wsServer = nullptr;
-static int  wsFd[WS_MAX_CLIENTS] = { -1, -1, -1, -1 };
 
+// A connected client is NOT a subscriber. Previously wsRemember() ran on the handshake,
+// before any credential was supplied, and wsBroadcast() sent every event to every registered
+// fd -- so a client that never authenticated still received decode results and key-related
+// replies produced by whoever did. The token gated EXECUTION but not RECEIPT.
+//
+// So a slot now carries an authenticated flag, set only after a valid token arrives. Broadcast
+// skips unauthenticated slots. A client that never authenticates gets nothing.
+static int  wsFd[WS_MAX_CLIENTS]       = { -1, -1, -1, -1 };
+static bool wsAuthed[WS_MAX_CLIENTS]   = { false, false, false, false };
+// wsReplyTo (defined above, with serialEmit's forward declarations) names the slot that the
+// reply currently being produced belongs to, or -1 for "no particular client" -- a serial
+// command, a timer event, a capture.
+
+static int wsSlotFor(int fd){
+  for(int i=0;i<WS_MAX_CLIENTS;i++) if(wsFd[i]==fd) return i;
+  return -1;
+}
 static void wsRemember(int fd){
-  for(int i=0;i<WS_MAX_CLIENTS;i++) if(wsFd[i]==fd) return;
-  for(int i=0;i<WS_MAX_CLIENTS;i++) if(wsFd[i]<0){ wsFd[i]=fd; return; }
-  wsFd[0]=fd;                        // table full: stop mirroring to the oldest
+  if(wsSlotFor(fd)>=0) return;
+  for(int i=0;i<WS_MAX_CLIENTS;i++) if(wsFd[i]<0){ wsFd[i]=fd; wsAuthed[i]=false; return; }
+  wsFd[0]=fd; wsAuthed[0]=false;      // table full: stop mirroring to the oldest
+}
+// Called once a slot's client has presented a valid token. From here it may receive events.
+static void wsMarkAuthed(int fd){
+  int i=wsSlotFor(fd);
+  if(i>=0) wsAuthed[i]=true;
 }
 static void wsForget(int fd){
-  for(int i=0;i<WS_MAX_CLIENTS;i++) if(wsFd[i]==fd) wsFd[i]=-1;
+  int i=wsSlotFor(fd);
+  if(i>=0){ wsFd[i]=-1; wsAuthed[i]=false; }
 }
 static int wsClientCount(){
   int n=0; for(int i=0;i<WS_MAX_CLIENTS;i++) if(wsFd[i]>=0) n++;
   return n;
 }
+static int wsAuthedCount(){
+  int n=0; for(int i=0;i<WS_MAX_CLIENTS;i++) if(wsFd[i]>=0&&wsAuthed[i]) n++;
+  return n;
+}
 
-// Broadcast one JSON object to every connected client. A send failure means the peer is
+// Broadcast one JSON object to every AUTHENTICATED client. A send failure means the peer is
 // gone; clear the slot so we stop trying.
 static void wsBroadcast(const String& json){
   if(!wsServer) return;
   for(int i=0;i<WS_MAX_CLIENTS;i++){
     int fd=wsFd[i];
-    if(fd<0) continue;
+    if(fd<0||!wsAuthed[i]) continue;
     httpd_ws_frame_t f{};
     f.type    = HTTPD_WS_TYPE_TEXT;
     f.payload = (uint8_t*)json.c_str();
     f.len     = json.length();
-    if(httpd_ws_send_frame_async(wsServer, fd, &f)!=ESP_OK) wsFd[i]=-1;
+    if(httpd_ws_send_frame_async(wsServer, fd, &f)!=ESP_OK){ wsFd[i]=-1; wsAuthed[i]=false; }
   }
+}
+
+// Send one JSON object to a single slot's client. Used for a command reply, which must go
+// back to its requester and nowhere else.
+static void wsSendToSlot(int slot, const String& json){
+  if(!wsServer||slot<0||slot>=WS_MAX_CLIENTS) return;
+  int fd=wsFd[slot];
+  if(fd<0) return;
+  httpd_ws_frame_t f{};
+  f.type    = HTTPD_WS_TYPE_TEXT;
+  f.payload = (uint8_t*)json.c_str();
+  f.len     = json.length();
+  if(httpd_ws_send_frame_async(wsServer, fd, &f)!=ESP_OK){ wsFd[slot]=-1; wsAuthed[slot]=false; }
 }
 
 // Inbound queue, written by the httpd task and drained by loop(). Single-producer /
@@ -1839,15 +1939,17 @@ static void wsBroadcast(const String& json){
 // why no lock is needed (both are int-sized and only ever move forward).
 #define WS_LINE_MAX 2048
 static char wsQ[WS_CMD_Q][WS_LINE_MAX];
+static int  wsQFrom[WS_CMD_Q];        // slot that sent each queued line, for reply routing
 static volatile int wsQTail=0;        // httpd writes here
 static volatile int wsQHead=0;        // loop() reads here
 
-static void wsEnqueue(const String& line){
+static void wsEnqueue(const String& line,int fromSlot){
   int next=(wsQTail+1)%WS_CMD_Q;
   if(next==wsQHead) return;           // full: drop rather than overwrite
   int n=line.length(); if(n>WS_LINE_MAX-1) n=WS_LINE_MAX-1;
   memcpy(wsQ[wsQTail], line.c_str(), n);
   wsQ[wsQTail][n]='\0';
+  wsQFrom[wsQTail]=fromSlot;
   wsQTail=next;
 }
 
@@ -1858,9 +1960,12 @@ static void wsPump();
 static esp_err_t wsHandler(httpd_req_t* req){
   int fd = httpd_req_to_sockfd(req);
   if(req->method==HTTP_GET){          // handshake completes on the first GET callback
+    // Register the socket but do NOT subscribe it: it receives nothing until a valid token
+    // arrives on a text frame (see the wsMarkAuthed() call below). Registration only makes
+    // the fd addressable for a reply to the client's own command.
     wsRemember(fd);
-    addLog("[WS] client connected ("+String(wsClientCount())+" total)");
-    wsBroadcast(String("{\"event\":\"ws_open\",\"clients\":")+String(wsClientCount())+"}");
+    addLog("[WS] socket open ("+String(wsClientCount())+" conn, "
+           +String(wsAuthedCount())+" authed)");
     return ESP_OK;
   }
   if(req->method==HTTP_DELETE){       // socket closed
@@ -1884,7 +1989,22 @@ static esp_err_t wsHandler(httpd_req_t* req){
   }
   rx[frame.len]='\0';
   String line(rx); line.trim();
-  if(line.length()>=3 && line[0]=='{') wsEnqueue(line);
+  if(line.length()>=3 && line[0]=='{'){
+    int slot = wsSlotFor(fd);
+    // Promote the slot the moment a command carrying a valid token arrives. Checking here
+    // (rather than in the loop-task dispatcher) lets the very first authenticated client
+    // subscribe on its first frame, and keeps the flag update on the httpd task where the
+    // table is otherwise only touched.
+    if(slot>=0 && !wsAuthed[slot]){
+      JsonDocument jc;
+      if(deserializeJson(jc,line)==DeserializationError::Ok && serialTokenMatches(jc)){
+        wsMarkAuthed(fd);
+        addLog("[WS] client authenticated ("+String(wsAuthedCount())+" of "
+               +String(wsClientCount())+" subscribed)");
+      }
+    }
+    wsEnqueue(line,slot);
+  }
   return ESP_OK;
 }
 
@@ -7214,7 +7334,15 @@ String decodeSignal(){
 // RSSI floor is sampled at startup. Threshold sits 12 dB above that floor.
 // captureSignal — capture one burst of edges.
 //
-// timeoutMs  : wall-clock bound on the capture (unchanged).
+// timeoutMs  : wall-clock bound on how long we WAIT for a signal to appear (the scan
+//              loop and the fallback sweep). It is NOT a bound on the recording.
+// capMaxMsOverride : extra budget, in ms, for the EDGE phase that begins once a signal is
+//              found (0 = the 3000 ms default). This is the second half of the pair, and
+//              the two were previously conflated: the edge deadline was hardcoded at 3 s,
+//              so a caller asking for a 250 ms window still got up to 3 s of recording if
+//              the signal stayed above the trigger threshold. That matters for the Ch-B
+//              fallback capture, whose whole point is to catch the remainder of a press
+//              that has already ended. One-shot: cleared when the capture starts.
 // gapUs      : silence that ends the capture early. Defaults to the historical
 //              350 ms, which allows a Toyota preamble-to-data silence (250-300 ms)
 //              to pass without terminating. C1 RollJam needs a much shorter value:
@@ -7231,6 +7359,18 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   const uint32_t gap=gapUs;
   if(!cc1101OK) return false;
   unsigned long _cT0 = millis(); // track wall-clock duration for lastCapDurMs
+  // Budget for the EDGE phase, in ms. This is deliberately separate from timeoutMs:
+  // timeoutMs bounds how long we WAIT for a signal to appear (see the scan loop and the
+  // fallback sweep below), while this bounds how long we RECORD once one has appeared.
+  //
+  // Every existing caller passed a timeout and relied on getting a full recording window,
+  // so the default is the 3 s the edge phase has always used and behaviour is unchanged
+  // for them. Callers that need a SHORT window pass capMaxMs explicitly -- the Ch-B
+  // fallback capture is the case that matters: it asks for 250 ms to catch the tail of a
+  // burst, and a sustained signal near the trigger threshold would otherwise hold that
+  // timing-sensitive sequence for the full 3 s, well past the press it is chasing.
+  uint32_t capMaxMs = capMaxMsOverride;   // 0 = use the default
+  if(capMaxMs == 0) capMaxMs = 3000;
   pinMode(PIN_GDO0,INPUT);
   // Release SX1278 DIO0 before the CC1101 drives GPIO 48.
   loraHardReset();
@@ -7352,7 +7492,8 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   // capEnd bounds the whole capture; `gap` (hoisted to the function head) is the
   // silence that ends it early. See the signature comment for why C1 passes a
   // smaller gap than the 350 ms default.
-  unsigned long capEnd=capStart+3000000UL;
+  unsigned long capEnd=capStart+(unsigned long)capMaxMs*1000UL;
+  capMaxMsOverride=0;   // one-shot: the next capture uses the default unless set again
 
   if(useGdo0){
     // ── GDO0 digital mode — no SPI in hot loop ──────────────────────────────
@@ -7549,10 +7690,17 @@ unsigned long jamMaxGapMs=0;    // worst loop() gap seen while jamming
 void startJam(float mhz){
   if(mhz<100.0f||mhz>950.0f) return;
   scanActive=false;
-  // Prefer GDO0 when the pin actually toggles; otherwise use the FIFO. Same toggle test
-  // captureSignal() uses, so the choice is consistent with the capture path.
+  // Path choice. A toggling GPIO 48 is NOT evidence that the CC1101's GDO0 is readable:
+  // on this board revision GPIO 48 is the SX1278's DIO0 and the CC1101's GDO0 is not routed
+  // at all (research/15, and the vendor firmware's own note that GDO0 is not wired to the
+  // ESP32 on this PCB). A toggle can therefore come from the LoRa side, and choosing the
+  // async path on that basis would transmit nothing -- the pin would be driven, but it is
+  // not the CC1101's TX data input.
+  //
+  // So the FIFO path is the default: it drives the CC1101's own PA and needs no GDO0.
+  // Async is used only when explicitly forced, for a revision where GDO0 really is routed.
   bool gdo0Usable=false;
-  {
+  if(gdo0ForceAsync){
     pinMode(PIN_GDO0,INPUT);
     unsigned long t=micros(); bool h=false,l=false;
     while(micros()-t<3000){ if(digitalRead(PIN_GDO0)) h=true; else l=true; if(h&&l) break; }
@@ -7958,11 +8106,18 @@ bool replayRaw(float mhz,uint16_t* data,int len,int reps=3,bool startHigh=true){
   // `return true` regardless — reporting a successful transmission of nothing. Every caller
   // then said ok:true, and C2 would report a completed RollBack having sent nothing.
   //
-  // So: if the pin toggles, bit-bang as before (bit-exact, arbitrary RAW). If it does not,
-  // route through packet mode, which needs no GDO0. If neither can work, refuse explicitly
-  // rather than claim success.
+  // So: default to packet mode, which needs no GDO0 and is the only path that works on this
+  // revision. The bit-bang path is used only when explicitly forced, for a board where GDO0
+  // really is routed -- a toggle alone cannot select it, because GPIO 48 belongs to the
+  // SX1278's DIO0 here and a toggle can come from the LoRa side. If the forced async path
+  // turns out to be dead, refuse explicitly rather than claim success.
   bool txPathLive=false;
-  {
+  if(gdo0ForceAsync){
+    // Force-pins the async TX input to the GDO0 pad and drives a continuous carrier. Must be
+    // a compile-time opt-out, not a hardware probe: the probe cannot distinguish the CC1101's
+    // GDO0 from the SX1278's DIO0.
+    pinMode(PIN_GDO0,OUTPUT);
+    cc_writeReg(0x02,0x2F); cc_strobe(0x36); delay(1);   // GDO0 = HW data input
     pinMode(PIN_GDO0,INPUT);
     unsigned long t=micros(); bool h=false,l=false;
     while(micros()-t<3000){ if(digitalRead(PIN_GDO0)) h=true; else l=true; if(h&&l) break; }
@@ -8549,7 +8704,11 @@ void scanTick(){
                     cc_setFreq(CHB_TRY[bi]);
                     delay(2);               // PLL settle — 150 µs min, 2 ms is conservative
                     rfLen=0;
-                    bool chbOk=captureSignal(250); // 250 ms — catch remaining burst reps
+                    // 250 ms is the EDGE budget, not the wait timeout: capMaxMsOverride
+                    // bounds the recording, and 3000 is the wait for the signal to appear.
+                    // Passing 250 as timeoutMs alone would have left a 3 s recording.
+                    capMaxMsOverride=250;
+                    bool chbOk=captureSignal(3000); // record 250 ms once triggered
                     if(chbOk&&rfLen>18){
                       rfLenB=rfLen; rfFreqB=CHB_TRY[bi];
                       memcpy(rfBufB,rfBuf,rfLen*sizeof(uint16_t));
@@ -9882,10 +10041,28 @@ void setupRoutes(){
   protectedRoute("/api/can_send",[](){
     if(!canActive){srv.send(503,"application/json","{\"error\":\"CAN not active\"}");return;}
     String idStr=srv.hasArg("id")?srv.arg("id"):"";
-    uint32_t id; bool ext=false;
-    if(idStr.startsWith("0x")||idStr.startsWith("0X"))
-      id=(uint32_t)strtoul(idStr.c_str()+2,nullptr,16);
-    else id=(uint32_t)strtoul(idStr.c_str(),nullptr,16);
+    // Validate the id strictly before parsing it. strtoul() stops at the first non-hex
+    // character and returns what it got, so "7DFZZZ" parsed as 0x7DF and "7DF" with any
+    // trailing junk was accepted silently. Reject anything that is not purely hex (after an
+    // optional 0x prefix) so a typo is reported instead of transmitted as a different id.
+    {
+      String h=idStr;
+      if(h.startsWith("0x")||h.startsWith("0X")) h=h.substring(2);
+      if(h.length()==0||h.length()>8) {
+        srv.send(400,"application/json","{\"error\":\"bad id\",\"detail\":\"id must be 1-8 hex digits, optionally 0x-prefixed\"}");
+        return;
+      }
+      for(size_t i=0;i<h.length();i++){
+        char c=h[i];
+        bool hexOk=(c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F');
+        if(!hexOk){
+          srv.send(400,"application/json","{\"error\":\"bad id\",\"detail\":\"id must be 1-8 hex digits, optionally 0x-prefixed\"}");
+          return;
+        }
+      }
+    }
+    uint32_t id=(uint32_t)strtoul(idStr.c_str()+(idStr.startsWith("0x")||idStr.startsWith("0X")?2:0),nullptr,16);
+    bool ext=false;
     if(id>0x1FFFFFFF){srv.send(400,"application/json","{\"error\":\"bad id\"}");return;}
     if(id>0x7FF) ext=true;
     twai_message_t msg; memset(&msg,0,sizeof(msg));
@@ -9901,8 +10078,13 @@ void setupRoutes(){
     bool ok=(e==ESP_OK);
     String note="";
     if(e==ESP_ERR_NOT_SUPPORTED) note=",\"note\":\"re-init without listen_only to transmit\"";
+    // Echo the PARSED id as a canonical hex string, never the raw query text. The raw value
+    // went into the JSON unescaped, so a quote or backslash in ?id= could alter the document
+    // (the non-hex input is now rejected above, but echoing the number removes the class
+    // rather than relying on that check alone).
+    char idHex[12]; snprintf(idHex,sizeof(idHex),"0x%lX",(unsigned long)id);
     srv.send(200,"application/json",
-      "{\"ok\":"+String(ok?"true":"false")+",\"id\":\""+idStr
+      "{\"ok\":"+String(ok?"true":"false")+",\"id\":\""+String(idHex)
       +"\",\"bytes\":"+String(nb)+note+"}");
   });
 
@@ -11450,8 +11632,13 @@ static void wsPump(){
   int n=0;
   while(wsQHead!=wsQTail && n<WS_CMD_Q){
     String line(wsQ[wsQHead]);
+    int from=wsQFrom[wsQHead];
     wsQHead=(wsQHead+1)%WS_CMD_Q;
+    // serialEmit() routes the reply to this slot instead of broadcasting it. Serial callers
+    // leave it at -1, which restores the broadcast path for those events.
+    wsReplyTo=from;
     processCommandLine(line);
+    wsReplyTo=-1;
     n++;
   }
 }
