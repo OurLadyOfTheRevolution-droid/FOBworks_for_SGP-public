@@ -10,6 +10,7 @@ Each assertion names the finding it pins, so a future edit that reintroduces the
 with an explanation rather than just a line number.
 """
 
+import re
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -39,10 +40,43 @@ assert "deserializeJson(jc,line)==DeserializationError::Ok && serialTokenMatches
     "the slot is promoted without a token check (finding 1)"
 
 # A command reply must go to its requester only.
-assert "int slot=wsReplyTo;" in src and "if(slot>=0) wsSendToSlot(slot,json);" in src, \
+assert "int slot=wsReplyTo;" in src and "if(slot>=0) wsSendToSlot(slot,wsReplyToGen,json);" in src, \
     "command replies are broadcast rather than routed to the requester (finding 1)"
 assert "wsReplyTo=from;" in src and "wsReplyTo=-1;" in src, \
     "wsReplyTo is not scoped per queued command (finding 1)"
+
+# ── Follow-up review: three edge cases the first pass left open ─────────────────────────────
+# ① The capture budget was cleared only after a signal was found, so an attempt that timed out
+#    left it set and the next ordinary capture inherited a 250 ms window.
+assert "capMaxMsOverride = 0;                   // consume now, whatever path we leave by" in src, \
+    "the capture budget is not consumed at the point it is read (follow-up 1)"
+assert "capMaxMsOverride=0;   // one-shot" not in src, \
+    "the late, exit-dependent clear is still present (follow-up 1)"
+
+# ② A queued command carried a slot index, which is reused, so a reply could reach whichever
+#    connection inherited the slot. Replies now carry a generation and require auth.
+assert "static uint32_t wsGen[WS_MAX_CLIENTS]" in src and "wsGenNext" in src, \
+    "slots have no generation, so a reused slot can still be addressed (follow-up 2)"
+assert "static bool wsSlotMatches(int slot, uint32_t gen){" in src, \
+    "there is no identity check for a queued reply (follow-up 2)"
+assert "if(!wsServer || !wsSlotMatches(slot,gen) || !wsAuthed[slot]) return;" in src, \
+    "wsSendToSlot does not verify the destination is the requester and is authenticated (follow-up 2)"
+assert "wsGen[i]=0;" in src, \
+    "a departed socket does not invalidate its generation (follow-up 2)"
+
+# ③ Capture still selected the GDO0 path from a bare GPIO48 toggle, which on this revision can
+#    be the SX1278's DIO0.
+assert "bool gdo0Routed = false;" in src, \
+    "the board-routing opt-in is missing or not off by default (follow-up 3)"
+assert "if(gdo0Routed){\n    unsigned long _gt=micros();" in src, \
+    "captureSignal still probes GPIO48 without the routing flag (follow-up 3)"
+assert "if(gdo0ForceAsync){" not in src, \
+    "the old TX-only flag name survives, so capture is not covered by the same gate (follow-up 3)"
+
+# ④ The published prose must agree with FW_VER.
+_ver = re.search(r'#define\s+FW_VER\s+"FOBworks for SGP v(\d+\.\d+)"', src).group(1)
+_readme = (HERE / "README.md").read_text(encoding="utf-8")
+assert f"Version {_ver}." in _readme, f"README does not state the current version (v{_ver})"
 
 # The old unconditional broadcast from the handshake is gone.
 assert 'wsBroadcast(String("{\\"event\\":\\"ws_open\\"' not in src, \
@@ -52,13 +86,13 @@ assert 'wsBroadcast(String("{\\"event\\":\\"ws_open\\"' not in src, \
 # On this revision GPIO 48 is the SX1278's DIO0 and the CC1101's GDO0 is not routed, so a
 # toggle can come from the LoRa side. Selecting the async path on that basis transmits nothing.
 
-assert "bool gdo0ForceAsync = false;" in src, \
-    "the async TX path is not gated behind an explicit opt-in (finding 2)"
+assert "bool gdo0Routed = false;" in src, \
+    "the board-routing opt-in is missing or not off by default (finding 2)"
 
-# Neither selection site may probe the pin unless forced.
+# Neither selection site may probe the pin unless the board routes GDO0.
 for site, marker in (
-    ("startJam", "if(gdo0ForceAsync){\n    pinMode(PIN_GDO0,INPUT);"),
-    ("replayRaw", "if(gdo0ForceAsync){\n    // Force-pins the async TX input"),
+    ("startJam", "if(gdo0Routed){\n    pinMode(PIN_GDO0,INPUT);"),
+    ("replayRaw", "if(gdo0Routed){\n    // Force-pins the async TX input"),
 ):
     assert marker in src, f"{site} still selects the async path from a bare toggle (finding 2)"
 
@@ -77,8 +111,8 @@ assert "uint32_t capMaxMsOverride = 0;" in src, \
     "there is no per-call edge budget (finding 3)"
 assert "capMaxMsOverride=250;" in src and "bool chbOk=captureSignal(3000);" in src, \
     "the Ch-B capture does not set a short recording budget (finding 3)"
-assert "capMaxMsOverride=0;" in src, \
-    "the budget is not one-shot, so it would leak into the next capture (finding 3)"
+# The budget must be one-shot, and consumed at the read rather than after the signal wait --
+# the later form missed every early exit. See follow-up ① above for the positive assertion.
 
 # ── Finding 4: /api/can_send echoed unvalidated input into JSON ──────────────────────────────
 # The raw query text went into the response unescaped, and strtoul's partial parse accepted
