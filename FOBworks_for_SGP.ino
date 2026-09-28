@@ -1,41 +1,21 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// FOBworks for SGP — standalone firmware for the SGP Card Mini
+// FOBworks for SGP — firmware for the SGP Card Mini
 // Version  : FOBworks for SGP v3.76
-// Device   : SGP Card Mini, May 2026 stock (ESP32-S3-MINI-1-N8, 8 MB flash,
-//            no PSRAM, USB CDC on boot)
-// RF Front : Texas Instruments CC1101 — async OOK + 2FSK, 300–928 MHz
-// Dashboard: http://192.168.4.1   Per-device WiFi and API credentials: USB serial
-// Serial   : 115200 baud, JSON command/event protocol (see SERIAL COMMANDS)
-// License  : GPL-3.0. See LICENSE.
+// Board    : May 2026 stock, ESP32-S3-MINI-1-N8, 8 MB flash, no PSRAM
+// Radio    : CC1101, OOK and 2FSK, 300–928 MHz
+// Dashboard: http://192.168.4.1; per-device Wi-Fi credentials are printed over USB
+// Serial   : 115200 baud, JSON commands and events (see SERIAL COMMANDS)
+// License  : GPL-3.0; see LICENSE.
 // ───────────────────────────────────────────────────────────────────────────────
-// ── WiFi AP DASHBOARD MODES ───────────────────────────────────────────────────
-//   On load the embedded dashboard shows a mode picker with four modes:
-//     · FOBscan  — full scanner workbench (live capture, frequency sweep, decode,
-//                  predict, key recovery, signal library, manual + dual-band replay,
-//                  BLE device scan + proximity pairing).
-//                  Frequency picker: Sweep All / Sweep Range / Lock to channel.
-//                  Lock calls /api/sweep_range to pin the CC1101 scan to ±0.15 MHz
-//                  of the selected channel; Sweep All restores the configured band.
-//     · FOBclone — guided step-by-step clone walk-through: pick make → model →
-//                  year, the scanner auto-arms (frequency window + OOK/2FSK),
-//                  tracks captures off the signal library, and offers raw /
-//                  dual-band / predicted / sequence / bruteforce replay scaled
-//                  to the protocol family (fixed, KeeLoq, or rolling).
-//     · FOBcatch — guided jam-and-replay walk-through: pick make → model → year,
-//                  the scanner auto-arms, captures the first fob press, and
-//                  immediately jams that frequency so the car cannot receive it.
-//                  REPLAY retransmits the captured frame, stops the jam, and
-//                  returns to listening. A second fob press while jamming notifies
-//                  and re-jams the new frequency. Each capture can be saved as a
-//                  named key via /api/save_decoded.
-//     · FOBback  — time-agnostic RollBack resync walk-through: pick make → vehicle,
-//                  the scanner passively captures N old fob codes (no jamming).
-//                  When the required count is reached (Loose: any N captures;
-//                  Strict: N consecutive matching roll-counters), tap Replay to
-//                  transmit all N captures in order via /api/fbk_replay?n= to
-//                  trigger receiver resync. Covers Hyundai/Kia, Nissan, Toyota,
-//                  Mazda, Honda/Acura, and Subaru 2005–2010 (sequential counter,
-//                  any 2 captures) with per-variant replay timing constraints.
+// The built-in dashboard has four modes. FOBscan is the general-purpose scanner;
+// it handles capture, scanning, decode, prediction, key recovery, the signal library,
+// replay, and BLE. FOBclone guides a user through collecting and reviewing signals
+// for a vehicle profile. FOBcatch and FOBback are guided capture/replay sequences;
+// their radio and counter checks are described in the sections below.
+//
+// The notes that follow are a quick map of the firmware, not a compatibility claim
+// for every vehicle or board revision. See README.md for the tested board setup and
+// the hardware limits that affect capture and transmission.
 // ───────────────────────────────────────────────────────────────────────────────
 //
 // ── ROLLING-CODE PROTOCOLS ────────────────────────────────────────────────────
@@ -89,10 +69,10 @@
 //   Toyota-Denso (dual-band 312/315 MHz, KeeLoq subtype; v3.19: RSSI falling-edge
 //     lag compensated — LO tolerance ±50%, TE derived from HI pulses only;
 //     v3.33: "too_short" confidence when cnt<80 (decoder loop never ran);
-//     v3.34: SX1278 hard-reset via PIN_LORA_RST before capture so GDO0 is
-//     released; later builds do that reset before every capture, not only
-//     the Toyota band; multi-attempt retry on too_short — Toyota fobs
-//     repeat 3-5 frames per press, retry catches the next clean repetition;
+//     v3.34: added an SX1278 reset before capture, initially believing it freed
+//     GDO0; later measurements showed the CC1101 GDO0 is not routed on this board.
+//     Retries short captures because Toyota fobs send 3–5 frames per press;
+//     a retry may catch a cleaner repetition.
 //     v3.48: false-positive KeeLoq gate for Ch-B captures > 160 bits;
 //     v3.49: phase-alignment fix (try ds and ds+1) + end-of-capture RSSI-tail
 //     tolerance (accept if only b≥38 fails))
@@ -106,10 +86,9 @@
 //   Linear-10 (Linear/Nortek 10-bit DIP-switch gate; edge-count guard ≥100)
 //   LD3 (FAAC LD3 / ATA 38–56-bit fixed, 433 MHz)
 //
-// ── DECODER GUARD DISCIPLINE ──────────────────────────────────────────────────
-//   Each decoder carries a TE window (cA), bit-count (bLen), and ratio guard.
-//   Additional protocol-specific guards prevent false positives from real-world
-//   noise sources observed in field captures:
+// ── DECODER GUARDS ────────────────────────────────────────────────────────────
+//   Decoders check pulse width (cA), bit count (bLen), and timing ratio. A few also
+//   have protocol-specific checks for noise seen in captures:
 //   · FAAC-64: ones-count gate (25–75%), identical-byte SN reject, and
 //     alternating-bit SN reject (popcount(SN ^ SN>>1) > 27 → noise artefact)
 //   · Somfy-RTS: nibble-XOR checksum (1/16 residual false-positive rate)
@@ -120,45 +99,27 @@
 //   · KeeLoq / Toyota / Chrysler / Subaru: frequency + ratio + TE guards;
 //     KeeLoq preamble retry across multiple TE candidates resolves real-fob flips
 //
-// ── RF CAPTURE ENGINE ─────────────────────────────────────────────────────────
-//   · Auto-frequency scan across 39 channels (300–928 MHz, incl. 315/433/868)
-//     - sweepMin / sweepMax (NVS: "swprange" / "sMin","sMax") constrain the band
-//     - /api/setfreq and serial setfreq now pin sweepMin=f-0.15, sweepMax=f+0.15
-//       so scanTick() stays on the locked channel for the session (v3.50)
-//     - WiFi Lock mode calls /api/sweep_range to narrow the background scan;
-//       switching back to Sweep All restores the previous preset band (v3.50)
-//   · Noise-floor measurement (32 samples) → adaptive trigger threshold
-//     - Trigger: noise floor + 10 dBm  (v3.19: lowered from +14; keeps −66 dBm fobs above threshold)
-//     - Edge detect: noise floor +  8 dBm  (sensitive once committed)
-//   · Pulse coherence gate: k-means clustering rejects incoherent noise bursts
-//   · Minimum 18 clean edges required before decode attempt
-//   · Sub-50 µs glitch filtering + pulse merging
-//   · 30 ms inter-burst gap detection (catches slow protocols: Somfy, LD3)
-//   · 3-second capture window, up to 512 edges
+// ── RF CAPTURE ────────────────────────────────────────────────────────────────
+//   The scanner sweeps 39 configured channels across 300–928 MHz. A saved range
+//   narrows the sweep; locking a frequency pins it to ±0.15 MHz. Capture measures
+//   the noise floor before setting its trigger and edge thresholds, then filters
+//   glitches and incoherent bursts before decoding (18 clean edges minimum).
+//   A capture lasts up to three seconds and stores at most 512 edges.
 //
-// ── AUTO-SCAN & SQUELCH ───────────────────────────────────────────────────────
-//   · Continuous 39-channel sweep; auto-captures on signal above squelch level
-//   · Default squelch: -55 dBm (tunable at runtime via SERIAL COMMANDS)
-//   · Weak-hit events (-80 to squelch dBm) emitted without full capture
-//   · OOK-raw (no-decode) results suppressed from auto-scan serial events
-//   · Noise alert toast when 10+ OOK-raw signals accumulate at same freq in 2 min
-//   · Burst-duplicate guard: firmware rejects re-decodes of the same RF burst
-//     that arrive within 200 ms (same proto+edges+TE), eliminating the 2–4×
-//     duplicate entries per button press seen in the signal library (v3.12)
+// ── AUTO-SCAN & SQUELCH ──────────────────────────────────────────────────────
+//   Auto-scan visits the configured channels and captures above the -55 dBm
+//   squelch setting (adjustable at runtime). Weaker hits are reported without a
+//   full capture. OOK noise is hidden from scan events; duplicate decodes of the
+//   same burst are suppressed.
 //
-// ── SIGNAL LIBRARY FIX (v3.12) ────────────────────────────────────────────────
-//   · Fixed sn=0 for all fixed-code protocols in the WiFi AP dashboard.
-//     Dashboard now maps d.code (PT2262, CAME-12, Linear-10), d.addr (EV1527,
-//     PT2240, HT12E, Marantec-D, Somfy-RTS, Beninca, Cardin, AN-Motors, LD3),
-//     and d.fixed (Security+/LiftMaster) to sn, so proto+sn grouping correctly
-//     consolidates repeated captures of the same fob into one library entry.
+// ── SIGNAL LIBRARY ───────────────────────────────────────────────────────────
+//   Fixed-code decoders use their code or address as the serial number, so repeated
+//   captures from the same fob can be grouped in the library.
 //
-// ── REPLAY & PREDICTION ───────────────────────────────────────────────────────
-//   · Raw replay: retransmit any captured burst verbatim (CC1101 OOK TX)
-//   · Rolling-code prediction: compute next N hop codes for decoded protocols
-//     using observed counter delta; replay the predicted frame
-//   · Brute-window replay: sweep a ±window range around predicted counter
-//   · Replay-sequence mode: auto-advance through predicted frames on button
+// ── REPLAY & PREDICTION ──────────────────────────────────────────────────────
+//   Replay can send a saved capture, or—where the decoder supports it—build a
+//   predicted frame from the observed counter delta. Sequence mode advances through
+//   a configured range of predicted frames.
 //
 // ── KEY MANAGEMENT ────────────────────────────────────────────────────────────
 //   · 16 user-defined KeeLoq device keys stored in NVS (survives power cycle)
@@ -232,185 +193,135 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
 // ── CHANGELOG ─────────────────────────────────────────────────────────────────
-// v3.76 (2026-09-28) — an out-of-bounds read in the WS slot table, and a non-portable test.
+// v3.76 (2026-09-28) — an out-of-bounds read in the WebSocket slot table, and a test that
+//   could not compile outside clang.
 //
-//   [BUG] The v3.75 generation lookup was an ARGUMENT to wsSlotMatches(), so wsGen[slot] was
-//     indexed before that function's own slot>=0 guard could apply -- an argument is evaluated
-//     before the call. A fifth connection evicts slot 0 by design, and if that evicted socket
-//     then sends a frame, wsSlotFor() returns -1, giving wsGen[-1]: a read one element before
-//     the array. Confirmed with UBSan, which reports "index -1 out of bounds for type
-//     'uint32_t[4]'" for the old form and nothing for the guarded one. The guard is now in the
-//     expression itself, where short-circuiting actually protects the index.
+//   [BUG] The generation lookup in the WebSocket handler was written as an argument:
 //
-//   [TEST] test_hexstr_bounds.py sized a static array as [CAP+16], where CAP was a
-//     function-scope `const size_t`. That is not a constant expression in C, so the construct is
-//     a variable length array: Apple clang folds it with a -Wgnu-folding-constant warning and
-//     compiles, which is why this suite passed here, while GNU gcc rejects it outright, which is
-//     why it failed for the reviewer. CAP is now a macro, so the array size is a real constant
-//     under any conforming compiler. Not a v3.75 regression -- the old form predates it -- but it
-//     made the suite unable to run for anyone not on clang.
+//           wsEnqueue(line, slot, wsSlotMatches(slot, wsGen[slot]) ? wsGen[slot] : 0);
 //
-// Verified: compile green (1774916 B flash, 149580 B RAM), all 16 suites pass, and the new
-// assertion was mutation-tested -- reverting the guard makes the suite fail.
-// v3.75 (2026-09-28) — three follow-ups from a review of v3.74, plus a doc fix.
+//     An argument is evaluated before the call, so wsGen[-1] was read before
+//     wsSlotMatches() could apply its own slot >= 0 check. The case is reachable: a fifth
+//     connection evicts slot 0, and if that evicted socket then sends a frame, wsSlotFor()
+//     no longer finds its fd and returns -1. Confirmed under UBSan, which reports
+//     "index -1 out of bounds for type 'uint32_t[4]'" for the old form and nothing for the
+//     guarded one. The guard now sits inside the expression, where short-circuiting
+//     protects the index.
 //
-//   [CAPTURE] The v3.74 edge budget was cleared only on the path that FOUND a signal. An
-//     attempt that timed out returned at the "No signal" exit first, leaving capMaxMsOverride
-//     set, so the NEXT ordinary capture silently inherited a 250 ms recording window. The
-//     budget is now consumed at the point it is read, which makes "one-shot" true whatever
-//     path the function leaves by -- the fix for a one-shot value is to clear it where it is
-//     taken, not at the end of some paths.
+//   [TEST] test_hexstr_bounds.py sized a static array with a value that is not a constant
+//     expression in C, making it a variable length array. clang folds it with a warning;
+//     GNU gcc rejects it, so the suite could not compile there and was covering nothing on
+//     that toolchain. The size is now a preprocessor constant.
 //
-//   [SECURITY] A queued WebSocket command carried a slot INDEX. Slots are reused, and
-//     wsSendToSlot() did not check the destination, so a command that waited while its client
-//     left could have its reply delivered to whichever connection took the slot. Each slot
-//     assignment now carries a generation number; a queued reply carries (slot, generation)
-//     and is dropped unless both still match AND the destination is authenticated. Narrower
-//     than the v3.74 broadcast leak -- that one needed no race -- but the same class.
+//   Compile: 1,775,192 B flash of 3,145,728 (56%), 149,580 B RAM of 327,680 (45%).
+//   All 16 suites pass; the new assertion was mutation-tested.
 //
-//   [CAPTURE] captureSignal() still chose the digital GDO0 path from a bare GPIO 48 toggle,
-//     which on this revision is the SX1278's DIO0. v3.74 fixed that for jam and replay but
-//     left capture probing for itself, so a capture could record the LoRa side and label it a
-//     CC1101 capture. The opt-in is now named gdo0Routed and governs all three paths. A
-//     wrong capture is worse than a coarse one, because the RSSI fallback at least reads the
-//     real CC1101 register.
+// v3.75 (2026-09-28) — follow-ups to the v3.74 review.
 //
-//   [DOC] README and CITATIONS still said v3.73 while the firmware said v3.74.
+//   [CAPTURE] A timed-out capture could leave capMaxMsOverride set, giving the next
+//     capture an unintended 250 ms recording window. The budget is now consumed as
+//     soon as captureSignal() reads it, so every exit path sees the same one-shot value.
 //
-// The reviewer's other observation is recorded, not changed: the Ch-B fallback capture now
-// waits 3000 ms for a signal where it used to pass 250 as the wait timeout. Combined with a
-// 250 ms recording budget that is the intended shape -- wait long enough to catch the burst,
-// then record only its tail -- but the timing has not been benched on a card.
+//   [SECURITY] A queued WebSocket reply could reach a new client if the original client
+//     disconnected and its slot was reused. Replies now carry the slot's generation and
+//     are dropped unless the slot still belongs to the authenticated requester.
 //
-// Verified: compile green (1774912 B flash, 149580 B RAM), all 16 suites pass, and the new
-// assertions were mutation-tested -- reverting any of the five makes the suite fail.
-// v3.74 (2026-09-27) — four findings from an external review of v3.73.
+//   [CAPTURE] GPIO 48 is the SX1278's DIO0 on this board, not the CC1101's GDO0.
+//     Capture now uses the digital path only when gdo0Routed is set, as jam and replay
+//     already do. Otherwise it falls back to RSSI readings from the CC1101.
 //
-//   [SECURITY] WebSocket replies reached clients that never authenticated. wsRemember() ran
-//     on the handshake, before any credential was supplied, and serialEmit() -- the single
-//     outbound funnel -- broadcast to every registered fd. The token gated EXECUTION but not
-//     RECEIPT, so anyone who could reach port 81 received decode results and key-related
-//     replies produced by clients that had authenticated. A slot now carries an authed flag,
-//     set only when a valid token arrives on a text frame; broadcast skips unauthenticated
-//     slots, and a command reply is routed back to the slot that sent it (wsReplyTo) instead
-//     of being broadcast. A client that never authenticates now receives nothing.
+//   [DOC] README.md and CITATIONS_AND_REFERENCES.md now identify v3.75.
 //
-//   [TX] The GDO0 toggle test could not prove the CC1101 path. On this board revision GPIO 48
-//     is the SX1278's DIO0 and the CC1101's GDO0 is not routed at all (worklog; the vendor
-//     firmware says the same), so a toggle can come from the LoRa side. Selecting the async
-//     path on that basis drives a pin that is not the CC1101's TX data input and transmits
-//     nothing. startJam() and replayRaw() now default to the packet-mode FIFO path, which
-//     needs no GDO0, and use async only when gdo0Routed is set for a board where GDO0 is
-//     genuinely wired. This corrects earlier notes that treated sleeping or resetting the
-//     SX1278 as a GDO0 fix; doc 15's measurement supersedes that.
+//     The Ch-B fallback now waits up to 3000 ms for a signal, then records for 250 ms.
+//     That timing is intended to catch the end of a press, but has not been measured on
+//     the card.
 //
-//   [CAPTURE] A requested short capture could run for three seconds. timeoutMs bounds the
-//     WAIT for a signal, but the edge-recording deadline was hardcoded at 3 s, so a caller
-//     asking for 250 ms still recorded up to 3 s when a signal stayed above the trigger
-//     threshold. The Ch-B fallback capture -- whose purpose is to catch the tail of a press
-//     that has already ended -- is exactly that case. The edge budget is now a separate
-//     one-shot value (capMaxMsOverride); all existing callers keep the 3 s default.
+//   Compile: 1,774,912 B flash, 149,580 B RAM. All 16 suites pass; the new assertions
+//   were mutation-tested.
 //
-//   [API] /api/can_send echoed the raw ?id= text into its JSON response without escaping, and
-//     strtoul's partial parse accepted non-hex suffixes ("7DFZZZ" parsed as 0x7DF). The id is
-//     now validated as 1-8 hex digits and the response echoes the parsed value canonically, so
-//     neither a malformed value nor a typo can alter the response or the transmitted id.
+// v3.74 (2026-09-27) — fixes for four v3.73 review findings.
 //
-// All four were verified statically and by mutation (test_review_v373_fixes.py); none could be
-// exercised at runtime here, which needs two WebSocket clients and a board with GDO0 routed.
-// v3.73 (2026-09-27) — WiFi WebSocket transport: the dashboard's WiFi mode can connect.
+//   [SECURITY] The token check protected command execution, but not WebSocket broadcasts:
+//     unauthenticated clients could still receive decode results and replies. A slot is now
+//     marked authenticated only after a valid token, broadcasts skip other clients, and
+//     command replies go only to the client that sent the command.
 //
-//   [BUG] There was no WebSocket server at all. The WiFi dashboard opens
-//     ws://<ap-ip>:81; `grep` for WebSocket/port 81 returned 0 hits, and the only server
-//     was WebServer srv(80) serving the built-in page. So that entire mode could not
-//     connect, and its error ("Cannot reach device at 192.168.4.1:81") named the wrong
-//     cause — the device was reachable, the socket did not exist.
+//   [TX] GPIO 48 toggling does not prove a CC1101 connection; it is the SX1278's DIO0,
+//     while the CC1101's GDO0 is not routed on this board. Jam and replay now use packet
+//     mode by default, and select async mode only when gdo0Routed is set on a board with
+//     a wired GDO0. Resetting or sleeping the SX1278 does not change this wiring.
 //
-//   [WS] Added a WebSocket command/event transport on port 81 using esp_http_server
-//     (CONFIG_HTTPD_WS_SUPPORT=1 in this SDK; the Arduino WebServer cannot upgrade a
-//     connection). USB and WiFi now share ONE dispatcher, so a command behaves
-//     identically whichever transport delivered it:
+//   [CAPTURE] timeoutMs limits how long to wait for a signal; it did not limit the
+//     recording itself, which was fixed at three seconds. A separate one-shot
+//     capMaxMsOverride now limits edge recording. Existing callers keep the 3 s default.
+//
+//   [API] /api/can_send now accepts only 1–8 hex digits for ?id= and returns the parsed
+//     value in canonical form. Previously strtoul accepted a valid prefix such as
+//     "7DF" in "7DFZZZ", and the response echoed the unescaped input.
+//
+//   Static checks and mutation tests are in test_review_v373_fixes.py. Runtime checks need
+//   two WebSocket clients and a board with GDO0 routed.
+//
+// v3.73 (2026-09-27) — add the Wi-Fi WebSocket transport.
+//
+//   [BUG] The Wi-Fi dashboard connects to ws://<ap-ip>:81, but the firmware only
+//     served HTTP on port 80. The device was reachable; there was no WebSocket server.
+//
+//   [WS] Port 81 now uses esp_http_server, since Arduino WebServer cannot upgrade a
+//     connection. USB and Wi-Fi share processCommandLine():
 //       · inbound  : httpd handler -> wsEnqueue() -> wsPump() (in loop()) -> processCommandLine()
 //       · outbound : serialEmit() -> wsBroadcast()  (every existing event, no per-event work)
 //
-//   [REFACTOR] The ~1500-line op chain moved out of handleSerial() into
-//     processCommandLine(const String&), so both transports reach the same token gate and
-//     the same commands. Extraction was mechanical — two `continue`->`return` conversions
-//     (the two early exits) and a re-indent, nothing re-typed. The op set is unchanged
-//     (67 names, verified identical to the pre-extraction tree), which matters because it
-//     is hardware behaviour that has been through many review rounds.
+//   [REFACTOR] The command chain moved from handleSerial() to
+//     processCommandLine(const String&). The 67-command set was unchanged.
 //
-//   [THREADING] The httpd handler runs on its OWN FreeRTOS task, but this firmware is
-//     built on the single-loop-task invariant v3.41 established (large buffers were moved
-//     to `static` on that basis). Running a command inline from the httpd task would have
-//     broken it, so inbound lines are queued and executed from loop(); only socket
-//     bookkeeping happens on the httpd task. Outbound uses httpd_ws_send_frame_async,
-//     which is documented as safe to call from another task.
+//   [THREADING] The HTTP handler runs on a FreeRTOS task. It queues inbound commands
+//     for wsPump() to execute from loop(); running them in the handler would break the
+//     firmware's single-loop-task assumption. Outbound frames use the async send API.
 //
-//   [GUARD] Inbound frames are bounded (WS_LINE_MAX 2048) and the queue is 4 deep; an
-//     overlong frame is refused with an explicit ws-frame-too-long rather than truncated.
-//     A full queue drops rather than overwrites. wsPump() is bounded per pass so a flood
-//     of WS commands cannot starve capture, scan or the sequencers.
+//   [GUARD] Frames are limited to WS_LINE_MAX (2048 bytes); oversized frames are rejected.
+//     The four-entry queue drops commands when full, and wsPump() handles only a bounded
+//     number per loop pass so socket traffic cannot starve capture or scanning.
 //
-//   [COST] Two static buffers: the inbound queue (4 x 2048 = 8 KB) and the httpd-side
-//     receive buffer (2 KB). Measured RAM 139420 -> 149700 B (+10280, of which 10256 is
-//     these buffers). Flash 55% -> 56%.
+//   [COST] The queue (4 × 2048 B) and receive buffer (2048 B) add 10,256 B of static
+//     storage. Measured RAM use rose from 139,420 to 149,700 B; flash use from 55% to 56%.
 //
-//   Note: the dashboard's WiFi mode needs the same access code as USB, because it is one
-//   token gate on one dispatcher. The app-side field is added.
+//   Wi-Fi uses the same access code as USB; both transports reach the same token gate.
 //
-// v3.72 (2026-09-26) — packet-mode TX: the board can transmit without GDO0.
+// v3.72 (2026-09-26) — add packet-mode TX, which does not use GDO0.
 //
-//   [FINDING] The CC1101's GDO0 is NOT connected to a readable GPIO on this revision.
-//     GPIO 48 is the SX1278's DIO0. Established by measurement, all controls passing:
-//     with the CC1101 tri-stated (IOCFG0=0x2E read back) and the SX1278 asleep
-//     (RegOpMode 0x00 read back) AND in reset (SPI stops answering), pin 48 stays sunk;
-//     only cutting the sensor rail frees it — and that rail also powers the CC1101, so
-//     it is not a usable fix. Matches SGP_CardMini.ino v2.8 ("GDO0 NO está cableado").
-//     See worklog. Four intermediate verdicts in that round were WRONG and are
-//     recorded in 14 §2: IOCFG0=0x2F is CC1101IocfgHW (an input, not a clock);
-//     pinMode(OUTPUT) does not enable the ESP32 input buffer so digitalRead lies;
-//     SX1278 "reset" was assumed to release DIO0 and does not.
+//   [FINDING] GPIO 48 is the SX1278's DIO0; the CC1101's GDO0 is not routed to a
+//     readable ESP32 pin. Pin 48 stayed low with the CC1101 tri-stated and the SX1278
+//     asleep or in reset. Removing sensor-rail power freed it, but that rail also powers
+//     the CC1101. The vendor firmware reports the same missing GDO0 connection.
 //
-//   [TX] Packet-mode TX over the TX FIFO needed no GDO0 at all — the vendor firmware's
-//     own comment documents this ("Sin GDO0 ... se hará via FIFO/PA del CC1101") and the
-//     tree had no FIFO code anywhere. Added cc_writeBurst(), cc_txPacket(),
-//     cc_txCarrier. Verified radiating with an external receiver (worklog).
+//   [TX] Packet mode sends through the TX FIFO and does not need GDO0. Added
+//     cc_writeBurst(), cc_txPacket(), and cc_txCarrier(); an external receiver decoded
+//     a transmitted frame.
 //
-//   [BUG] A drained TX FIFO is NOT evidence of RF: OOK needs BOTH PATABLE levels
-//     programmed ("logic 0 and logic 1 to index 0 and 1 respectively", §24), and a
-//     single-byte 0x3E write reaches index 0 only. Index 1 was 0x00, so an OOK logic 1
-//     went out at ZERO POWER while the FIFO drained normally and the test reported
-//     success. Fixed with a burst write of {0xC0,0xC0}; pa_check reads it back.
+//   [BUG] A drained FIFO did not prove that the radio transmitted. OOK needs both
+//     PATABLE entries set; the old single-byte write left logic 1 at zero power.
+//     A burst write now sets {0xC0,0xC0}, and pa_check verifies the values.
 //
-//   [BUG] TX is MARCSTATE 19,20 — not 17, which is RXFIFO_OVERFLOW. The wrong constant
-//     made a working carrier report "did not enter TX" for three rounds. Exposed by
-//     logging the raw MARCSTATE/TXBYTES sequence rather than trusting the verdict.
-//     The TX FIFO is 64 bytes: writing more in one burst silently drops the excess.
+//   [BUG] MARCSTATE 19 and 20 indicate TX; 17 is RXFIFO_OVERFLOW. The TX FIFO holds
+//     64 bytes, so larger writes must be split across bursts.
 //
-//   [C1] startJam() now selects a path: GDO0 async TX when the pin toggles, otherwise
-//     the PA driven from the FIFO (64-byte 0xFF packets at ~8.9 kBaud, ~58 ms each) kept
-//     alive by jamTick() from loop() so C1 can jam AND watch RSSI AND capture. jamTick()
-//     writes only 64-queued bytes — overfilling corrupts the byte counter and starved the
-//     FIFO (carrier gapped ~1/s). jam_status reports underruns and max loop gap.
+//   [C1] The FIFO carrier uses 64-byte 0xFF packets at about 8.9 kBaud. jamTick() refills
+//     them from loop(); overfilling the FIFO caused roughly one carrier gap per second.
+//     jam_status reports underruns and the longest loop gap.
 //
-//   [GUARD] replayRaw() no longer returns true on a dead path. It bit-bangs PIN_GDO0 as
-//     the async TX data input, so where GDO0 is absent it toggled the LoRa's DIO0 and
-//     reported success for a transmission of nothing — every caller then said ok:true,
-//     and C2 would report a completed RollBack having sent nothing. It now tests the pin
-//     for toggling (the same test startJam uses) and refuses with reason "tx_path_dead",
-//     plus a chip-side MARCSTATE check after the burst. worklog §1.
+//   [GUARD] The first replay path toggled GPIO 48 to check for async TX, but that pin
+//     belongs to the SX1278 and is not proof of a CC1101 connection. The check could
+//     report a successful replay when nothing was sent. The v3.72 implementation added
+//     a TX-state check; v3.74 later replaced pin-based path selection with gdo0Routed.
 //
-//   [GUARD] Captures that contain no bit edges are refused with reason "no-bit-edges".
-//     The RSSI fallback polls at ~1600 µs, slower than a Kia V3/V4 short pulse, so it
-//     produced uniform pulses that were still reported as "✓ N edges" and fed to the
-//     decoders as has_ctr:true. A real frame is short/long at ~2:1; uniform widths mean
-//     there is nothing to decode. The RX-side twin of the guard above.
+//   [GUARD] The RSSI fallback polls at roughly 1600 µs, too slowly to resolve short
+//     Kia V3/V4 pulses. Captures with no bit edges now fail with "no-bit-edges" instead
+//     of being passed to a decoder as a valid frame.
 //
-//   [DIAG] gdo0_probe, gdo0_isolate, lora_sleep_check, lora_rst_check, gdo0_rail_test,
-//     tx_fifo_test, tx_carrier_test, pa_check, jam_status. Each carries method controls
-//     (readback before verdict, known-good reference pins) after the failures above —
-//     every wrong answer this round was an error of the instrument, not the device.
+//   [DIAG] Added gdo0_probe, gdo0_isolate, lora_sleep_check, lora_rst_check,
+//     gdo0_rail_test, tx_fifo_test, tx_carrier_test, pa_check, and jam_status. Readbacks
+//     and reference-pin checks make each result easier to verify.
 //
 // v3.71 (2026-09-26) — a capture is now trimmed to ONE frame (worklog F2/F5/F4).
 //
@@ -1082,9 +993,9 @@
 //   · RSSI in-loop 100 µs minimum-pulse guard — sub-100 µs crossings (threshold oscillations)
 //     no longer consume rawBuf slots or reduce cnt.
 //
-// v3.34 (2026-06-14) — Toyota-band SX1278 hard reset + multi-attempt retry.
-//   · loraHardReset() asserts PIN_LORA_RST (GPIO47) LOW for 200 µs before SPI sleep;
-//     loraSleepInit() alone left DIO0 LOW, masking CC1101 GDO0 edges.  Toyota-band only.
+// v3.34 (2026-06-14) — add an SX1278 reset before Toyota-band capture and retry short results.
+//   · At the time, reset was believed to release GDO0. Later measurements showed the
+//     CC1101 GDO0 is not routed on this board; see v3.72.
 //   · After a "too_short" result scanTick retries captureSignal() up to 2×; best result
 //     (decoded or highest edge count) goes to the signal library.
 //
@@ -1291,8 +1202,8 @@
 //     idx 0 = NA (300–320 MHz)   idx 1 = EU (433–435 MHz)   idx 2 = ALL
 //
 // ── HARDWARE PIN MAP ──────────────────────────────────────────────────────────
-//   CC1101 : MOSI=35  MISO=33  SCK=36  CS=34  GDO0=48
-//   LoRa   : Ra-02 SX1278  CS=38  RST=47  DIO0=48 (shared with GDO0)
+//   CC1101 : MOSI=35  MISO=33  SCK=36  CS=34  GDO0 not routed to an ESP32 GPIO
+//   LoRa   : Ra-02 SX1278  CS=38  RST=47  DIO0=48
 //            GPIO 26 is reserved for a later SX1262 and is unused on this card.
 //   SD     : CS=10
 //   RGB LED: GPIO 5               Buzzer : GPIO 1
@@ -1886,14 +1797,11 @@ static bool serialTokenMatches(const JsonDocument& command);
 
 void serialEmit(const String& json){
   Serial.println(json);
-  // Mirror every outbound event to WebSocket clients. This is the single outbound funnel for
-  // the whole firmware (ticks, heartbeats, decode results, every command reply), so tapping it
-  // here gives the WiFi dashboard the same stream the USB one gets, with no per-event changes
-  // and nothing to keep in sync as events are added.
+  // Mirror the serial event stream to authenticated WebSocket clients here. Keeping one
+  // outbound path means new events reach both dashboards without per-event routing code.
   //
-  // Routing: a reply to a WiFi command goes back to the client that sent it, and nowhere else
-  // (wsReplyTo names that slot -- see wsPump()). Everything else -- serial commands, timers,
-  // capture results -- is broadcast, but only to clients that have authenticated.
+  // A Wi-Fi command reply goes only to its sender (wsReplyTo, set in wsPump()). Other
+  // events, including serial replies and capture results, go to authenticated clients.
   //
   // Declared here, defined with the rest of the WebSocket code below.
   int slot=wsReplyTo;
@@ -1902,40 +1810,28 @@ void serialEmit(const String& json){
 }
 
 // ─── WebSocket command/event transport (port 81) ──────────────────────────────
-// The USB dashboard speaks JSON-over-serial. The WiFi dashboard expects the SAME JSON
-// frames over ws://<ap-ip>:81, and the firmware had no WebSocket server at all, so that
-// entire mode could not connect.
+// The USB dashboard uses JSON over serial; Wi-Fi sends the same commands as WebSocket
+// frames to port 81.
 //
-// Built on esp_http_server (CONFIG_HTTPD_WS_SUPPORT=1 in this SDK), not the Arduino
-// WebServer, which cannot upgrade a connection.
+// Use esp_http_server (CONFIG_HTTPD_WS_SUPPORT=1). Arduino WebServer cannot upgrade
+// the connection.
 //
-// THREADING: the httpd handler runs on its own FreeRTOS task, but this firmware is built
-// on the single-loop-task invariant that v3.41 established (large buffers were moved to
-// `static` on exactly that basis). Running a command inline from the httpd task would
-// break it. So inbound commands are copied into a ring buffer and executed from loop()
-// by wsPump(); only the socket bookkeeping happens on the httpd task.
+// The HTTP handler runs in its own FreeRTOS task. It queues commands for wsPump() to
+// execute from loop(); commands must not run on the handler task because the firmware's
+// buffers and radio state rely on a single command loop.
 //
-// OUTBOUND: wsBroadcast() is called by serialEmit(), the single outbound funnel, so every
-// existing event (ticks, heartbeats, decode results, all ~65 command replies) reaches WiFi
-// clients with no per-event changes. httpd_ws_send_frame_async is documented as safe from
-// another task, which is what makes this work from loop().
+// serialEmit() forwards outbound events. Replies go to their requesting client; other
+// events are broadcast to authenticated clients. The async send API is safe from loop().
 #define WS_MAX_CLIENTS 4
 #define WS_CMD_Q       4            // queued inbound commands (loop() drains each pass)
 httpd_handle_t wsServer = nullptr;
 
-// A connected client is NOT a subscriber. Previously wsRemember() ran on the handshake,
-// before any credential was supplied, and wsBroadcast() sent every event to every registered
-// fd -- so a client that never authenticated still received decode results and key-related
-// replies produced by whoever did. The token gated EXECUTION but not RECEIPT.
-//
-// So a slot now carries an authenticated flag, set only after a valid token arrives. Broadcast
-// skips unauthenticated slots. A client that never authenticates gets nothing.
+// Registering a socket is not enough to receive events. Each slot stays unauthenticated
+// until the client sends a valid token; broadcasts skip all other slots.
 static int  wsFd[WS_MAX_CLIENTS]       = { -1, -1, -1, -1 };
 static bool wsAuthed[WS_MAX_CLIENTS]   = { false, false, false, false };
-// A slot index alone is not a connection identity: slots are reused, so a queued reply could
-// address whoever took the slot meanwhile. Each time a slot is assigned, it gets a new
-// generation number, and a queued reply carries (slot, generation). Only the connection that
-// issued the command can match both.
+// Slots are reused, so an index alone cannot identify the client that queued a reply.
+// Each assignment gets a new generation; a reply is sent only if both still match.
 static uint32_t wsGen[WS_MAX_CLIENTS]  = { 0, 0, 0, 0 };
 static uint32_t wsGenNext              = 1;
 // wsReplyTo (defined above, with serialEmit's forward declarations) names the slot that the
@@ -1976,8 +1872,7 @@ static int wsAuthedCount(){
   return n;
 }
 
-// Broadcast one JSON object to every AUTHENTICATED client. A send failure means the peer is
-// gone; clear the slot so we stop trying.
+// Send an event to authenticated clients. Drop slots whose send fails.
 static void wsBroadcast(const String& json){
   if(!wsServer) return;
   for(int i=0;i<WS_MAX_CLIENTS;i++){
@@ -1991,14 +1886,9 @@ static void wsBroadcast(const String& json){
   }
 }
 
-// Send one JSON object to a single slot's client. Used for a command reply, which must go back
-// to its requester and nowhere else.
-//
-// Two guards, both of which the first version lacked:
-//   · gen must still match the slot. A slot is reused when a client leaves, so a reply to a
-//     departed requester must be dropped rather than delivered to whoever inherited the slot.
-//   · the destination must still be authenticated. Reply routing and event broadcast share the
-//     same table, so the reply path needs the same check the broadcast path has.
+// Send a command reply only to its requester. Check both the slot generation and
+// authentication before sending; otherwise a reused slot could expose a reply to a
+// different client.
 static void wsSendToSlot(int slot, uint32_t gen, const String& json){
   if(!wsServer || !wsSlotMatches(slot,gen) || !wsAuthed[slot]) return;
   int fd=wsFd[slot];
@@ -2009,9 +1899,8 @@ static void wsSendToSlot(int slot, uint32_t gen, const String& json){
   if(httpd_ws_send_frame_async(wsServer, fd, &f)!=ESP_OK){ wsFd[slot]=-1; wsAuthed[slot]=false; wsGen[slot]=0; }
 }
 
-// Inbound queue, written by the httpd task and drained by loop(). Single-producer /
-// single-consumer: the head is only advanced by loop(), the tail only by httpd, which is
-// why no lock is needed (both are int-sized and only ever move forward).
+// The HTTP task writes the queue; loop() drains it. Each side updates a different index,
+// so neither can overwrite the other's progress.
 #define WS_LINE_MAX 2048
 static char wsQ[WS_CMD_Q][WS_LINE_MAX];
 static int      wsQFrom[WS_CMD_Q];    // slot that sent each queued line, for reply routing
@@ -2030,16 +1919,13 @@ static void wsEnqueue(const String& line,int fromSlot,uint32_t fromGen){
   wsQTail=next;
 }
 
-// Drain queued commands on the loop() task, so they run under the single-task invariant.
-// Declared here, defined after the command dispatcher exists.
+// Drain commands from loop(), not the HTTP task. Defined after the dispatcher.
 static void wsPump();
 
 static esp_err_t wsHandler(httpd_req_t* req){
   int fd = httpd_req_to_sockfd(req);
   if(req->method==HTTP_GET){          // handshake completes on the first GET callback
-    // Register the socket but do NOT subscribe it: it receives nothing until a valid token
-    // arrives on a text frame (see the wsMarkAuthed() call below). Registration only makes
-    // the fd addressable for a reply to the client's own command.
+    // Track the socket, but do not send it events until it presents a valid token.
     wsRemember(fd);
     addLog("[WS] socket open ("+String(wsClientCount())+" conn, "
            +String(wsAuthedCount())+" authed)");
@@ -2050,8 +1936,8 @@ static esp_err_t wsHandler(httpd_req_t* req){
     addLog("[WS] client disconnected ("+String(wsClientCount())+" left)");
     return ESP_OK;
   }
-  // Text frame. Probe for length first, then receive into a static buffer -- one per
-  // httpd task, which is single, so no contention with the loop-task buffers.
+  // Receive into a static buffer owned by the single HTTP task. The loop-task buffers
+  // are separate.
   static char rx[WS_LINE_MAX];
   httpd_ws_frame_t frame{};
   frame.type    = HTTPD_WS_TYPE_TEXT;
@@ -2068,10 +1954,7 @@ static esp_err_t wsHandler(httpd_req_t* req){
   String line(rx); line.trim();
   if(line.length()>=3 && line[0]=='{'){
     int slot = wsSlotFor(fd);
-    // Promote the slot the moment a command carrying a valid token arrives. Checking here
-    // (rather than in the loop-task dispatcher) lets the very first authenticated client
-    // subscribe on its first frame, and keeps the flag update on the httpd task where the
-    // table is otherwise only touched.
+    // Authenticate before queueing so this client's first command can receive its reply.
     if(slot>=0 && !wsAuthed[slot]){
       JsonDocument jc;
       if(deserializeJson(jc,line)==DeserializationError::Ok && serialTokenMatches(jc)){
@@ -2658,9 +2541,9 @@ void cc_cs(bool sel){
     digitalWrite(PIN_CC1101_CS,HIGH);
   }
 }
-// May 2026 SGP Card Mini: Ra-02 SX1278. DIO0 shares GPIO 48 with CC1101 GDO0.
-// This firmware does not use the LoRa radio. Reset, then write RegOpMode 0x00
-// so DIO0 goes high-impedance and the CC1101 can drive GDO0.
+// The May 2026 card has a Ra-02 SX1278 whose DIO0 is wired to GPIO 48. The CC1101's
+// GDO0 is not routed to a readable ESP32 pin on this revision. Reset and sleep the
+// SX1278 for its SPI setup, but do not rely on either to create a CC1101 GDO0 path.
 // Read one SX1278 register. Bit 7 clear = read on SX1278 (unlike the CC1101).
 static uint8_t loraReadReg(uint8_t a){
   digitalWrite(PIN_LORA_CS,LOW);
@@ -2672,13 +2555,9 @@ static uint8_t loraReadReg(uint8_t a){
   return v;
 }
 
-// Read back RegOpMode after the sleep write and record it.
-//
-// This exists because the whole GDO0 failure came down to an assumption: the firmware
-// asserted "SX1278 DIO0 released" after loraSleepNow() but never checked. The bench
-// then measured a pin held LOW and blamed the ESP32, when the LoRa was still driving
-// the shared line. If this readback is not 0x00, the sleep never landed and DIO0 stays
-// an output — which is exactly the symptom, and a two-line fix rather than a hardware one.
+// Read back RegOpMode to confirm the sleep command reached the SX1278. A successful
+// readback does not mean GPIO 48 is connected to the CC1101; the board measurement
+// found no CC1101 GDO0 route.
 uint8_t loraOpModeAfterSleep = 0xFF;   // 0x00 = SLEEP confirmed; 0xFF = never sampled
 
 // Call outside an SPI transaction. loraHardReset opens and closes its own.
@@ -2712,24 +2591,11 @@ uint8_t cc_readStatus(uint8_t a){ cc_cs(true); cc_waitMISO(); cc_xfer(a|0xC0); u
 // Forward declaration: cc_init() programs the PA table before this is defined below.
 void cc_writeBurst(uint8_t addr,const uint8_t* p,uint8_t n);
 
-// ─── Packet-mode TX over the FIFO (worklog §1) ────────────────────────────
-//
-// Why this exists: on this board revision the CC1101's GDO0 is not connected to a
-// readable GPIO, so the async bit-bang TX path cannot key the PA. The vendor firmware
-// documents the workaround in the same comment that states GDO0 is absent:
-//
-//   // Sin GDO0 no se puede hacer replay bit-bang;
-//   // se hará via FIFO/PA del CC1101.
-//   // ("Without GDO0 you cannot do bit-bang replay; it will be done via the CC1101's
-//   //   FIFO/PA.")
-//
-// In packet mode the chip frames the payload from its TX FIFO and drives its own PA.
-// GDO0 is only the TX *data input* in async serial mode, so packet mode needs no GDO0
-// at all. That makes structured-protocol transmission possible on this hardware.
-//
-// What it cannot do: bit-accurate RAW replay. The chip frames the packet (preamble,
-// optional sync word, optional CRC), so arbitrary captured pulse trains cannot be sent
-// verbatim. Rolling-code frames are ordinary packets, so C1/C2's decoded codes fit.
+// ─── Packet-mode TX over the FIFO ────────────────────────────────────────────
+// The CC1101's GDO0 is not routed on this board, so async bit-bang TX cannot drive
+// the PA. Packet mode sends data from the chip's FIFO and does not need GDO0. It can
+// send protocol frames, but not reproduce arbitrary captured pulse timing: the chip
+// adds packet framing. C1/C2's decoded frames fit this path.
 void cc_writeBurst(uint8_t addr,const uint8_t* p,uint8_t n){
   cc_cs(true); cc_waitMISO();
   cc_xfer(addr|0x40);                 // burst write
@@ -2737,16 +2603,14 @@ void cc_writeBurst(uint8_t addr,const uint8_t* p,uint8_t n){
   cc_cs(false);
 }
 
-// Transmit one packet synchronously. Returns true if the chip accepted and sent it.
-// `wait` polls the TXBYTES status register until the FIFO drains, with a bounded
-// timeout so a wedged radio cannot hang the caller (or leave a carrier running).
+// Transmit one packet and wait, with a deadline, for the TX FIFO to drain. Always
+// return the chip to idle and restore the receive configuration afterward.
 bool cc_txPacket(float mhz,const uint8_t* payload,uint8_t n,uint8_t chan){
   if(n==0||n>64) return false;        // CC1101 FIFO is 64 B
   SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
   cc_setFreq(mhz);
   cc_writeReg(0x0A,chan);             // CHANNR
-  // Packet mode: PKTCTRL0 = 0x00 -> packet handling ON, fixed length, no whitening,
-  // CRC enabled. (0x30 was async serial, which is what needs GDO0.)
+  // Fixed-length packet mode; no whitening or CRC. (0x30 is async serial and needs GDO0.)
   cc_writeReg(0x08,0x00);
   cc_writeReg(0x06,n);                // PKTLEN
   cc_writeReg(0x07,0x00);             // PKTCTRL1: no address check, no append status
@@ -2776,33 +2640,14 @@ bool cc_txPacket(float mhz,const uint8_t* payload,uint8_t n,uint8_t chan){
   return drained && txb>0;
 }
 
-// Emit an unmodulated carrier for `ms`, without GDO0. Same technique as startJam():
-// the PA is keyed by the chip, not by the TX data pin, so this works on this board.
-//
-// Two faults in the first version, both fixed:
-//
-// 1. It returned `true` unconditionally, so it could not fail. That is the same class of
-//    false indicator as the FIFO count that reported success while OOK logic 1 was
-//    transmitting at zero power. MARCSTATE is now read and TX (17) is required.
-//
-// 2. It selected async serial mode (PKTCTRL0=0x30) with GDO0 tri-stated (IOCFG0=0x2E).
-//    In async TX the chip takes its data FROM GDO0, so an unconnected high-impedance pin
-//    means the transmitted level is undefined — not a carrier. There is no way to key a
-//    carrier through a pin that does not exist.
-//
-// The working approach is packet mode with an INFINITE packet length
-// (PKTCTRL0.LENGTH_CONFIG=2) and the TX FIFO kept filled with 0xFF. In OOK a logic 1 is
-// full PA power (PATABLE index 1, now 0xC0), so a stream of 1s is an unmodulated carrier
-// that runs until SIDLE. The FIFO must be refilled before it underflows.
-//
-// Data rate is DRATE = (256+DRATE_M)*2^DRATE_E/2^28*XOSC; with MDMCFG4/3 = 0x4C/0x22 that
-// is ~115 kBaud, so 64 FIFO bytes drain in ~4.4 ms. The refill loop therefore runs every
-// ~2 ms to stay ahead of underflow.
+// Send an unmodulated carrier without GDO0. Packet mode keys the PA from the chip;
+// async mode would need the missing data pin. The FIFO is kept full of 0xFF (OOK high,
+// PATABLE index 1 = 0xC0), and the function checks MARCSTATE rather than reporting
+// success unconditionally. Refills must keep ahead of FIFO underflow.
 int  lastTxMarcState=-1;  // MARCSTATE observed while trying to reach TX (diagnostic)
 int  txDiagMcsM1=-1;      // MCSM1 at attempt time (TXOFF_MODE decides post-TX state)
 bool lastTxUnderflow=false;// did the TX FIFO run dry mid-carrier? (a gap means no jam)
-// Which route the last replayRaw() took. "ok:true" from a caller is only meaningful
-// together with this: a replay that reports success must name the path that carried it.
+// Record which TX path replayRaw() used; a success reply must name the path.
 enum ReplayPath { REPLAY_NONE=0, REPLAY_VIA_GDO0, REPLAY_VIA_FIFO };
 ReplayPath lastReplayPath=REPLAY_NONE;
 bool cc_txCarrier(float mhz,uint16_t ms){
@@ -3942,31 +3787,20 @@ static void rbReset(){
   rbPhase=RB_IDLE; rbArmed=false; rbT0=0;
 }
 
-// Arm the sequencer. Explicit and separate from firing, so a duplicate tap on a
-// UI button cannot re-fire the sequence: every fire consumes the arm.
-//
-// Two entries are necessary but NOT sufficient: they must be two different codes in
-// the right order, or the sequence sent to the receiver is wrong and the attack
-// fails silently (worklog §2.5). Both checks below are therefore required.
+// Arm only after two distinct, single-frame captures are ready and their counters
+// are in order. The start call consumes the arm, preventing a duplicate tap from firing twice.
 static bool rbArm(){
   if(rbPhase==RB_GAP) return false;                 // already mid-sequence
   if(fbkCount<2) return false;                      // need two codes
-  // A stored block must be ONE frame. Only Kia V3/V4 has a measured frame boundary, so
-  // for any other protocol the entry is still ~3 repeats and C2 would transmit several
-  // presses of each code — which may still land, or may advance the receiver's counter
-  // by 3 and break the sequence. Neither is certain, which is the worst position: the
-  // operator cannot tell an unsupported protocol from a mis-sequenced tool. So refuse
-  // and attribute it, rather than proceeding silently (worklog §2 / §3 P1).
+  // Only Kia V3/V4 has a measured frame boundary. Refuse other captures unless they
+  // have already been trimmed; replaying a block of repeats could send multiple presses.
   if(!fbkBuf[0].trimmed||!fbkBuf[1].trimmed) return false;
-  // Same-code rejection. A capture that decoded to a counter uses it; the order and
-  // the delta must be consistent with the protocol's step. This is the check that
-  // matters, because one press can append two entries.
+  // Check the counters when available; one button press can add two entries.
   int ord=fbkCtrOrder();
   if(ord<0) return false;                           // ctr[1] is not ahead of ctr[0]
   if(ord==0){
-    // No decoded counter, so fall back to content identity: two byte-identical
-    // blocks are certainly the same code, which cannot form a RollBack pair. This is
-    // a necessary condition only, not proof that they differ.
+    // Without decoded counters, reject byte-identical frames. Different bytes alone
+    // do not prove that the frames form a valid pair.
     if(fbkBuf[0].len==fbkBuf[1].len &&
        fbkHash(fbkBuf[0].w,fbkBuf[0].len)==fbkHash(fbkBuf[1].w,fbkBuf[1].len))
       return false;
@@ -3984,8 +3818,7 @@ static bool rbStart(uint32_t gapMs){
   if(fbkCount<2){ rbArmed=false; return false; }
   rbArmed=false;                                    // consume: single-shot
   rbGapMs = (gapMs<RB_GAP_MIN_MS)?RB_GAP_MIN_MS:((gapMs>RB_GAP_MAX_MS)?RB_GAP_MAX_MS:gapMs);
-  // This feature transmits deliberate codes, so a live carrier must not be on:
-  // it would collide with our own transmission.
+  // Stop any carrier before transmitting the stored frames.
   if(jamActive) stopJam();
   scanActive=false;
   FbkEntry& e0=fbkBuf[0];
@@ -4011,8 +3844,7 @@ static void rbTick(){
   if(millis()-rbT0 < rbGapMs) return;
   FbkEntry& e1=fbkBuf[1];                           // fbkCount>=2 guaranteed by rbStart
   bool ok=replayRaw(e1.freq, e1.w, e1.len, 3, e1.sh);
-  // Every exit path stops the jam, including this one. A jam that will not stop
-  // is the worst failure mode of any transmitting feature here.
+  // Stop any active jam before reporting the result.
   if(jamActive) stopJam();
   rbPhase=RB_DONE;
   setLed(0,150,65);
@@ -4024,34 +3856,18 @@ static void rbTick(){
 }
 
 // ─── C1: RollJam sequencer ───────────────────────────────────────────────────
-// Jam press 1 (the car never hears it), capture it, keep jamming, wait for press 2,
-// capture that too, then replay press 1. The car accepts the replayed code and the
-// code it never heard (press 2) stays banked for later. worklog C1.
+// The intended sequence is to capture two presses and replay the first. Whether a
+// receiver accepts that sequence has not been tested on a car.
 //
-// Why this lives in firmware rather than the dashboard: the shipped form was a
-// JavaScript state machine in html_page.h (FOBcatch's fccPhase) polling three HTTP
-// endpoints every 1.5 s. That put the jam under the browser's control, so closing
-// the tab or losing Wi-Fi mid-sequence left the carrier running with nothing to stop
-// it — the same class of failure as the reset-path jam in worklog §2.2, one
-// layer up. It also had no deadline, no single-shot lockout, and no check that the
-// two "codes" it banked were actually two different codes (the defect worklog
-// §2.5 fixed in C2). All four are structural here:
+// The dashboard version ran the sequence in JavaScript, polling HTTP endpoints. That
+// meant a closed tab or lost Wi-Fi could leave the jam running. The firmware sequencer
+// owns the radio and adds an explicit, single-use arm, a deadline, cleanup on every
+// exit (including reset), and a counter check before replay.
 //
-//   · the jam is owned by firmware and cleared on every exit path, and by the boot
-//     guard in setup() if a reset intervenes;
-//   · an explicit arm is required and firing consumes it (single-shot);
-//   · a hard deadline aborts the sequence and stops the jam;
-//   · the two captures must decode to different, forward-ordered counters before
-//     the replay is allowed, reusing the C2 check.
-//
-// The single-radio constraint is real and shapes the timing: during the jam phases
-// the CC1101 is in TX (STX) with GDO0 held HIGH, so it cannot also receive. A press
-// is therefore noticed by RSSI (the carrier is on, so a fob transmission shows as a
-// rise), and the capture happens in the window AFTER the jam is dropped. That window
-// is the risk worklog flags: dropping the jam for the capture also lets the car
-// hear that press. The mitigation specified there is to keep the jam on through the
-// press and only drop it after — validated on a bench, not here. This code does the
-// ordering; it cannot prove the ordering works against a real receiver.
+// The card has one CC1101, so it cannot transmit and receive at the same time. It
+// alternates between jamming and capture; each capture window also gives the receiver
+// a chance to hear the fob. Host-side tests cannot establish whether the timing works
+// against a real receiver.
 enum RJState : uint8_t { RJ_IDLE=0, RJ_JAM1, RJ_CAP1, RJ_JAM2, RJ_CAP2, RJ_TX1, RJ_DONE };
 static RJState  rjState = RJ_IDLE;
 static uint32_t rjT0=0, rjDeadline=0;
@@ -4065,7 +3881,7 @@ static bool     rjArmed=false;
 static bool     rjReplayed=false;            // true once press 1 was retransmitted
 static String   rjLastJson="{\"event\":\"rolljam\",\"state\":\"idle\"}";
 
-// Captures are single-shot and bounded: two blocks, no loop, per the guard rails.
+// Two bounded capture buffers; each sequence collects at most one pair.
 static uint16_t rjBuf1[CAP_SZ], rjBuf2[CAP_SZ];
 static bool     rjSh1=true, rjSh2=true;
 
@@ -7411,53 +7227,30 @@ String decodeSignal(){
 }
 
 // ─── Capture Engine ───────────────────────────────────────────────────────────
-// RSSI-based detection: noise floor sampled at startup, threshold = floor+12 dBm.
-// RSSI floor is sampled at startup. Threshold sits 12 dB above that floor.
-// captureSignal — capture one burst of edges.
+// captureSignal() first waits for a signal, then records its edges. timeoutMs limits
+// the wait; capMaxMsOverride limits recording (zero keeps the 3 s default). The
+// separate recording limit lets the Ch-B fallback wait for a press and then record
+// only its tail.
 //
-// timeoutMs  : wall-clock bound on how long we WAIT for a signal to appear (the scan
-//              loop and the fallback sweep). It is NOT a bound on the recording.
-// capMaxMsOverride : extra budget, in ms, for the EDGE phase that begins once a signal is
-//              found (0 = the 3000 ms default). This is the second half of the pair, and
-//              the two were previously conflated: the edge deadline was hardcoded at 3 s,
-//              so a caller asking for a 250 ms window still got up to 3 s of recording if
-//              the signal stayed above the trigger threshold. That matters for the Ch-B
-//              fallback capture, whose whole point is to catch the remainder of a press
-//              that has already ended. One-shot: cleared when the capture starts.
-// gapUs      : silence that ends the capture early. Defaults to the historical
-//              350 ms, which allows a Toyota preamble-to-data silence (250-300 ms)
-//              to pass without terminating. C1 RollJam needs a much shorter value:
-//              it must stop at the END OF ONE FRAME, and the frame repeat gap in a
-//              real capture is a few ms, not 350 ms (measured: a Kia frame repeat
-//              unit is ~158 pulses, and the intra-burst gap is ~7 ms while the
-//              inter-burst gap is ~60 ms).
-//
-//              Passing a small gapUs makes this a frame-bounded capture, which is
-//              what C1 requires so a stored block is ONE code rather than several
-//              repeats of it (worklog §3).
+// gapUs ends a capture after that much silence. The 350 ms default preserves the
+// 250–300 ms Toyota preamble gap. RollJam uses a shorter gap to save one frame rather
+// than several repeats: in the measured Kia capture, frames contain about 158 pulses,
+// with roughly 7 ms between repeats and 60 ms between bursts.
 bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   if(gapUs<1000) gapUs=1000;          // never so small it cuts on a single pulse
   const uint32_t gap=gapUs;
   if(!cc1101OK) return false;
   unsigned long _cT0 = millis(); // track wall-clock duration for lastCapDurMs
-  // Budget for the EDGE phase, in ms. This is deliberately separate from timeoutMs:
-  // timeoutMs bounds how long we WAIT for a signal to appear (see the scan loop and the
-  // fallback sweep below), while this bounds how long we RECORD once one has appeared.
-  //
-  // Every existing caller passed a timeout and relied on getting a full recording window,
-  // so the default is the 3 s the edge phase has always used and behaviour is unchanged
-  // for them. Callers that need a SHORT window pass capMaxMs explicitly -- the Ch-B
-  // fallback capture is the case that matters: it asks for 250 ms to catch the tail of a
-  // burst, and a sustained signal near the trigger threshold would otherwise hold that
-  // timing-sensitive sequence for the full 3 s, well past the press it is chasing.
-  // Consume the one-shot budget here, at the only place it is read. Clearing it later (after
-  // the signal wait) missed every early exit: an attempt that found no signal returned first
-  // and left the override in place, so the next ordinary capture inherited a 250 ms window.
+  // timeoutMs controls the signal wait; capMaxMs controls recording. Most callers use
+  // the 3 s default. The Ch-B fallback sets a 250 ms budget so a sustained signal cannot
+  // keep the sequence recording long after the press has ended. Consume that one-shot
+  // override here: clearing it later would leave it set when the signal wait times out.
   uint32_t capMaxMs = capMaxMsOverride;   // 0 = use the default
   capMaxMsOverride = 0;                   // consume now, whatever path we leave by
   if(capMaxMs == 0) capMaxMs = 3000;
   pinMode(PIN_GDO0,INPUT);
-  // Release SX1278 DIO0 before the CC1101 drives GPIO 48.
+  // Reset and sleep the SX1278 before using the SPI bus. This does not connect the
+  // CC1101 GDO0 to GPIO 48; that path is disabled unless gdo0Routed is set.
   loraHardReset();
   // SIDLE, flush the TX FIFO (0x3A), then SRX.
   SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
@@ -7466,32 +7259,22 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   addLog("[CAP] Capturing on "+String(curFreq,2)+" MHz…");
   setLed(255,255,0); rfLen=0; rfFreq=curFreq;
 
-  // Noise floor: average of 64 RSSI samples over ~32 ms.
-  // Using AVERAGE (not max) so that a strong signal already present during
-  // measurement doesn't inflate the threshold and make bit-level edges invisible.
-  // If the average is suspiciously high (> -60 dBm — fob likely already transmitting),
-  // cap it at -75 dBm so thresholds remain usable at close range.
-  // trigThr = floor + 14 dBm — must exceed this to START a capture.
-  // edgeThr = floor +  8 dBm — used during edge timing once committed.
+  // Average 64 RSSI samples (~32 ms) for the noise floor. Averaging avoids letting a
+  // nearby fob dominate the threshold; cap suspicious readings above -60 dBm at -75.
   long _nsum=0;
   for(int i=0;i<64;i++){ _nsum+=cc_fastRSSI(); delayMicroseconds(500); }
   int noiseMax=(int)(_nsum/64);
   if(noiseMax>-60) noiseMax=-75; // cap: fob was transmitting during measurement
-  // trigThr: +10 dBm above floor (was +14). At weak-signal range (-65 to -66 dBm),
-  // a +14 margin left trigThr exactly at the fob's peak RSSI so only ~1-in-20 polls
-  // fired. +10 gives reliable triggers while still rejecting thermal noise spikes.
+  // Trigger at floor +10 dBm. The former +14 margin missed weak signals near -65 dBm.
   int trigThr=noiseMax+10;
-  // Toyota-band (309–316 MHz): lower edgeThr to +5 (vs the global +8).
-  // The trigger (noiseFloor+10) already confirms a real signal is present.
-  // At –65 dBm fob / –75 dBm noise, the default +8 gives only 2 dBm margin
-  // → RSSI barely crosses edgeThr, producing <50 edges per 3-s capture.
-  // +5 gives 5 dBm margin for the same signal, yielding far more crossings.
+  // Toyota-band captures use floor +5 for edge detection (floor +8 elsewhere).
+  // This gives weak signals more margin after the +10 dBm trigger has fired.
   bool _toyBand=(curFreq>=309.0f&&curFreq<=316.0f);
   int edgeThr=noiseMax+(_toyBand?5:8);
   addLog("  Floor: "+String(noiseMax)+" dBm  Trig: "+String(trigThr)+" / Edge: "+String(edgeThr)+" dBm"+(_toyBand?" (Toyota –3dB)":""));
   SPI.endTransaction();
 
-  // Wait for signal (first half of timeout)
+  // First half of timeout: wait at the current frequency before sweeping all channels.
   bool hit=false; int peak=-130;
   unsigned long t0=millis(); uint16_t wait1=timeoutMs/2;
   SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
@@ -7537,24 +7320,11 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   }
   if(!hit){rfRssi=noiseMax;addLog("  ⚠ No signal");setLed(0,150,65);lastCapDurMs=(uint32_t)(millis()-_cT0);return false;}
 
-  // ── Edge capture — dual mode ──────────────────────────────────────────────
-  // GDO0 mode (preferred): CC1101 IOCFG0=0x0D drives GPIO48 as the demodulated
-  //   async OOK bitstream directly from the chip demodulator — no RSSI averaging
-  //   artefacts, sub-2µs edge timing, matches actual bit transitions exactly.
-  //   Requires loraHardReset() above to leave SX1278 DIO0 high-impedance.
-  // RSSI mode (fallback): used if GDO0 reads stuck-LOW (DIO0 still driving).
-  //   RSSI averaging smooths edges and distorts short TE pulses at moderate range.
-  //
-  // GDO0 selection. Gated on gdo0Routed, exactly as the jam and replay paths are, and for the
-  // same reason: on this revision GPIO 48 is the SX1278's DIO0 and the CC1101's GDO0 is not
-  // routed, so a toggling pin does not establish that what it carries came from the CC1101.
-  // Probing for a toggle and capturing anyway would record the LoRa side and label it a CC1101
-  // capture -- a wrong capture is worse than a coarse one, because the RSSI fallback at least
-  // reads the real CC1101 register.
-  //
-  // When it IS routed, the test still requires TOGGLING (both HIGH and LOW within 5 ms). Toyota
-  // preamble alternates at ~2×TE ≈ 840 µs, so ~6 cycles fit. The older test broke on the first
-  // HIGH, which made "stuck HIGH" (DIO0 held after a failed sleep) look like a live OOK stream.
+  // ── Edge capture — digital GDO0 or RSSI ───────────────────────────────────
+  // This board does not route the CC1101's GDO0 to GPIO 48, so the digital path is
+  // opt-in. A changing GPIO level alone is not proof that the CC1101 is driving it.
+  // If gdo0Routed is enabled for a board that does wire GDO0, require both HIGH and LOW
+  // within 5 ms before using it. Otherwise read the CC1101's RSSI register.
   bool useGdo0=false;
   if(gdo0Routed){
     unsigned long _gt=micros(); bool _gH=false,_gL=false;
@@ -7564,41 +7334,30 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     }
   }
   lastCapGdo0=useGdo0;
-  // Report what was actually established. Without gdo0Routed the pin was never examined, so
-  // claiming it is "stuck/flat" would be a diagnosis we did not make.
+  // Report only what was checked. When GDO0 is not configured as routed, no pin test ran.
   if(!gdo0Routed)          addLog("  GDO0 not routed on this revision — RSSI edge mode");
   else if(useGdo0)         addLog("  GDO0 OK — digital edge mode");
   else                     addLog("  GDO0 stuck/flat — RSSI edge mode");
 
-  // Gap / guard limits (same semantics in both modes):
-  // gap=200 ms clears KeeLoq inter-packet guards (up to ~180 ms).
-  // Min-edge guard (64) + min-time guard (100 ms) prevent premature gap exit.
+  // The minimum-edge and minimum-time guards avoid ending capture on a short pause.
   setLed(0,200,255);
   // static: 512 × 2 B = 1 kB — off the stack; captureSignal is single-task only.
   static uint16_t rawBuf[CAP_SZ]; int rawLen=0;
-  // Level of the state held when recording begins = the level of rawBuf[0] (and
-  // of every even index after it, since recorded pulses alternate). Both modes
-  // determine this from a real reading rather than assuming HIGH; the RSSI mode
-  // previously hard-coded `true`, which mislabelled captures that start LOW.
+  // The first stored pulse has this level; subsequent pulses alternate.
   bool capStartHigh=useGdo0?(bool)digitalRead(PIN_GDO0):true;
   bool lastSt=capStartHigh;
   unsigned long lastEdge=micros();
   unsigned long capStart=micros();
-  // capEnd bounds the whole capture; `gap` (hoisted to the function head) is the
-  // silence that ends it early. See the signature comment for why C1 passes a
-  // smaller gap than the 350 ms default.
+  // capEnd is the recording deadline. A longer silent gap can end capture sooner.
   unsigned long capEnd=capStart+(unsigned long)capMaxMs*1000UL;
 
   if(useGdo0){
     // ── GDO0 digital mode — no SPI in hot loop ──────────────────────────────
-    // 15µs glitch filter: safely below the shortest real TE (~90µs, Santa Fe).
-    // Sub-15µs edges are EMI spikes; skipping lastEdge/lastSt update merges
-    // the spike duration into the following real pulse rather than storing it.
+    // Ignore edges under 15 µs, below the shortest expected TE (~90 µs). Leaving
+    // lastEdge unchanged merges each short glitch into the following pulse.
     const uint32_t GLITCH_US=15;
-    // yield() every 100ms to feed the Task Watchdog (TWDT).
-    // Toyota retry paths run two back-to-back 3s captures; without periodic
-    // yields the combined 6s block exceeds the default 5s TWDT and reboots.
-    // yield() overhead is <10µs — well below the 15µs glitch filter floor.
+    // Feed the watchdog during long captures; Toyota retries can run two 3 s
+    // captures back to back, longer than the default watchdog interval.
     unsigned long _wdtUs=micros();
     while(rawLen<CAP_SZ&&micros()<capEnd){
       bool cur=(bool)digitalRead(PIN_GDO0);
