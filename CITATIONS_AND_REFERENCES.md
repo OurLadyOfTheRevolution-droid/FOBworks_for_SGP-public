@@ -1,6 +1,6 @@
 # Citations and references
 
-These are the documents FOBworks for SGP v3.75 is written against. The firmware is standalone, for the May 2026 SGP Card Mini. The names below are the notes and datasheets the sketch's KeeLoq paths, radio init, board, and WebSocket transport actually use.
+These are the documents FOBworks for SGP v3.76 is written against. The firmware is standalone, for the May 2026 SGP Card Mini. The names below are the notes and datasheets the sketch's KeeLoq paths, radio init, board, and WebSocket transport actually use.
 
 ## KeeLoq
 
