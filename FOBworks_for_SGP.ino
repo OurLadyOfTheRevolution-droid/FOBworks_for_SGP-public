@@ -244,7 +244,7 @@
 //     of being broadcast. A client that never authenticates now receives nothing.
 //
 //   [TX] The GDO0 toggle test could not prove the CC1101 path. On this board revision GPIO 48
-//     is the SX1278's DIO0 and the CC1101's GDO0 is not routed at all (research/15; the vendor
+//     is the SX1278's DIO0 and the CC1101's GDO0 is not routed at all (worklog; the vendor
 //     firmware says the same), so a toggle can come from the LoRa side. Selecting the async
 //     path on that basis drives a pin that is not the CC1101's TX data input and transmits
 //     nothing. startJam() and replayRaw() now default to the packet-mode FIFO path, which
@@ -1502,7 +1502,7 @@ uint32_t capMaxMsOverride = 0;
 // Opt-in for the CC1101 async (GDO0) TX path. Off by default: on this board revision the
 // CC1101's GDO0 is not routed to a readable GPIO, so GPIO 48 toggling does not mean the
 // async path can transmit. Set true only on a revision where GDO0 really is wired.
-// research/15 records the measurement; the vendor firmware says the same.
+// The worklog records the measurement; the vendor firmware says the same.
 bool gdo0ForceAsync = false;
 
 bool captureSignal(uint16_t timeoutMs,uint32_t gapUs);
@@ -7692,7 +7692,7 @@ void startJam(float mhz){
   scanActive=false;
   // Path choice. A toggling GPIO 48 is NOT evidence that the CC1101's GDO0 is readable:
   // on this board revision GPIO 48 is the SX1278's DIO0 and the CC1101's GDO0 is not routed
-  // at all (research/15, and the vendor firmware's own note that GDO0 is not wired to the
+  // at all (worklog, and the vendor firmware's own note that GDO0 is not wired to the
   // ESP32 on this PCB). A toggle can therefore come from the LoRa side, and choosing the
   // async path on that basis would transmit nothing -- the pin would be driven, but it is
   // not the CC1101's TX data input.
