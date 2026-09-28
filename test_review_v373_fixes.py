@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression checks for the four review findings against the published v3.73 tree.
+"""Regression checks for the four review findings, against the published tree.
 
 These are source-level assertions, not behavioural tests: the WebSocket recipient leak and the
 GPIO routing question both need hardware (two clients; a board where GDO0 is actually wired) to
@@ -127,4 +127,30 @@ assert 'snprintf(idHex,sizeof(idHex),"0x%lX",(unsigned long)id);' in src, \
 assert '+",\\"id\\":\\""+idStr' not in src, \
     "the raw id string is still echoed into JSON (finding 4)"
 
-print("v3.73 review-finding checks passed (websocket auth, GDO0 routing, capture budget, can_send)")
+# ── no published doc may point at something this tree does not contain ──────────────────────
+# Two stale pointers survived earlier rounds: CITATIONS named the key corpus (deliberately not
+# published) and `research/04` (the worklog, not published). A reader cannot open either.
+# This checks the PUBLISHED docs against the PUBLISHED file list.
+#
+# Scope notes, learned from the first version of this check: only the files this branch actually
+# ships are inspected (the worklog lives on other branches and legitimately cites itself), and a
+# reference must look like a path on a single line -- a backtick span containing newlines is a
+# code block, not a reference.
+_PUB_DOCS = ["README.md", "PROMO.md", "CITATIONS_AND_REFERENCES.md"]
+_REF = re.compile(r"`((?:research|tools)/[A-Za-z0-9_./ -]+)`")
+_bad = []
+for _f in _PUB_DOCS:
+    _p = HERE / _f
+    if not _p.is_file():
+        continue
+    for _i, _line in enumerate(_p.read_text(encoding="utf-8").split("\n"), 1):
+        for _m in _REF.finditer(_line):
+            _r = _m.group(1).strip()
+            if _r.endswith("/"):                      # a directory or an upstream project path
+                continue
+            if not (HERE / _r).exists() and not (HERE / _r.rstrip("/")).is_dir():
+                _bad.append(f"{_f}:{_i} -> {_r}")
+assert not _bad, f"published docs reference paths this tree does not contain: {_bad}"
+print(f"  published-reference check: {len(_PUB_DOCS)} docs, every cited path resolves")
+
+print(f"review-finding checks passed on v{_ver} (websocket auth, GDO0 routing, capture budget, can_send)")

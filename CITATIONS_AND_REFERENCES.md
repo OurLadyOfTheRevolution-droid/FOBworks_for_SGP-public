@@ -6,9 +6,9 @@ These are the documents FOBworks for SGP v3.75 is written against. The firmware 
 
 The source labels three derivation paths with note numbers that do not match a published Microchip KeeLoq document. The table below is the published note for each label, so the comment in the sketch can be followed to the right PDF.
 
-**Status (v3.71):** the comments the v3.71 KeeLoq work touched now cite the real notes directly. The three wrong labels below still appear in dated changelog entries and in comments not yet revisited; that cleanup is item F3 in the development worklog, which is not part of this repository. This table stays until F3 is finished.
+**Status (v3.71):** the comments the v3.71 KeeLoq work touched now cite the real notes directly. The three wrong labels below still appear in dated changelog entries and in comments not yet revisited; that cleanup is item F3 in the worklog. This table stays until F3 is finished.
 
-The manufacturer key table is the real 73-entry corpus. The upstream file is `github.com/HiennNek/non-flipper-rolling-code-support` :: `keeloq_mfcodes_user`; it is not shipped with this repository, but the table it produced is in the sketch as `MFR_KEYS`. Each entry carries its learning type (see `enum KLLearn` in the sketch), which decides which derivation the key uses.
+The manufacturer key table is the real 73-entry corpus, from the public list at `github.com/HiennNek/non-flipper-rolling-code-support` (`keeloq_mfcodes_user`). That file is not shipped here: it holds the same keys the firmware already carries, so publishing it would add nothing. Each entry carries its learning type (see `enum KLLearn` in the sketch), which decides which derivation the key uses.
 
 | Label in this sketch | What the code uses it for | Published document |
 | --- | --- | --- |
