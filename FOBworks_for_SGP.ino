@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — standalone firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v3.74
+// Version  : FOBworks for SGP v3.75
 // Device   : SGP Card Mini, May 2026 stock (ESP32-S3-MINI-1-N8, 8 MB flash,
 //            no PSRAM, USB CDC on boot)
 // RF Front : Texas Instruments CC1101 — async OOK + 2FSK, 300–928 MHz
@@ -232,6 +232,38 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
 // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+// v3.75 (2026-09-28) — three follow-ups from a review of v3.74, plus a doc fix.
+//
+//   [CAPTURE] The v3.74 edge budget was cleared only on the path that FOUND a signal. An
+//     attempt that timed out returned at the "No signal" exit first, leaving capMaxMsOverride
+//     set, so the NEXT ordinary capture silently inherited a 250 ms recording window. The
+//     budget is now consumed at the point it is read, which makes "one-shot" true whatever
+//     path the function leaves by -- the fix for a one-shot value is to clear it where it is
+//     taken, not at the end of some paths.
+//
+//   [SECURITY] A queued WebSocket command carried a slot INDEX. Slots are reused, and
+//     wsSendToSlot() did not check the destination, so a command that waited while its client
+//     left could have its reply delivered to whichever connection took the slot. Each slot
+//     assignment now carries a generation number; a queued reply carries (slot, generation)
+//     and is dropped unless both still match AND the destination is authenticated. Narrower
+//     than the v3.74 broadcast leak -- that one needed no race -- but the same class.
+//
+//   [CAPTURE] captureSignal() still chose the digital GDO0 path from a bare GPIO 48 toggle,
+//     which on this revision is the SX1278's DIO0. v3.74 fixed that for jam and replay but
+//     left capture probing for itself, so a capture could record the LoRa side and label it a
+//     CC1101 capture. The opt-in is now named gdo0Routed and governs all three paths. A
+//     wrong capture is worse than a coarse one, because the RSSI fallback at least reads the
+//     real CC1101 register.
+//
+//   [DOC] README and CITATIONS still said v3.73 while the firmware said v3.74.
+//
+// The reviewer's other observation is recorded, not changed: the Ch-B fallback capture now
+// waits 3000 ms for a signal where it used to pass 250 as the wait timeout. Combined with a
+// 250 ms recording budget that is the intended shape -- wait long enough to catch the burst,
+// then record only its tail -- but the timing has not been benched on a card.
+//
+// Verified: compile green (1774912 B flash, 149580 B RAM), all 16 suites pass, and the new
+// assertions were mutation-tested -- reverting any of the five makes the suite fail.
 // v3.74 (2026-09-27) — four findings from an external review of v3.73.
 //
 //   [SECURITY] WebSocket replies reached clients that never authenticated. wsRemember() ran
@@ -248,7 +280,7 @@
 //     firmware says the same), so a toggle can come from the LoRa side. Selecting the async
 //     path on that basis drives a pin that is not the CC1101's TX data input and transmits
 //     nothing. startJam() and replayRaw() now default to the packet-mode FIFO path, which
-//     needs no GDO0, and use async only when gdo0ForceAsync is set for a board where GDO0 is
+//     needs no GDO0, and use async only when gdo0Routed is set for a board where GDO0 is
 //     genuinely wired. This corrects earlier notes that treated sleeping or resetting the
 //     SX1278 as a GDO0 fix; doc 15's measurement supersedes that.
 //
@@ -1327,7 +1359,7 @@
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v3.74"
+#define FW_VER        "FOBworks for SGP v3.75"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
@@ -1499,11 +1531,15 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
 // the next capture. See the note at the head of captureSignal().
 uint32_t capMaxMsOverride = 0;
 
-// Opt-in for the CC1101 async (GDO0) TX path. Off by default: on this board revision the
-// CC1101's GDO0 is not routed to a readable GPIO, so GPIO 48 toggling does not mean the
-// async path can transmit. Set true only on a revision where GDO0 really is wired.
-// The worklog records the measurement; the vendor firmware says the same.
-bool gdo0ForceAsync = false;
+// Whether this board revision actually routes the CC1101's GDO0 to a readable GPIO. Off by
+// default, because on this revision it does not: GPIO 48 is the SX1278's DIO0, so a pin that
+// toggles is not evidence the signal came from the CC1101. It governs all three paths that
+// could otherwise be fooled by a toggle -- jam, replay, and capture.
+//
+// Set true only on a board where GDO0 really is wired. The worklog records the measurement and
+// the vendor firmware says the same; neither is a reason to probe for it at runtime, because a
+// probe cannot tell the two chips' pins apart.
+bool gdo0Routed = false;
 
 bool captureSignal(uint16_t timeoutMs,uint32_t gapUs);
 
@@ -1822,8 +1858,9 @@ void addLog(const String& s){ Serial.println(s); }
 // the WebSocket table lives below, so these must be visible first. serialTokenMatches() is
 // declared for the same reason: wsHandler() now authenticates a slot on receipt, and it is
 // defined below wsHandler().
-volatile int wsReplyTo = -1;
-static void wsSendToSlot(int slot, const String& json);
+volatile int      wsReplyTo    = -1;   // slot of the client that issued the current command
+volatile uint32_t wsReplyToGen = 0;    // generation of that slot, so a reused slot cannot match
+static void wsSendToSlot(int slot, uint32_t gen, const String& json);
 static void wsBroadcast(const String& json);
 static bool serialTokenMatches(const JsonDocument& command);
 
@@ -1840,7 +1877,7 @@ void serialEmit(const String& json){
   //
   // Declared here, defined with the rest of the WebSocket code below.
   int slot=wsReplyTo;
-  if(slot>=0) wsSendToSlot(slot,json);
+  if(slot>=0) wsSendToSlot(slot,wsReplyToGen,json);
   else        wsBroadcast(json);
 }
 
@@ -1875,6 +1912,12 @@ httpd_handle_t wsServer = nullptr;
 // skips unauthenticated slots. A client that never authenticates gets nothing.
 static int  wsFd[WS_MAX_CLIENTS]       = { -1, -1, -1, -1 };
 static bool wsAuthed[WS_MAX_CLIENTS]   = { false, false, false, false };
+// A slot index alone is not a connection identity: slots are reused, so a queued reply could
+// address whoever took the slot meanwhile. Each time a slot is assigned, it gets a new
+// generation number, and a queued reply carries (slot, generation). Only the connection that
+// issued the command can match both.
+static uint32_t wsGen[WS_MAX_CLIENTS]  = { 0, 0, 0, 0 };
+static uint32_t wsGenNext              = 1;
 // wsReplyTo (defined above, with serialEmit's forward declarations) names the slot that the
 // reply currently being produced belongs to, or -1 for "no particular client" -- a serial
 // command, a timer event, a capture.
@@ -1885,8 +1928,15 @@ static int wsSlotFor(int fd){
 }
 static void wsRemember(int fd){
   if(wsSlotFor(fd)>=0) return;
-  for(int i=0;i<WS_MAX_CLIENTS;i++) if(wsFd[i]<0){ wsFd[i]=fd; wsAuthed[i]=false; return; }
-  wsFd[0]=fd; wsAuthed[0]=false;      // table full: stop mirroring to the oldest
+  for(int i=0;i<WS_MAX_CLIENTS;i++) if(wsFd[i]<0){
+    wsFd[i]=fd; wsAuthed[i]=false; wsGen[i]=wsGenNext++; return; }
+  // Table full: evict the oldest. It also gets a fresh generation, so any reply still queued
+  // against the previous occupant is dropped rather than delivered to the new one.
+  wsFd[0]=fd; wsAuthed[0]=false; wsGen[0]=wsGenNext++;
+}
+// True when (slot, gen) still names the connection that queued a command.
+static bool wsSlotMatches(int slot, uint32_t gen){
+  return slot>=0 && slot<WS_MAX_CLIENTS && wsFd[slot]>=0 && wsGen[slot]==gen;
 }
 // Called once a slot's client has presented a valid token. From here it may receive events.
 static void wsMarkAuthed(int fd){
@@ -1895,7 +1945,7 @@ static void wsMarkAuthed(int fd){
 }
 static void wsForget(int fd){
   int i=wsSlotFor(fd);
-  if(i>=0){ wsFd[i]=-1; wsAuthed[i]=false; }
+  if(i>=0){ wsFd[i]=-1; wsAuthed[i]=false; wsGen[i]=0; }   // 0 never matches a queued gen
 }
 static int wsClientCount(){
   int n=0; for(int i=0;i<WS_MAX_CLIENTS;i++) if(wsFd[i]>=0) n++;
@@ -1921,17 +1971,22 @@ static void wsBroadcast(const String& json){
   }
 }
 
-// Send one JSON object to a single slot's client. Used for a command reply, which must go
-// back to its requester and nowhere else.
-static void wsSendToSlot(int slot, const String& json){
-  if(!wsServer||slot<0||slot>=WS_MAX_CLIENTS) return;
+// Send one JSON object to a single slot's client. Used for a command reply, which must go back
+// to its requester and nowhere else.
+//
+// Two guards, both of which the first version lacked:
+//   · gen must still match the slot. A slot is reused when a client leaves, so a reply to a
+//     departed requester must be dropped rather than delivered to whoever inherited the slot.
+//   · the destination must still be authenticated. Reply routing and event broadcast share the
+//     same table, so the reply path needs the same check the broadcast path has.
+static void wsSendToSlot(int slot, uint32_t gen, const String& json){
+  if(!wsServer || !wsSlotMatches(slot,gen) || !wsAuthed[slot]) return;
   int fd=wsFd[slot];
-  if(fd<0) return;
   httpd_ws_frame_t f{};
   f.type    = HTTPD_WS_TYPE_TEXT;
   f.payload = (uint8_t*)json.c_str();
   f.len     = json.length();
-  if(httpd_ws_send_frame_async(wsServer, fd, &f)!=ESP_OK){ wsFd[slot]=-1; wsAuthed[slot]=false; }
+  if(httpd_ws_send_frame_async(wsServer, fd, &f)!=ESP_OK){ wsFd[slot]=-1; wsAuthed[slot]=false; wsGen[slot]=0; }
 }
 
 // Inbound queue, written by the httpd task and drained by loop(). Single-producer /
@@ -1939,17 +1994,19 @@ static void wsSendToSlot(int slot, const String& json){
 // why no lock is needed (both are int-sized and only ever move forward).
 #define WS_LINE_MAX 2048
 static char wsQ[WS_CMD_Q][WS_LINE_MAX];
-static int  wsQFrom[WS_CMD_Q];        // slot that sent each queued line, for reply routing
+static int      wsQFrom[WS_CMD_Q];    // slot that sent each queued line, for reply routing
+static uint32_t wsQGen[WS_CMD_Q];     // that slot's generation, so a reused slot cannot match
 static volatile int wsQTail=0;        // httpd writes here
 static volatile int wsQHead=0;        // loop() reads here
 
-static void wsEnqueue(const String& line,int fromSlot){
+static void wsEnqueue(const String& line,int fromSlot,uint32_t fromGen){
   int next=(wsQTail+1)%WS_CMD_Q;
   if(next==wsQHead) return;           // full: drop rather than overwrite
   int n=line.length(); if(n>WS_LINE_MAX-1) n=WS_LINE_MAX-1;
   memcpy(wsQ[wsQTail], line.c_str(), n);
   wsQ[wsQTail][n]='\0';
   wsQFrom[wsQTail]=fromSlot;
+  wsQGen[wsQTail]=fromGen;
   wsQTail=next;
 }
 
@@ -2003,7 +2060,7 @@ static esp_err_t wsHandler(httpd_req_t* req){
                +String(wsClientCount())+" subscribed)");
       }
     }
-    wsEnqueue(line,slot);
+    wsEnqueue(line,slot, wsSlotMatches(slot,wsGen[slot]) ? wsGen[slot] : 0);
   }
   return ESP_OK;
 }
@@ -7369,7 +7426,11 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   // fallback capture is the case that matters: it asks for 250 ms to catch the tail of a
   // burst, and a sustained signal near the trigger threshold would otherwise hold that
   // timing-sensitive sequence for the full 3 s, well past the press it is chasing.
+  // Consume the one-shot budget here, at the only place it is read. Clearing it later (after
+  // the signal wait) missed every early exit: an attempt that found no signal returned first
+  // and left the override in place, so the next ordinary capture inherited a 250 ms window.
   uint32_t capMaxMs = capMaxMsOverride;   // 0 = use the default
+  capMaxMsOverride = 0;                   // consume now, whatever path we leave by
   if(capMaxMs == 0) capMaxMs = 3000;
   pinMode(PIN_GDO0,INPUT);
   // Release SX1278 DIO0 before the CC1101 drives GPIO 48.
@@ -7460,20 +7521,30 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   // RSSI mode (fallback): used if GDO0 reads stuck-LOW (DIO0 still driving).
   //   RSSI averaging smooths edges and distorts short TE pulses at moderate range.
   //
-  // GDO0 test: require TOGGLING — both HIGH and LOW observed within 5 ms.
-  //   Toyota preamble alternates at ~2×TE ≈ 840 µs → ~6 full cycles in 5 ms.
-  //   Old test broke on the first HIGH, making "stuck HIGH" (SX1278 DIO0 holding
-  //   GPIO48 after a failed sleep) indistinguishable from a live
-  //   CC1101 OOK stream.  Any non-toggling state (stuck HIGH or stuck LOW) falls
-  //   back to RSSI mode, which at least reads the true CC1101 RSSI register.
+  // GDO0 selection. Gated on gdo0Routed, exactly as the jam and replay paths are, and for the
+  // same reason: on this revision GPIO 48 is the SX1278's DIO0 and the CC1101's GDO0 is not
+  // routed, so a toggling pin does not establish that what it carries came from the CC1101.
+  // Probing for a toggle and capturing anyway would record the LoRa side and label it a CC1101
+  // capture -- a wrong capture is worse than a coarse one, because the RSSI fallback at least
+  // reads the real CC1101 register.
+  //
+  // When it IS routed, the test still requires TOGGLING (both HIGH and LOW within 5 ms). Toyota
+  // preamble alternates at ~2×TE ≈ 840 µs, so ~6 cycles fit. The older test broke on the first
+  // HIGH, which made "stuck HIGH" (DIO0 held after a failed sleep) look like a live OOK stream.
   bool useGdo0=false;
-  {unsigned long _gt=micros(); bool _gH=false,_gL=false;
-   while(micros()-_gt<5000){
-     if(digitalRead(PIN_GDO0)) _gH=true; else _gL=true;
-     if(_gH&&_gL){useGdo0=true;break;}
-   }}
+  if(gdo0Routed){
+    unsigned long _gt=micros(); bool _gH=false,_gL=false;
+    while(micros()-_gt<5000){
+      if(digitalRead(PIN_GDO0)) _gH=true; else _gL=true;
+      if(_gH&&_gL){useGdo0=true;break;}
+    }
+  }
   lastCapGdo0=useGdo0;
-  addLog(useGdo0?"  GDO0 OK — digital edge mode":"  GDO0 stuck/flat — RSSI edge mode");
+  // Report what was actually established. Without gdo0Routed the pin was never examined, so
+  // claiming it is "stuck/flat" would be a diagnosis we did not make.
+  if(!gdo0Routed)          addLog("  GDO0 not routed on this revision — RSSI edge mode");
+  else if(useGdo0)         addLog("  GDO0 OK — digital edge mode");
+  else                     addLog("  GDO0 stuck/flat — RSSI edge mode");
 
   // Gap / guard limits (same semantics in both modes):
   // gap=200 ms clears KeeLoq inter-packet guards (up to ~180 ms).
@@ -7493,7 +7564,6 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   // silence that ends it early. See the signature comment for why C1 passes a
   // smaller gap than the 350 ms default.
   unsigned long capEnd=capStart+(unsigned long)capMaxMs*1000UL;
-  capMaxMsOverride=0;   // one-shot: the next capture uses the default unless set again
 
   if(useGdo0){
     // ── GDO0 digital mode — no SPI in hot loop ──────────────────────────────
@@ -7700,7 +7770,7 @@ void startJam(float mhz){
   // So the FIFO path is the default: it drives the CC1101's own PA and needs no GDO0.
   // Async is used only when explicitly forced, for a revision where GDO0 really is routed.
   bool gdo0Usable=false;
-  if(gdo0ForceAsync){
+  if(gdo0Routed){
     pinMode(PIN_GDO0,INPUT);
     unsigned long t=micros(); bool h=false,l=false;
     while(micros()-t<3000){ if(digitalRead(PIN_GDO0)) h=true; else l=true; if(h&&l) break; }
@@ -8112,7 +8182,7 @@ bool replayRaw(float mhz,uint16_t* data,int len,int reps=3,bool startHigh=true){
   // SX1278's DIO0 here and a toggle can come from the LoRa side. If the forced async path
   // turns out to be dead, refuse explicitly rather than claim success.
   bool txPathLive=false;
-  if(gdo0ForceAsync){
+  if(gdo0Routed){
     // Force-pins the async TX input to the GDO0 pad and drives a continuous carrier. Must be
     // a compile-time opt-out, not a hardware probe: the probe cannot distinguish the CC1101's
     // GDO0 from the SX1278's DIO0.
@@ -11633,12 +11703,17 @@ static void wsPump(){
   while(wsQHead!=wsQTail && n<WS_CMD_Q){
     String line(wsQ[wsQHead]);
     int from=wsQFrom[wsQHead];
+    uint32_t fromGen=wsQGen[wsQHead];
     wsQHead=(wsQHead+1)%WS_CMD_Q;
     // serialEmit() routes the reply to this slot instead of broadcasting it. Serial callers
-    // leave it at -1, which restores the broadcast path for those events.
+    // leave it at -1, which restores the broadcast path for those events. The generation is
+    // restored too: if the client left and its slot was taken while this command waited, the
+    // generation no longer matches and wsSendToSlot() drops the reply rather than misdelivering.
     wsReplyTo=from;
+    wsReplyToGen=fromGen;
     processCommandLine(line);
     wsReplyTo=-1;
+    wsReplyToGen=0;
     n++;
   }
 }
