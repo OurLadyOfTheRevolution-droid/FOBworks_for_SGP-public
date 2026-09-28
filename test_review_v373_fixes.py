@@ -64,6 +64,15 @@ assert "if(!wsServer || !wsSlotMatches(slot,gen) || !wsAuthed[slot]) return;" in
 assert "wsGen[i]=0;" in src, \
     "a departed socket does not invalidate its generation (follow-up 2)"
 
+# ②b A fifth connection evicts slot 0. If that evicted socket then sends a frame, wsSlotFor()
+#     returns -1 -- and the generation lookup was an ARGUMENT to wsSlotMatches(), so it indexed
+#     wsGen[-1] before the call could apply its own guard. Verified with UBSan: the old shape
+#     reports "index -1 out of bounds for type 'uint32_t[4]'".
+assert "uint32_t gen = (slot >= 0) && wsSlotMatches(slot, wsGen[slot])" in src, \
+    "the generation lookup is not guarded against slot == -1 (out-of-bounds read)"
+assert "wsSlotMatches(slot,wsGen[slot])" not in src, \
+    "an unguarded wsGen[slot] index survives (the argument is evaluated before the call)"
+
 # ③ Capture still selected the GDO0 path from a bare GPIO48 toggle, which on this revision can
 #    be the SX1278's DIO0.
 assert "bool gdo0Routed = false;" in src, \

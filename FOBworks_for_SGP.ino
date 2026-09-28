@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — standalone firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v3.75
+// Version  : FOBworks for SGP v3.76
 // Device   : SGP Card Mini, May 2026 stock (ESP32-S3-MINI-1-N8, 8 MB flash,
 //            no PSRAM, USB CDC on boot)
 // RF Front : Texas Instruments CC1101 — async OOK + 2FSK, 300–928 MHz
@@ -232,6 +232,26 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
 // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+// v3.76 (2026-09-28) — an out-of-bounds read in the WS slot table, and a non-portable test.
+//
+//   [BUG] The v3.75 generation lookup was an ARGUMENT to wsSlotMatches(), so wsGen[slot] was
+//     indexed before that function's own slot>=0 guard could apply -- an argument is evaluated
+//     before the call. A fifth connection evicts slot 0 by design, and if that evicted socket
+//     then sends a frame, wsSlotFor() returns -1, giving wsGen[-1]: a read one element before
+//     the array. Confirmed with UBSan, which reports "index -1 out of bounds for type
+//     'uint32_t[4]'" for the old form and nothing for the guarded one. The guard is now in the
+//     expression itself, where short-circuiting actually protects the index.
+//
+//   [TEST] test_hexstr_bounds.py sized a static array as [CAP+16], where CAP was a
+//     function-scope `const size_t`. That is not a constant expression in C, so the construct is
+//     a variable length array: Apple clang folds it with a -Wgnu-folding-constant warning and
+//     compiles, which is why this suite passed here, while GNU gcc rejects it outright, which is
+//     why it failed for the reviewer. CAP is now a macro, so the array size is a real constant
+//     under any conforming compiler. Not a v3.75 regression -- the old form predates it -- but it
+//     made the suite unable to run for anyone not on clang.
+//
+// Verified: compile green (1774916 B flash, 149580 B RAM), all 16 suites pass, and the new
+// assertion was mutation-tested -- reverting the guard makes the suite fail.
 // v3.75 (2026-09-28) — three follow-ups from a review of v3.74, plus a doc fix.
 //
 //   [CAPTURE] The v3.74 edge budget was cleared only on the path that FOUND a signal. An
@@ -1359,7 +1379,7 @@
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v3.75"
+#define FW_VER        "FOBworks for SGP v3.76"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
@@ -2060,7 +2080,11 @@ static esp_err_t wsHandler(httpd_req_t* req){
                +String(wsClientCount())+" subscribed)");
       }
     }
-    wsEnqueue(line,slot, wsSlotMatches(slot,wsGen[slot]) ? wsGen[slot] : 0);
+    // slot can be -1: a fifth connection evicts slot 0, and if that evicted socket then sends
+    // a frame, wsSlotFor() no longer finds its fd. Guard BEFORE indexing wsGen -- an argument is
+    // evaluated before the call, so wsSlotMatches()'s own check comes too late to save it.
+    uint32_t gen = (slot >= 0) && wsSlotMatches(slot, wsGen[slot]) ? wsGen[slot] : 0;
+    wsEnqueue(line,slot,gen);
   }
   return ESP_OK;
 }
