@@ -1,6 +1,6 @@
 # FOBworks for SGP
 
-FOBworks for SGP is standalone firmware I wrote for the SGP Card Mini. The card is an existing third-party board. This firmware is its own project. Version 3.73.
+FOBworks for SGP is standalone firmware I wrote for the SGP Card Mini. The card is an existing third-party board. This firmware is its own project. Version 3.75.
 
 This copy is written for the card I bought in May 2026. That stock is an ESP32-S3-MINI-1-N8: dual-core LX7 at 240 MHz, 8 MB quad flash, no PSRAM, Wi-Fi 802.11 b/g/n, and BLE 5. The radio I use is the CC1101 already on the card, OOK and 2FSK, on the 39 channels the sketch lists inside 300–348, 387–464, and 779–928 MHz. The LoRa module on this card is a Ra-02 SX1278. The firmware resets it and writes it to sleep so DIO0 releases GPIO 48 for the CC1101. GPIO 26 is reserved on the PCB for a later SX1262 and stays unused. The fuel gauge is a MAX17048 at I2C address 0x36. A kept decode is written to the microSD as a FOBworks RAW file, and the dashboard reads that library back. The CC1101 is accepted only when its version register is 0x04 or 0x14, and that byte is shown on the status chip.
 
