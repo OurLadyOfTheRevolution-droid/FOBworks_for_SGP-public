@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Regression checks for the four review findings against the published v3.73 tree.
+
+These are source-level assertions, not behavioural tests: the WebSocket recipient leak and the
+GPIO routing question both need hardware (two clients; a board where GDO0 is actually wired) to
+prove at runtime, and neither is available here. What is checkable is that the code no longer
+contains the constructs that caused each finding.
+
+Each assertion names the finding it pins, so a future edit that reintroduces the old shape fails
+with an explanation rather than just a line number.
+"""
+
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+FW = HERE / "FOBworks_for_SGP.ino"
+src = FW.read_text(encoding="utf-8")
+
+
+def has(needle):
+    return needle in src
+
+
+# ── Finding 1: WebSocket recipients were never authenticated ─────────────���──────────────────
+# A client could connect, supply no token, and still receive every event -- including decode
+# results and key-related replies produced by an authenticated client.
+
+assert has("if(fd<0||!wsAuthed[i]) continue;"), \
+    "wsBroadcast no longer skips unauthenticated slots (finding 1)"
+
+# The handshake must register the socket WITHOUT subscribing it. The old shape was
+# wsRemember(fd) followed immediately by a broadcast to everyone.
+assert "wsRemember(fd);\n    addLog(\"[WS] socket open" in src, \
+    "the handshake appears to subscribe the client again (finding 1)"
+
+assert "wsMarkAuthed(fd);" in src, \
+    "nothing promotes a slot to authenticated (finding 1)"
+assert "deserializeJson(jc,line)==DeserializationError::Ok && serialTokenMatches(jc)" in src, \
+    "the slot is promoted without a token check (finding 1)"
+
+# A command reply must go to its requester only.
+assert "int slot=wsReplyTo;" in src and "if(slot>=0) wsSendToSlot(slot,json);" in src, \
+    "command replies are broadcast rather than routed to the requester (finding 1)"
+assert "wsReplyTo=from;" in src and "wsReplyTo=-1;" in src, \
+    "wsReplyTo is not scoped per queued command (finding 1)"
+
+# The old unconditional broadcast from the handshake is gone.
+assert 'wsBroadcast(String("{\\"event\\":\\"ws_open\\"' not in src, \
+    "the handshake still broadcasts to every connected socket (finding 1)"
+
+# ── Finding 2: the GDO0 toggle test cannot prove the CC1101 path ────────────────────────────
+# On this revision GPIO 48 is the SX1278's DIO0 and the CC1101's GDO0 is not routed, so a
+# toggle can come from the LoRa side. Selecting the async path on that basis transmits nothing.
+
+assert "bool gdo0ForceAsync = false;" in src, \
+    "the async TX path is not gated behind an explicit opt-in (finding 2)"
+
+# Neither selection site may probe the pin unless forced.
+for site, marker in (
+    ("startJam", "if(gdo0ForceAsync){\n    pinMode(PIN_GDO0,INPUT);"),
+    ("replayRaw", "if(gdo0ForceAsync){\n    // Force-pins the async TX input"),
+):
+    assert marker in src, f"{site} still selects the async path from a bare toggle (finding 2)"
+
+# The FIFO path must remain the default in both.
+assert "bool ok=replayViaFifo(mhz,data,len,startHigh,reps);" in src, \
+    "the packet-mode fallback is gone (finding 2)"
+assert "jamUseFifo" in src, "the FIFO jam path is gone (finding 2)"
+
+# ── Finding 3: the edge capture overran the requested window ────────────────────────────────
+# timeoutMs bounds the wait for a signal, not the recording. The recording window was hardcoded
+# at 3 s, so a 250 ms request could record for three seconds.
+
+assert "unsigned long capEnd=capStart+(unsigned long)capMaxMs*1000UL;" in src, \
+    "the edge deadline is hardcoded again (finding 3)"
+assert "uint32_t capMaxMsOverride = 0;" in src, \
+    "there is no per-call edge budget (finding 3)"
+assert "capMaxMsOverride=250;" in src and "bool chbOk=captureSignal(3000);" in src, \
+    "the Ch-B capture does not set a short recording budget (finding 3)"
+assert "capMaxMsOverride=0;" in src, \
+    "the budget is not one-shot, so it would leak into the next capture (finding 3)"
+
+# ── Finding 4: /api/can_send echoed unvalidated input into JSON ──────────────────────────────
+# The raw query text went into the response unescaped, and strtoul's partial parse accepted
+# non-hex suffixes.
+
+assert "if(h.length()==0||h.length()>8) {" in src, \
+    "the id length is not validated (finding 4)"
+assert "bool hexOk=(c>='0'&&c<='9')||(c>='a'&&c<='f')||(c>='A'&&c<='F');" in src, \
+    "non-hex characters are accepted in the id (finding 4)"
+assert 'snprintf(idHex,sizeof(idHex),"0x%lX",(unsigned long)id);' in src, \
+    "the response does not echo a canonical id (finding 4)"
+assert '+",\\"id\\":\\""+idStr' not in src, \
+    "the raw id string is still echoed into JSON (finding 4)"
+
+print("v3.73 review-finding checks passed (websocket auth, GDO0 routing, capture budget, can_send)")
