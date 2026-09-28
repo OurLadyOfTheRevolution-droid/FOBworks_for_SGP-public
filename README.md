@@ -198,6 +198,6 @@ The harness stops if its known-good control fails. A passing run therefore inclu
 
 ## License
 
-Copyright (C) 2026 OurLady.
+Copyright (C) 2026 OurLadyOfTheRevolution.
 
 FOBworks for SGP is free software under the GNU General Public License v3.0. The full license is in `LICENSE`.
