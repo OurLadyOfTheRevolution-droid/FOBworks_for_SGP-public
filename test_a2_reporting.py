@@ -2,7 +2,7 @@
 """A2 reporting checks — the harness must not overstate its own result.
 
 A2 passed against real Kia captures, but the first version of the harness reported
-it dishonestly in two ways (worklog §1.2):
+it dishonestly in two ways (doc 09 §1.2):
 
   1. The corpus stores the same capture under two filenames, so "validated=4"
      counted 2 distinct captures twice. The corroboration line then read as
@@ -122,7 +122,7 @@ assert (A ^ B) == 0x01000000, "expected the difference at bit 24 (unverified)"
 print("a2 reporting checks passed")
 
 
-# ── Key-file evidence and breadth (worklog §1.3 / §5.2) ───────────────────────
+# ── Key-file evidence and breadth (doc 09 §1.3 / §5.2) ───────────────────────
 # A Key file stores an already-demodulated payload, so it exercises the crypto and
 # field-extraction path but NOT the PWM path. It is therefore recorded as a
 # separate evidence class: it can show the key check works on a second device, but

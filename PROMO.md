@@ -49,7 +49,7 @@ A standalone FOBworks RAW file contains a short header, frequency, and pulse lis
 
 Key recovery is intended for a KeeLoq fob you own. Press the same button two to five times while the card listens. Recovery checks the built-in table and any keys saved on the card. It keeps a candidate only if every press decrypts to the same serial and button with a counter that advances. A match to a filler pattern in the built-in table is labeled **pattern match**; a saved key is reported separately. If no key matches, recovery reports no match. It does not derive a manufacturer key from a transmission.
 
-The built-in table contains 73 entries. In the corpus used for this project, four Kia decoders have not matched a real capture; 31 of 41 decoders have no match at all, mostly because the corpus contains few gate and garage signals. `tools/corpus_regression.py` reproduces these counts, and its header comment records the results.
+The built-in table contains 73 entries. In the corpus used for this project, four Kia decoders have not matched a real capture; 31 of 41 decoders have no match at all, mostly because the corpus contains few gate and garage signals. `tools/corpus_regression.py` reproduces these counts and its header comment records the results.
 
 Recovery reports a candidate only when it decrypts two consecutive frames consistently. A single frame is not enough: this check uses 12 bits, so a wrong key may match one frame about once in 4,000 tries. Transmitting a code derived from a wrong key could desynchronize the fob.
 

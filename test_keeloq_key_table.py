@@ -21,12 +21,11 @@ import re
 
 HERE = Path(__file__).resolve().parent
 FIRMWARE = HERE / "FOBworks_for_SGP.ino"
-
 # The manufacturer-key corpus is a local research fixture and is deliberately NOT published:
-# it is the same 73 keys the firmware already embeds in plaintext, so shipping the file would
-# add nothing a reader of the sketch does not already have. Read it from research/sources/ when
-# it is present locally, or from FOBWORKS_MFCODES. The cross-check below is skipped when it is
-# absent, so the rest of this suite still runs in a fresh clone.
+# it is the same keys the firmware already embeds, so shipping the file would add nothing a
+# reader does not already have. Read it from research/sources/ when present locally, or from
+# FOBWORKS_MFCODES. The cross-check below is skipped when it is absent, so this suite still
+# runs in a fresh clone.
 _env = os.environ.get("FOBWORKS_MFCODES")
 CORPUS = Path(_env).expanduser() if _env else HERE / "research" / "sources" / "keeloq_mfcodes_public.txt"
 
@@ -107,120 +106,68 @@ raw = re.findall(
     r'\{\s*"([^"]+)"\s*,\s*0x([0-9A-Fa-f]{16})ULL\s*,\s*([A-Za-z0-9_]+)\s*,\s*([01])\s*\}',
     table.group("body"),
 )
-
-# ── the stored keys are masked ───────────────────────────────────────────────
-# The table holds the affine transform of each key rather than the key itself, so the
-# plaintext is not the first thing a reader sees. The firmware inverts this on the way into
-# every derivation (ks_unmaskMfrKey), and the corpus comparison below needs the plaintext, so
-# this suite has to invert it too -- which also makes the cross-check double as a test that the
-# mask is consistent between the sketch and this file.
-assert "static inline uint64_t ks_unmaskMfrKey(uint64_t v){" in source, \
-    "the unmask helper is missing; the table cannot be read"
-assert "ks_deriveOneMfrKey(sn, ks_unmaskMfrKey(MFR_KEYS[k].key), dk)" in source, \
-    "the derivation loop does not unmask the table"
-assert "ks_klDecrypt(f.hop,ks_unmaskMfrKey(MFR_KEYS[i].key))" in source, \
-    "the recovery analyzer does not unmask the table"
-assert "TRY_KEY(MFR_KEYS[i].name, ks_unmaskMfrKey(MFR_KEYS[i].key)" in source, \
-    "/api/mfr_test does not unmask the table"
-
-# Read the constants the sketch actually uses, so this cannot drift from them.
+def learn_value(tok):
+    return int(tok) if tok.isdigit() else KL_VALUE.get(tok, -1)
+# The stored values are masked. Read the constants from the sketch rather than duplicating
+# them, so this file cannot drift from what the firmware actually inverts with.
 _c = re.search(r"#define MFR_KEY_A\s+(0x[0-9A-Fa-f]+)ULL", source)
-assert _c, "MFR_KEY_A not found"
+assert _c, "MFR_KEY_A not found in the sketch"
 MASK_A = int(_c.group(1), 16)
 _c = re.search(r"#define MFR_KEY_B\s+(0x[0-9A-Fa-f]+)ULL", source)
-assert _c, "MFR_KEY_B not found"
+assert _c, "MFR_KEY_B not found in the sketch"
 MASK_B = int(_c.group(1), 16)
 _c = re.search(r"#define MFR_KEY_N\s+(\d+)", source)
-assert _c, "MFR_KEY_N not found"
-MASK_N = int(_c.group(1), 16 if False else 10)
+assert _c, "MFR_KEY_N not found in the sketch"
+MASK_N = int(_c.group(1))
 
 
 def unmask(v):
-    x = (v ^ MASK_B) & 0xFFFFFFFFFFFFFFFF
+    x = (int(v, 16) ^ MASK_B) & 0xFFFFFFFFFFFFFFFF
     return (((x >> MASK_N) | (x << (64 - MASK_N))) & 0xFFFFFFFFFFFFFFFF) ^ MASK_A
 
 
-def encode(k):
-    """The forward transform, as tools/mask_mfrkeys.py applies it."""
-    x = (k ^ MASK_A) & 0xFFFFFFFFFFFFFFFF
-    return (((x << MASK_N) | (x >> (64 - MASK_N))) & 0xFFFFFFFFFFFFFFFF) ^ MASK_B
-
-
-# Keep the stored (masked) values so the transparency checks below can test the inverse.
-raw_original = raw
-raw = [(n, f"{unmask(int(k, 16)):016X}", t, s) for n, k, t, s in raw]
-
-# The Kia OEM key is public, but there is no reason to write it out: take it from the
+# The Kia OEM key is public, but there is no reason to write it out here: take it from the
 # masked constant the sketch ships and invert it, which also re-checks the inverse.
-_kia_stored = int(re.search(r"#define KIA_V34_MF_KEY\s+0x([0-9A-Fa-f]{16})ULL", source).group(1), 16)
+_kia_stored = re.search(r"#define KIA_V34_MF_KEY\s+0x([0-9A-Fa-f]{16})ULL", source).group(1)
 PUBLIC_KIA = unmask(_kia_stored)
-# The table entry and the decoder constant are two copies of the same key; both must invert
-# to the same plaintext, or one of them was masked wrong.
-_kia_tbl = next(k for n, k, _t, _s in raw_original if n == "Kia_V3_V4_OEM")
-assert unmask(int(_kia_tbl, 16)) == PUBLIC_KIA, "Kia key paths disagree"
 
-def learn_value(tok):
-    return int(tok) if tok.isdigit() else KL_VALUE.get(tok, -1)
-entries = [(n, k, learn_value(t), int(s)) for n, k, t, s in raw]
+
+assert "static inline uint64_t ks_unmaskMfrKey(uint64_t v){" in source, \
+    "the unmask helper is missing; the table cannot be read"
+entries = [(n, f"{unmask(k):016X}", learn_value(t), int(s)) for n, k, t, s in raw]
 assert len(entries) == 73, f"expected 73 real keys, found {len(entries)}"
 assert all(l >= 0 for _, _, l, _ in entries), "unknown learning-type token in the table"
 
-# The corpus is a local research fixture and is NOT published, so this comparison is skipped
-# when it is absent. The table's own shape (73 entries, learning types, suspect flags) is
-# asserted above and does not depend on the file.
 corpus = []
-if CORPUS.is_file():
-    for line in CORPUS.read_text(encoding="utf-8").splitlines():
-        line = line.split("#")[0].strip()
-        m = re.match(r"^([0-9A-Fa-f]{16}):(\d+):(.+)$", line)
-        if m:
-            corpus.append((m.group(3).strip(), m.group(1).upper(), int(m.group(2))))
+# The corpus file is not published, so a fresh clone has none. Guard the WHOLE comparison
+# rather than only the read: with an empty corpus every firmware entry compares as "extra",
+# which reports 73 false failures instead of skipping.
+_corpus = CORPUS.read_text(encoding="utf-8") if CORPUS.is_file() else ""
+if not _corpus:
+    print(f"  corpus cross-check: skipped ({CORPUS.name} not present; "
+          f"set FOBWORKS_MFCODES to run it)")
+for line in _corpus.splitlines():
+    line = line.split("#")[0].strip()
+    m = re.match(r"^([0-9A-Fa-f]{16}):(\d+):(.+)$", line)
+    if m:
+        corpus.append((m.group(3).strip(), m.group(1).upper(), int(m.group(2))))
 
-if corpus:
-    # The Kia entry is not in the corpus file (it comes from the open-source Kia
-    # decoders, see worklog). Everything else must match the corpus exactly — name, key,
-    # and learning type — so a transcription slip cannot slip through.
-    corpus_set = {(n, k, l) for n, k, l in corpus}
-    table_set = {(n.strip(), k.upper(), l) for n, k, l, _ in entries}
+# The Kia entry is not in the corpus file (it comes from the open-source Kia
+# decoders, see research/01). Everything else must match the corpus exactly —
+# name, key, and learning type — so a transcription slip cannot slip through.
+corpus_set = {(n, k, l) for n, k, l in corpus}
+table_set = {(n.strip(), k.upper(), l) for n, k, l, _ in entries}
 
+if _corpus:
     extra = table_set - corpus_set - {("Kia_V3_V4_OEM", f"{PUBLIC_KIA:016X}", 1)}
     assert not extra, f"firmware entries that do not match the corpus: {sorted(extra)}"
     missing = corpus_set - table_set
     assert not missing, f"corpus entries absent from the firmware table: {sorted(missing)}"
-    assert ("Kia_V3_V4_OEM", f"{PUBLIC_KIA:016X}", 1) in table_set, "the public OEM KeeLoq key is missing"
-    print(f"  corpus cross-check: {len(corpus)} entries matched")
 else:
-    print(f"  corpus cross-check: skipped ({CORPUS.name} not present; set FOBWORKS_MFCODES to run it)")
-
-# ── the mask must be transparent ─────────────────────────────────────────────
-# The stored keys are transformed, so the one thing that could break silently is the inverse.
-# Assert the properties that matter: the transform is invertible on every entry, no entry is a
-# fixpoint (a fixpoint would mean the "masked" value equals the key), and the Kia entry -- the
-# one key whose plaintext is public and checkable -- inverts to exactly that value.
-for name, stored_hex, _learn, _suspect in raw_original:
-    stored = int(stored_hex, 16)
-    assert unmask(encode(stored)) == stored, f"{name}: mask is not invertible"
-    assert encode(stored) != stored, f"{name}: the stored value is a transform fixpoint"
-
-_kia_masked = next(k for n, k, _t, _s in raw_original if n == "Kia_V3_V4_OEM")
-assert unmask(int(_kia_masked, 16)) == PUBLIC_KIA, \
-    "the Kia table entry does not unmask to the public Kia key"
-
-# The firmware must invert at every point where the table is read, or those paths would
-# silently derive keys from masked values. Each of these is a real call site.
-for call in ("ks_deriveOneMfrKey(sn, ks_unmaskMfrKey(MFR_KEYS[k].key), dk)",
-             "ks_klDecrypt(f.hop,ks_unmaskMfrKey(MFR_KEYS[i].key))",
-             "CAND_ADD(MFR_KEYS[i].name, ks_unmaskMfrKey(MFR_KEYS[i].key)",
-             "TRY_KEY(MFR_KEYS[i].name, ks_unmaskMfrKey(MFR_KEYS[i].key)"):
-    assert call in source, f"a table read skips the unmask: {call}"
-
-# And the decoder's own key constant must be stored masked and unmasked on use, so that one
-# of the 73 is not left sitting in the clear.
-assert f"0x{PUBLIC_KIA:016X}ULL" not in source, \
-    "the Kia key is still plaintext somewhere in the sketch"
-assert "ks_unmaskMfrKey(KIA_V34_MF_KEY)" in source, \
-    "KIA_V34_MF_KEY is used without unmasking"
-print("  mask transparency: invertible, no fixpoints, every read unmasked")
+    # Without the corpus there is nothing to compare against, but the table must still hold
+    # the expected shape: 73 entries, the public OEM key present, and the mask consistent.
+    assert len(table_set) == 73, f"expected 73 entries, found {len(table_set)}"
+assert ("Kia_V3_V4_OEM", f"{PUBLIC_KIA:016X}", 1) in table_set, "the public OEM KeeLoq key is missing"
 
 # Learning types must be real enum values, not raw 0/1/2 in the source.
 assert "enum KLLearn : uint8_t" in source

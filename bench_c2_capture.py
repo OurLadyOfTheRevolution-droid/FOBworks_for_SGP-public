@@ -3,7 +3,7 @@
 
 Needs a Kia/Hyundai/Genesis V3 or V4 fob and the card tuned to 315 MHz — that is
 where the frame trim has measured constants. For any other protocol expect
-reason="untrimmed-block", which is the gate working, not a bug (worklog §3 P1).
+reason="untrimmed-block", which is the gate working, not a bug (research/12 §3 P1).
 
 Typical run:
 
@@ -146,7 +146,7 @@ def main():
         reason = (arm or {}).get("reason")
         print(f"    REFUSED, reason={reason!r}")
         if reason == "untrimmed-block":
-            print("    This is the untrimmed-block gate doing its job: before it, the card")
+            print("    This is the research/12 gate doing its job: before it, the card")
             print("    would have transmitted a 3-repeat block with no indication.")
             print("    The trim needs this fob's pitch measured before it can work.")
         return 0

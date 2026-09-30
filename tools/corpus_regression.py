@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Corpus regression harness: run every real decoder against every real capture.
 
-worklog §5 step 1. Forty of this firmware's 41 decoders had never been pointed at a real
+research/35 §5 step 1. Forty of this firmware's 41 decoders had never been pointed at a real
 capture; the corpus has 306 RAW files across ~19 brands on disk. This runs the REAL C++
 functions -- extracted from the sketch and compiled -- rather than Python reimplementations,
 because an earlier round's Python model of the encoder disagreed with the running code and cost
@@ -15,7 +15,7 @@ part of the decoder behaviour:
 Skipping the gates would fire decoders the firmware itself would refuse, so the harness would
 report false positives that cannot occur on hardware.
 
-Outputs the triage worklog §5 step 2 asks for:
+Outputs the triage research/35 §5 step 2 asks for:
   · per decoder: files fired on, distinct serials, and whether any non-brand file fires
   · decoders that never fire
   · files matched by none
@@ -309,9 +309,7 @@ def main():
         f"#define {n} {v}" for n, v in
         # Accept decimal AND hex (with u/U/l/L suffixes). KIA_V34_MF_KEY is a 64-bit hex
         # literal; a decimal-only pattern silently dropped it and left ks_klDecrypt keyless.
-        # MFR_KEY_* are the mask constants ks_unmaskMfrKey needs, added when the table became
-        # masked -- without them the extracted helper does not compile.
-        re.findall(r"^#define\s+((?:KIA_V34|TE|KL|MFR_KEY)_[A-Z0-9_]+)\s+"
+        re.findall(r"^#define\s+((?:KIA_V34|TE|KL)_[A-Z0-9_]+)\s+"
                    r"(0[xX][0-9A-Fa-f]+[uUlL]*|[0-9]+[uUlL]*)", src, re.M))
 
     # One call site per decoder, with zeroed out-params sized from its own signature.
@@ -425,7 +423,7 @@ static int run_all(int multi){{
   float mhz=(float)mhz_g;
 {gate_defs}
   /* multi=1: evaluate EVERY decoder whose gate passes, and print each hit, so a file matched
-     by two decoders is visible (worklog §I4's predicted false-positive class).
+     by two decoders is visible (research/04 §I4's predicted false-positive class).
      multi=0: the firmware's own first-match behaviour. */
   if(multi){{
 {chr(10).join(multi_calls)}
@@ -595,7 +593,7 @@ int main(int argc,char**argv){{
 
         print()
         print("=" * 78)
-        print("PER-DECODER (worklog §5 step 1)")
+        print("PER-DECODER (research/35 §5 step 1)")
         print("=" * 78)
         # Report from multi_hits when available: it holds every decoder that fired, whereas
         # `hits` only the first. Two columns matter and they are different things:
@@ -632,7 +630,7 @@ int main(int argc,char**argv){{
 
         print()
         print("=" * 78)
-        print("TRIAGE (worklog §5 step 2)")
+        print("TRIAGE (research/35 §5 step 2)")
         print("=" * 78)
         # Derive "never fires" from whichever pass actually ran. In multi mode `hits` is empty
         # (the branch continues early), so reading it alone reported all 41 as never firing.

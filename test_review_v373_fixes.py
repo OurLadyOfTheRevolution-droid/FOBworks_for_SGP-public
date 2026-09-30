@@ -145,8 +145,15 @@ assert '+",\\"id\\":\\""+idStr' not in src, \
 # ships are inspected (the worklog lives on other branches and legitimately cites itself), and a
 # reference must look like a path on a single line -- a backtick span containing newlines is a
 # code block, not a reference.
+#
+# Second correction: the first version only checked that a cited path exists in the LOCAL tree,
+# so a doc could point at a file this repository will never publish and still pass. README.md
+# did exactly that, naming the worklog index, and it went unnoticed until the publish branch was
+# compared against main. Existence and publishability are different properties, so both are
+# checked here. The unpublished set is not a guess: it is what the publish branch excludes.
 _PUB_DOCS = ["README.md", "PROMO.md", "CITATIONS_AND_REFERENCES.md"]
 _REF = re.compile(r"`((?:research|tools)/[A-Za-z0-9_./ -]+)`")
+_UNPUBLISHED = re.compile(r"^research/[0-9][0-9]_|^research/sources/keeloq_mfcodes_public\.txt$")
 _bad = []
 for _f in _PUB_DOCS:
     _p = HERE / _f
@@ -158,8 +165,10 @@ for _f in _PUB_DOCS:
             if _r.endswith("/"):                      # a directory or an upstream project path
                 continue
             if not (HERE / _r).exists() and not (HERE / _r.rstrip("/")).is_dir():
-                _bad.append(f"{_f}:{_i} -> {_r}")
-assert not _bad, f"published docs reference paths this tree does not contain: {_bad}"
+                _bad.append(f"{_f}:{_i} -> {_r} (not in this tree)")
+            elif _UNPUBLISHED.match(_r):
+                _bad.append(f"{_f}:{_i} -> {_r} (not published; a reader cannot open it)")
+assert not _bad, f"published docs reference paths a reader cannot open: {_bad}"
 print(f"  published-reference check: {len(_PUB_DOCS)} docs, every cited path resolves")
 
 print(f"review-finding checks passed on v{_ver} (websocket auth, GDO0 routing, capture budget, can_send)")

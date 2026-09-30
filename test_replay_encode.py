@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile and exercise the real CC1101 packet encoder against real capture data.
 
-The packet-mode replay path (worklog §5 step 4) encodes a list of pulse widths into OOK
+The packet-mode replay path (research/19 §5 step 4) encodes a list of pulse widths into OOK
 bits at a register-selected symbol rate. Two things must hold, and neither can be checked by
 reading the source:
 
@@ -159,7 +159,7 @@ int main(void){
   printf("chosen S=%u worst_err_us=%u\n", bestS, bestS/2);
 
   /* ── The shipped trim ───────────────────────────────────────────────────���───
-     worklog §2.1 recommended trimming to the separator boundaries. MEASURED, that
+     research/21 §2.1 recommended trimming to the separator boundaries. MEASURED, that
      breaks the frame ([20:182) does not decode) because index 20 is the protocol sync.
      The shipped rule drops only the partial leading pulse and the trailing next-frame
      separator. Reproduce it here and report what survives. */
@@ -217,7 +217,7 @@ int main(void){
                   f"runs ({runs}) are consistent with the pulse count ({len(frame)}), "
                   f"so the frame did not collapse")
             check(maxrun <= 24, f"longest single-level run ({maxrun}) is short")
-        # The worklog fix: te comes from clustering, the chosen symbol is te itself, and
+        # The research/20 fix: te comes from clustering, the chosen symbol is te itself, and
         # the protocol's short:long ratio survives quantisation.
         mt = re.search(r"te_short=(\d+) te_long=(\d+) cluster_ratio=([\d.]+)", out)
         check(mt is not None, "te derived from clustering is reported")
@@ -232,7 +232,7 @@ int main(void){
             check(ratio > 1.6, f"accepted ratio {ratio:.3f} preserves short:long (>1.6)")
             check(serr < 15.0, f"accepted short-pulse error {serr:.1f}% is within tolerance")
         # The payload must contain no pulse outside the te clusters — this is the assertion
-        # worklog §2.1 option 1 asks for, and it must fail if the trim is removed.
+        # research/21 §2.1 option 1 asks for, and it must fail if the trim is removed.
         mtr = re.search(r"trim: dropped=(\d+) payload=\[(\d+),(\d+)\] len=(\d+)", out)
         check(mtr is not None, "the trim is reported")
         if mtr:
