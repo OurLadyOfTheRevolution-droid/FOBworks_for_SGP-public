@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v3.76
+// Version  : FOBworks for SGP v3.79
 // Board    : May 2026 stock, ESP32-S3-MINI-1-N8, 8 MB flash, no PSRAM
 // Radio    : CC1101, OOK and 2FSK, 300–928 MHz
 // Dashboard: http://192.168.4.1; per-device Wi-Fi credentials are printed over USB
@@ -193,6 +193,96 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
 // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+// v3.79 (2026-09-29) — a stored frame can be imported even when its protocol has no trim.
+//
+//   [BUG] fbk_import refused any body that rjTrimKiaV34 could not bound, so only Kia V3/V4
+//     format captures could ever be imported. rjTrimKiaV34 looks for the 162-pulse Kia
+//     repeat by construction, so a Toyota, CAME, Nice or Ford body can never satisfy it --
+//     the import path was therefore narrower than the docs implied, and it blocked loading
+//     the one family the bench actually needs (research/43).
+//
+//     fbkAppend already keeps the raw block when the trim finds nothing ("a wrong trim is
+//     worse than a long one, because the decoder can still find a frame inside a
+//     multi-repeat block"), so this makes the import path agree with the capture path
+//     instead of being stricter than it. The kept body is capped to CAP_SZ, which is what an
+//     FbkEntry holds, and an import_kept_raw event reports it rather than accepting silently.
+//
+//     The safety property is unchanged and still asserted: rbArm refuses an untrimmed block
+//     (both the HTTP and serial paths), so C2 cannot transmit a multi-repeat body as if it
+//     were a single press. Only storage changed, not what is allowed to fire.
+//
+//   [TEST] test_fbk_import.py previously asserted the refusal; it now asserts the guard that
+//     matters -- trimmed=false is recorded, rbArm refuses it, and the keep is reported.
+//
+// v3.78 (2026-09-29) — ks_decodeToyota was unreachable on its own captures.
+//
+//   [BUG] The decoder fired on 12 foreign captures (Ford, Tesla, Kia, VW) while decoding
+//     none of its own 62 Toyota/Lexus captures. The dispatch guard was an inverted ceiling:
+//     `te_toy && ratio<=2.5` (and `ratio<=3.0` on the Ch-B path). A Toyota capture that
+//     contains data measures ratio 6.6-13.2, because the data region mixes 1T and 2T HI
+//     pulses with long inter-bit LO gaps while the equal-width preamble collapses toward
+//     1.0; the foreign files measure ~2.0. So the ceiling admitted the aliased population
+//     and excluded the brand the decoder serves. The guard is now `ratio>=3.5`. Foreign
+//     fires fall 12 -> 5, own-brand decodes rise 0 -> 2, and the decoder is now reachable
+//     on 39 of 62 own-brand captures instead of zero.
+//
+//     The v3.53/v3.54 comments claimed the ceiling "cleanly separates the two populations"
+//     with real Toyota below 3.0 and aliasing above. The measurement is the other way round.
+//
+//   [BUG] The preamble minimum was 3, against this decoder's own documented 8, with a note
+//     asserting that 3 prevents false positives. Measured, it does the opposite: restoring 8
+//     keeps the identical own-brand result and cuts the foreign hits from 8 to 5. Recorded
+//     caveat: only 2 of 64 captures reach 8 detectable pairs, because a modern fob's preamble
+//     is short, so 8 would exclude genuine short-preamble fobs if the data stage were fixed.
+//
+//   [NOT FIXED] The data stage still resolves only 2 of the 62 captures, and emits several
+//     inconsistent frames per capture. That needs a correctly-scaled capture; the corpus
+//     scaling is unreliable (research/38). Also noted for later: the entropy gate accepts up
+//     to 32 transitions in 39 bit-pairs, and 82% is close to alternating noise, so its upper
+//     bound can be tightened well below 32 with no risk to real frames.
+//
+//   [TEST] test_toyota_reachability.py asserts the DISPATCH condition as well as the decode,
+//     so it cannot pass by moving the decoder further out of reach.
+//
+//   Compile: 1,775,184 B flash of 3,145,728 (56%), 149,580 B RAM of 327,680 (45%).
+//   All 18 suites pass.
+//
+// v3.77 (2026-09-29) — the two decoder false positives the corpus regression surfaced.
+//
+//   [BUG] ks_decodeKiaV2 rejected every genuine KIA/HYU V2 frame and accepted a family of
+//     noise instead. The CRC4 formula was missing its final + 1. Two genuine KIA/HYU V2
+//     payloads in the corpus (Hyundai_V2_N1, Hyundai_V2_Random_Habar) satisfy
+//     (xor of the twelve data nibbles + 1) & 0x0F and fail without the + 1, while the seven
+//     Tesla 433.92 MHz captures this decoder used to fire on satisfy only the old form. The
+//     two sets are disjoint, so the one operator both validates real frames and removes the
+//     false positives. This was not a loose tolerance: the decoder was stricter than the
+//     protocol, so it could not have decoded a real V2 fob at all. The reference
+//     implementation computes the same (crc + 1) & 0x0F.
+//
+//   [BUG] ks_decodeFordV0 fired on three VW Polo 434.42 MHz captures. Its 80-bit window
+//     slides into the long unmodulated tail those captures end on, and the CRC7 of a
+//     constant run passes by construction: 136 passing offsets per file, every one with 0 or
+//     1 bit transitions across the window, against roughly 50 for a real frame. Windows
+//     below 8 transitions are now rejected. The floor is set at "modulated at all" rather
+//     than just above the observed value, so no real frame can reach it.
+//
+//   Neither fix narrows a pulse-geometry tolerance, so neither depends on capture scaling,
+//   which matters because the corpus scaling is unreliable (research/38).
+//
+//   [FIX] The band remark in research/37 §4.1 is a red herring: te_kv2 requires eu433, so
+//     433.92 MHz is the correct band for the EU V2 variant and the band gate was working.
+//
+//   [DOC] research/39 records the investigation; research/36 §3.3 and research/37 §6 carry
+//     corrections, because both described these as "too-permissive validation" when the
+//     KiaV2 cause was an incorrect check rather than an absent one.
+//
+//   [TEST] test_decoder_false_positives.py runs the shipped decoders over the real captures
+//     and asserts the old formula DID fire on every Tesla file, and that both gates are open
+//     on every test file, so neither assertion can pass vacuously.
+//
+//   Compile: 1,775,180 B flash of 3,145,728 (56%), 149,580 B RAM of 327,680 (45%).
+//   All 17 suites pass.
+//
 // v3.76 (2026-09-28) — an out-of-bounds read in the WebSocket slot table, and a test that
 //   could not compile outside clang.
 //
@@ -323,7 +413,7 @@
 //     gdo0_rail_test, tx_fifo_test, tx_carrier_test, pa_check, and jam_status. Readbacks
 //     and reference-pin checks make each result easier to verify.
 //
-// v3.71 (2026-09-26) — a capture is now trimmed to ONE frame (worklog F2/F5/F4).
+// v3.71 (2026-09-26) — a capture is now trimmed to ONE frame (research/11 F2/F5/F4).
 //
 //   [BUG] A capture buffer entry was several repeats of one code, not one code.
 //     captureSignal fills CAP_SZ=512 pulses and a press emits its frame repeatedly,
@@ -376,11 +466,11 @@
 //
 //     1. The jam was owned by the browser. Closing the tab or losing Wi-Fi
 //        mid-sequence left the carrier running with nothing to stop it — the same
-//        class of failure as the reset-path jam (worklog §2.2), one layer up.
+//        class of failure as the reset-path jam (research/09 §2.2), one layer up.
 //     2. No deadline and no single-shot lockout. The JS re-armed itself on replay,
 //        so a duplicate tap could re-fire.
 //     3. No check that the two banked "codes" were two different codes — the defect
-//        worklog §2.5 fixed in C2, present here too.
+//        research/10 §2.5 fixed in C2, present here too.
 //
 //   [C1] rjState machine: IDLE -> JAM1 -> CAP1 -> JAM2 -> CAP2 -> TX1 -> IDLE.
 //     · rjArm() is explicit and refuses while a sequence runs; rjStart() consumes
@@ -399,12 +489,12 @@
 //   [PREREQ] captureSignal() takes an optional gapUs. The 350 ms default allows a
 //     Toyota preamble-to-data silence to pass; C1 passes RJ_CAP_GAP_US (8 ms) so the
 //     capture ends at the frame repeat boundary and one block is ONE code, not
-//     several repeats of it (worklog §3).
+//     several repeats of it (research/10 §3).
 //
 //   Surfaces: /api/rolljam_arm | _start | _abort | _status | _replay, serial
 //   mirrors, all behind the auth gate.
 //
-//   [NOT DONE] C1 still needs bench validation, and worklog C1 names the thing
+//   [NOT DONE] C1 still needs bench validation, and research/04 C1 names the thing
 //     to validate: dropping the jam for a capture window also lets the CAR hear that
 //     press. This code does the "jam through the press, RX between presses" ordering;
 //     whether that ordering works against a real receiver is not something a host
@@ -415,7 +505,7 @@
 //     path, same-code refusal, deadline, single-shot, re-armability after success, and
 //     that the replay sends press 1. 9/9 mutants caught.
 //
-// v3.69 (2026-09-26) — C2 refuses a same-code pair (worklog §2.5).
+// v3.69 (2026-09-26) — C2 refuses a same-code pair (research/10 §2.5).
 //
 //   [BUG] rbArm required two ENTRIES but not two different CODES.
 //     One fob press can append two entries: captureSignal fills CAP_SZ=512 pulses
@@ -442,7 +532,7 @@
 //     no-distinct-codes) plus a hint, so a refusal is diagnosable rather than silent.
 //
 //   [NOT DONE, deliberately] Trimming each stored block to one frame before
-//     transmitting. worklog §2.5 asks for it on the premise that a 512-pulse
+//     transmitting. research/10 §2.5 asks for it on the premise that a 512-pulse
 //     block "will look to the receiver like three presses". Measurement contradicts
 //     that: the ~3 frames in a capture all carry the SAME counter, i.e. they are the
 //     repeats a real fob sends for one press. Trimming would remove repeats the
@@ -458,7 +548,7 @@
 //
 // v3.68 (2026-09-26) — reset-path jam guard, executable C2 test, honest A2.
 //
-//   [CRITICAL] Reset-path jam guard (worklog §2.2, §5.4).
+//   [CRITICAL] Reset-path jam guard (research/09 §2.2, §5.4).
 //     A reset (watchdog, brownout, panic, reflash) runs no cleanup path, so a jam
 //     active when the CPU died could outlive it. Mechanism: startJam() leaves the
 //     CC1101 in TX (STX) and drives GDO0 HIGH; in async TX GDO0 is the TX DATA
@@ -586,7 +676,7 @@
 //     A1 now builds the true on-air format (preamble, sync with the level set by
 //     version, one bit per pulse) via ks_kiaV34BuildPulses.
 //
-//   Evidence (worklog section 7, tools under research/sources/):
+//   Evidence (research/08 section 7, tools under research/sources/):
 //     · corpus fetched: 323 captures in research/sources/corpus_automotive_subghz/
 //     · the firmware C decoder and the Python mirror agree exactly on real captures
 //     · KIA V3 N1 -> V3 sn=0x00C0ED06 ctr=0x0026  (was reported V4 before the fix)
@@ -617,7 +707,7 @@
 //     encryption input are different layouts in this protocol:
 //       on-air  (serial & 0x0FFFFFFF) | (btn<<28)
 //       encrypt (cnt & 0xFFFF) | ((serial & 0x3FF)<<16) | (btn<<28)
-//     Only serial[9:0] enters the encrypted word. worklog §2.6 conflated
+//     Only serial[9:0] enters the encrypted word. research/06 §2.6 conflated
 //     them; the on-air form loses the top serial bits into bits[43:16] of a
 //     32-bit word and overwrites the button nibble, so any serial >= 0x3FF
 //     failed validation. Caught by the A1 round-trip at serial 0x0A1B2CE7.
@@ -650,7 +740,7 @@
 //     "serial & 0xFF" would have passed every test. Vector 2 uses
 //     serial=0x0A1B2FE7 (serial[9:8]=11) to pin the mask width. Both computed
 //     from lib/subghz/protocols/kia_v3_v4.c:243 and verified with the shipped
-//     cipher. Note: worklog §2 and §3.2 contain two errors, documented and
+//     cipher. Note: research/07 §2 and §3.2 contain two errors, documented and
 //     NOT applied — §2's vectors are ENCRYPT not DECRYPT (ENC matches 3/3), and
 //     §3.2's 0x2E7 is wrong (0x3FF is a 10-bit mask, so serial&0x3FF = 0x0E7).
 //     Applying §3.2 would have made the KAT pass a wrong implementation.
@@ -666,7 +756,7 @@
 //     validates the framing gate only: none of those captures contains the
 //     400/800us pattern, so the crypto rejection path is untested on real RF.
 //     The RAW-export polarity assumption (§3.4a) is also still open. C2 not
-//     started, per worklog §6.
+//     started, per research/07 §6.
 //
 // v3.64 (2026-09-26) — KeeLoq framing + match-predicate fix, V1 gate, V2/V3.
 //   Two defects in the KeeLoq frame path made every key match wrong. They
@@ -1290,13 +1380,13 @@
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v3.76"
+#define FW_VER        "FOBworks for SGP v3.79"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
 #define AP_SSID       "SGP Card Mini"
 #define CAP_SZ         512
-// worklog §2.1: the import body limit expressed in pulses. A corpus .sub runs 4.38 bytes
+// research/23 §2.1: the import body limit expressed in pulses. A corpus .sub runs 4.38 bytes
 // per pulse (verified: 297934 bytes / 67977 pulses), so an 8192-byte body carries ~1869
 // pulses. The parser cap and every import staging buffer must match this, or the accepted
 // body is wider than what can be searched -- which is how a 512-pulse cap ended up refusing
@@ -1305,14 +1395,14 @@
 // limits must move together: the instruction raised only the pulse cap to 1868, which is
 // the correct figure for an 8192-byte body but still short of the first frame at 2517, so
 // the stated goal ("posting the corpus file's head must import successfully") would not
-// have been met. See worklog §4 step 1.
+// have been met. See research/23 §4 step 1.
 #define SUB_REPLAY_MAX_PULSES 3740
 // Largest serial command line accepted. Was an inline 255, which silently discarded any
 // longer command -- see the note at the read loop. Sized for the widest command the firmware
 // takes; the import's pulse list is the largest, and its handler bounds that payload.
 #define SERIAL_CMD_MAX 8192
 uint32_t serialRxQueueActual=0;   // what setRxBufferSize() actually achieved (0 = failed)
-// Stack instrumentation (worklog §3.2). There was none, which is why the first real
+// Stack instrumentation (research/28 §3.2). There was none, which is why the first real
 // frame had to crash to reveal the limit. uxTaskGetStackHighWaterMark(NULL) returns the
 // MINIMUM free stack (in words) since the task started, i.e. the worst case so far -- so after
 // one bench session the value IS the measurement, and a regression shows as a shrinking
@@ -1432,7 +1522,7 @@ float    rfFreqB = 0.0f;
 // transmits correct levels. Defaults true for entries built by protocol generators.
 // ctr/hasCtr: the rolling counter this capture decoded to, when the decoder
 // supplied one. Used by fbkCtrOrder() to reject two entries carrying the SAME code,
-// which cannot produce a valid RollBack sequence (worklog §2.5).
+// which cannot produce a valid RollBack sequence (research/10 §2.5).
 struct FbkEntry { uint16_t w[CAP_SZ]; int len; float freq; uint32_t ts; bool sh;
                   uint32_t ctr; bool hasCtr;
                   // trimmed = the block was reduced to ONE frame. Only Kia V3/V4 has a
@@ -1440,7 +1530,7 @@ struct FbkEntry { uint16_t w[CAP_SZ]; int len; float freq; uint32_t ts; bool sh;
                   // multi-repeat block is kept and this is false. C1/C2 are only
                   // correct when this is true, which is why rbArm/rjArm gate on it and
                   // report "untrimmed-block" rather than failing silently
-                  // (worklog §2/§3 P1).
+                  // (research/12 §2/§3 P1).
                   bool trimmed; };
 static FbkEntry fbkBuf[FBK_MAX];
 static int      fbkCount = 0;
@@ -1467,7 +1557,7 @@ uint32_t capMaxMsOverride = 0;
 // toggles is not evidence the signal came from the CC1101. It governs all three paths that
 // could otherwise be fooled by a toggle -- jam, replay, and capture.
 //
-// Set true only on a board where GDO0 really is wired. The worklog records the measurement and
+// Set true only on a board where GDO0 really is wired. `research/14` records the measurement and
 // the vendor firmware says the same; neither is a reason to probe for it at runtime, because a
 // probe cannot tell the two chips' pins apart.
 bool gdo0Routed = false;
@@ -1490,7 +1580,7 @@ static int  rjTrimKiaV34(const uint16_t* w,int len,uint16_t* out,int outCap,int*
 // Why here: FOBback already captures a run of raw codes into fbkBuf. RollBack is
 // the same capture with a specific two-code transmission order and a configurable
 // gap, so it is a sequencer on top of existing machinery rather than new capture
-// code. worklog C2.
+// code. research/04 C2.
 //
 // Guard rails, deliberately conservative because this transmits:
 //   · exactly two codes, code 0 then code 1 — never a loop
@@ -1684,7 +1774,7 @@ struct KLCand { const char* name; uint64_t key; uint8_t learn; bool suspect; };
 // Carried per manufacturer key. The learning type decides which key
 // diversification the device key came from, so it decides which derivations are
 // worth generating for that key. Values and meanings match the leaked-corpus
-// type field and the reference keeloq_common.h (see worklog, section 1).
+// type field and the reference keeloq_common.h (see research/01, section 1).
 //   UNKNOWN   — type not recorded; several interpretations are possible, so a
 //               match is reported as unconfirmed.
 //   SIMPLE    — device key == manufacturer key.
@@ -1711,7 +1801,7 @@ enum KLLearn : uint8_t {
 //             dashboard's "pattern" badge means. 0 for a real, typed key.
 struct MfrKey  { const char* name; uint64_t key; uint8_t learn; uint8_t suspect; };
 
-// Stack high-water sampler (worklog §3.2). Defined here, after the type declarations,
+// Stack high-water sampler (research/28 §3.2). Defined here, after the type declarations,
 // because the sketch preprocessor hoists prototypes above the body -- a function defined
 // earlier would land before these types exist.
 static void stackSample(){
@@ -2769,7 +2859,7 @@ bool cc_init(float mhz){
   // and cc_reset() only issues SRES — which does not by itself drive GDO0, the
   // async TX data input. Holding GDO0 LOW as an OUTPUT puts a definite
   // no-carrier level on that input across the reset, before SIDLE and the RX
-  // reconfiguration below. setup does the same thing first (worklog §2.2);
+  // reconfiguration below. setup() does the same thing first (`research/09` §2.2);
   // it is repeated here so cc_init() is safe to call on any path, including the
   // /api/reinit route.
   pinMode(PIN_GDO0,OUTPUT);
@@ -2952,7 +3042,7 @@ static inline uint32_t ks_klDec1(uint32_t& hi,uint32_t& lo,uint64_t key){
 // only ever produce a false positive, and every recovery run spent budget on
 // them first.
 //
-// Provenance is recorded in worklog §1; the corpus
+// Provenance is recorded in `research/01` §1; the corpus
 // itself is the MFR_KEYS table below. The upstream corpus file is not shipped with this
 //
 //   · 72 gate/barrier/shutter/alarm entries, from a publicly leaked key list.
@@ -3050,7 +3140,8 @@ static const MfrKey MFR_KEYS[]={
 // value is the affine transform of the real key; ks_unmaskMfrKey below is the inverse, applied
 // once per key on the way into a derivation. It is obfuscation, not a security boundary: the
 // constants are right here, the table is in a public repository, and anything the device can
-// compute, so can a reader. Reversible with tools/mask_mfrkeys.py.
+// compute, so can a reader. Reversible with tools/mask_mfrkeys.py. Produced by
+// tools/publish_prepare.py; do not edit this branch by hand.
 #define MFR_KEY_A  0x5A5A5A5A5A5A5A5AULL   // matches tools/mask_mfrkeys.py
 #define MFR_KEY_B  0x3C3C3C3C3C3C3C3CULL
 #define MFR_KEY_N  13
@@ -3061,7 +3152,9 @@ static inline uint64_t ks_unmaskMfrKey(uint64_t v){
   const uint8_t n = MFR_KEY_N;
   return ((x >> n) | (x << (64 - n))) ^ MFR_KEY_A;
 }
-static_assert(N_MFR_KEYS == 73, "MFR_KEYS count changed — update this assert with the table");
+static_assert(N_MFR_KEYS == 73, "MFR_KEYS count changed -- update this assert with the table");
+
+static_assert(N_MFR_KEYS == 73, "MFR_KEYS count changed — update research/sources/keeloq_mfcodes_public.txt and this assert together");
 #define N_KL_DERIV_MODES 14
 #define MAX_DERIVED_KEYS (N_MFR_KEYS * N_KL_DERIV_MODES)
 // V3: pin the mode count so the per-mode tables cannot silently disagree with
@@ -3876,7 +3969,7 @@ static uint32_t rjCtr1=0, rjCtr2=0;
 static bool     rjHasCtr1=false, rjHasCtr2=false;
 static bool     rjTrim1=false, rjTrim2=false;    // was each capture reduced to one frame?
 static float    rjFreq=0.0f;
-static float    rjJamOffset=0.150f;          // +150 kHz, per worklog C1
+static float    rjJamOffset=0.150f;          // +150 kHz, per `research/04` C1
 static bool     rjArmed=false;
 static bool     rjReplayed=false;            // true once press 1 was retransmitted
 static String   rjLastJson="{\"event\":\"rolljam\",\"state\":\"idle\"}";
@@ -3896,7 +3989,7 @@ static void rjReset(){
   rjTrim1=rjTrim2=false;
 }
 
-// Does the second capture follow the first? Reuses the C2 rule (worklog §2.5):
+// Does the second capture follow the first? Reuses the C2 rule (research/10 §2.5):
 // two entries are not two codes, and a pair that is not forward-ordered cannot
 // produce a working RollJam.  1 = ordered, 0 = unknown, -1 = reject.
 static int rjCtrOrder(){
@@ -3953,14 +4046,14 @@ static void rjTick(){
     case RJ_JAM1: {
       // Press 1 in flight: capture it now, then re-jam while press 2 arrives.
       // The capture drops the jam for its duration (single radio), which is the
-      // window worklog says to validate on a bench.
+      // window research/04 says to validate on a bench.
       if(cc_fastRSSI() > autoCapDbm){
         stopJam();
         delayMicroseconds(RJ_JAM_SETTLE_US);
         cc_setCaptureOOK();
         if(captureSignal(RJ_CAP_TIMEOUT, RJ_CAP_GAP_US) && rfLen>8){
           // Trim to one frame: a capture holds ~3 repeats of the same code, and the
-          // RollJam replay must send ONE press, not three (worklog §2 F2).
+          // RollJam replay must send ONE press, not three (research/11 §2 F2).
           { static uint16_t _t[CAP_SZ];
             int _tl=rjTrimKiaV34(rfBuf,rfLen,_t,CAP_SZ,nullptr);
             if(_tl>0){ memcpy(rjBuf1,_t,_tl*sizeof(uint16_t)); rjLen1=_tl; rjTrim1=true; }
@@ -3990,7 +4083,7 @@ static void rjTick(){
         cc_setCaptureOOK();
         if(captureSignal(RJ_CAP_TIMEOUT, RJ_CAP_GAP_US) && rfLen>8){
           // Trim to one frame: a capture holds ~3 repeats of the same code, and the
-          // RollJam replay must send ONE press, not three (worklog §2 F2).
+          // RollJam replay must send ONE press, not three (research/11 §2 F2).
           { static uint16_t _t[CAP_SZ];
             int _tl=rjTrimKiaV34(rfBuf,rfLen,_t,CAP_SZ,nullptr);
             if(_tl>0){ memcpy(rjBuf2,_t,_tl*sizeof(uint16_t)); rjLen2=_tl; rjTrim2=true; }
@@ -4013,7 +4106,7 @@ static void rjTick(){
       // protocol each capture is still ~3 repeats of its code and the replay would
       // look to the car like three presses of press 1. Refuse and attribute it rather
       // than sending a sequence that may be wrong in a way nobody can see
-      // (worklog §2 / §3 P1).
+      // (research/12 §2 / §3 P1).
       if(!rjTrim1||!rjTrim2){
         rjLastJson="{\"event\":\"rolljam\",\"state\":\"aborted\",\"reason\":\"untrimmed-block\"}";
         serialEmit(rjLastJson);
@@ -4100,7 +4193,7 @@ static bool fbkParseCtr(const String& dec,uint32_t& out){
   return true;
 }
 
-// ─── Uniform-pulse predicate (worklog §2, shared) ────────────────────────
+// ─── Uniform-pulse predicate (research/19 §2, shared) ────────────────────────
 // True when a pulse train has no bit edges: essentially every width is the same, so there
 // is no short/long modulation for a decoder to read. A genuine OOK frame is 1:2 short:long,
 // so the max is at least ~1.5x the min; a uniform train stays within 10%.
@@ -4121,7 +4214,7 @@ static bool ks_noBitEdges(const uint16_t* w,int len,uint32_t& widthOut){
   return (mn>0 && (uint32_t)mx*100 < (uint32_t)mn*110);
 }
 
-// ─── Frame trimming (worklog §2 F2) ──────────────────────────────────────
+// ─── Frame trimming (research/11 §2 F2) ──────────────────────────────────────
 // A capture is NOT one code. captureSignal fills CAP_SZ=512 pulses or runs to its
 // time bound, and a fob press emits its frame repeatedly, so one buffer entry holds
 // several repeats of the same code. Measured on KIA V3 N1 RAW.sub: the frame repeat
@@ -4129,7 +4222,7 @@ static bool ks_noBitEdges(const uint16_t* w,int len,uint32_t& widthOut){
 // and C2 depend on "one block = one code", so the stored block must be trimmed to a
 // single frame.
 //
-// Why trim after capture rather than bound the capture itself (worklog §1):
+// Why trim after capture rather than bound the capture itself (research/11 §1):
 //   · The capture path cannot exit before its 100 ms floor, and an 8 ms gap is
 //     unreachable inside that window.
 //   · More fundamentally, the measured gap distribution is smooth and decaying with
@@ -4153,7 +4246,7 @@ static bool ks_noBitEdges(const uint16_t* w,int len,uint32_t& widthOut){
 // the corpus capture). It is what makes this selective: see the locator note below.
 // `anchorOut` is optional (may be -1's address? no: pass nullptr to ignore). When given, it
 // receives the index in `w` of the separator the trim locked onto, so a caller can report
-// WHERE a frame was found -- worklog §2.2 asked for this because a refusal otherwise
+// WHERE a frame was found -- research/23 §2.2 asked for this because a refusal otherwise
 // gives no hint whether the body was wrong or the search too narrow.
 static int klTrimToFrame(const uint16_t* w,int len,uint16_t* out,int outCap,
                          uint32_t gapUs,int framePitchPulses,int pitchTolPulses,
@@ -4206,7 +4299,7 @@ static int klTrimToFrame(const uint16_t* w,int len,uint16_t* out,int outCap,
 }
 
 // Kia V3/V4 frame constants. These are measured FROM ONE CAPTURE, and the confidence
-// they carry should be read with that in mind (worklog §1):
+// they carry should be read with that in mind (research/12 §1):
 //   separator : >1000 us. te_long is 800 us, so the boundary must clear that plus
 //               jitter; the measured separator distribution supports 1000 us.
 //   pitch     : 162 pulses from one separator to the next, observed 135 times in
@@ -4251,7 +4344,7 @@ static bool fbkAppend(const uint16_t* w,int len,float mhz,bool startHigh,const S
   // CAP_SZ=512 pulses and a press emits its frame repeatedly, so a raw block is ~3
   // repeats. C2 transmits fbkBuf[0] then fbkBuf[1], and sending 3 repeats of a code
   // looks to the receiver like several presses rather than the one the sequence
-  // depends on (worklog §2 F2, root cause).
+  // depends on (research/11 §2 F2, root cause).
   //
   // The trim is protocol-specific and currently only Kia V3/V4 has a measured
   // boundary. When it does not apply, or finds no frame, the raw block is kept: a
@@ -4280,7 +4373,7 @@ static bool fbkAppend(const uint16_t* w,int len,float mhz,bool startHigh,const S
   return true;
 }
 
-// ─── Import a stored frame into fbkBuf (worklog §3) ──────────────────────
+// ─── Import a stored frame into fbkBuf (research/22 §3) ──────────────────────
 //
 // Why this exists: the ONLY writer to fbkBuf was the armed live-capture path, and on this
 // board that path cannot produce a usable code — capture falls back to RSSI (no GDO0), the
@@ -4300,7 +4393,7 @@ static bool fbkAppend(const uint16_t* w,int len,float mhz,bool startHigh,const S
 //   · the same fbkCount<FBK_MAX bound
 //
 // Returns true only when the entry was actually appended.
-// ── Import staging (worklog §2) ──────────────────────────────────────────
+// ── Import staging (research/24 §2) ──────────────────────────────────────────
 //
 // TWO buffers, not four. An earlier version had four copies of a 3740-entry array -- the
 // trim output plus three handler-local statics holding the parsed body -- costing 29.9 KB
@@ -4353,16 +4446,28 @@ static bool fbkImportFrame(const uint16_t* w,int len,float mhz,bool startHigh,St
   int anchor=-1;
   int tl=rjTrimKiaV34(w,len,impFrame,CAP_SZ,&anchor);
   impLastAnchor=anchor;
-  if(tl<=0){
-    err="no-frame-in-body";
-    serialEmit(String("{\"event\":\"import_rejected\",\"reason\":\"no-frame-in-body\",")+
-      "\"pulses\":"+String(len)+",\"searched\":"+String(len)+
-      ",\"detail\":\"no Kia V3/V4 pitch pair was found anywhere in the body, so there is "
-      "no single frame to hold; crop the body to start near a burst head\"}");
-    return false;
+  const uint16_t* fw;
+  int flen;
+  if(tl>0){ fw=impFrame; flen=tl; }
+  else {
+    // No Kia V3/V4 pitch pair. That is NOT a failure for any other protocol: rjTrimKiaV34 is
+    // Kia-specific by construction (it looks for the 162-pulse repeat), so a Toyota, CAME,
+    // Nice or Ford body can never satisfy it. Refusing here meant the import path could only
+    // ever accept Kia-format captures, which is narrower than the docs implied and blocked
+    // importing the one family the bench actually needs (research/43).
+    //
+    // fbkAppend already keeps the raw block when the trim finds nothing -- "a wrong trim is
+    // worse than a long one, because the decoder can still find a frame inside a multi-repeat
+    // block" -- so this makes the import path agree with the capture path instead of being
+    // stricter than it. Capped to CAP_SZ because that is what an FbkEntry holds.
+    flen=(len>CAP_SZ)?CAP_SZ:len;
+    if(flen<4){ err="too-few-pulses"; return false; }
+    fw=w;
+    serialEmit(String("{\"event\":\"import_kept_raw\",\"reason\":\"no-kia-frame-found\",")+
+      "\"pulses\":"+String(len)+",\"held\":"+String(flen)+
+      ",\"detail\":\"no Kia V3/V4 pitch pair; body kept as-is, as a live capture would be. "
+      "Set the frame boundary yourself if the body holds several repeats\"}");
   }
-  const uint16_t* fw=impFrame;
-  int flen=tl;
 
   // Decode through the real path so the counter comes from the same decoder a capture uses.
   // decodeSignal() reads the rfBuf/rfLen globals, so stage the TRIMMED frame there, exactly
@@ -5690,6 +5795,13 @@ static bool ks_decodeFordV0(const char* mb,int ml,
     uint8_t b9[9];
     for(int i=0;i<8;i++) b9[i]=(uint8_t)(k1>>(56-i*8));
     b9[8]=(uint8_t)(k2>>8);
+    // A constant run is never a frame. Without this, the 80-bit window slides into the
+    // long unmodulated tail VW Polo captures end on and the CRC7 passes trivially: measured
+    // 136 passing offsets per Polo file, all with 0 or 1 bit transitions across the whole
+    // window. Real frames here have ~50. The CRC alone cannot separate the two because a
+    // constant run satisfies it by construction.
+    { int tr=0; for(int i=1;i<80;i++) if(mb[s+i]!=mb[s+i-1]) tr++;
+      if(tr<8) continue; }
     if((ks_fv0_gf2crc(b9)&0x7F)!=((uint8_t)((k2&0xFF)^0x80)&0x7F)) continue;
     uint8_t buf8[8];
     for(int i=0;i<8;i++) buf8[i]=(uint8_t)(k1>>(56-i*8));
@@ -5752,7 +5864,7 @@ static bool ks_decodeKiaV7(const char* mb,int ml,
 // ─── KIA/HYU V3/V4 — 68-bit OOK PWM rolling code, KeeLoq (CRC4) ──────────────
 // The one Kia variant FOBworks can actually *decrypt*, because its manufacturer
 // key is public. The same value is the Kia_V3_V4_OEM entry in
-// MFR_KEYS above, and its sources are recorded in the worklog §2.
+// MFR_KEYS above, and its sources are recorded in `research/01` §2.
 //
 // IMPORTANT — this must NOT be routed through ks_parseKL. That parser assumes an
 // HCS 66-bit frame with the discriminator at sn[15:4] and the button in the low
@@ -5855,7 +5967,7 @@ static bool ks_kiaV34Validate(KiaV34Frame& f){
 // ks_klBuildPlain, and it is also NOT the on-air serial framing.
 //
 // The reference keeps these two layouts deliberately different, which is easy to
-// conflate (worklog §2.6 does, and the mistake overruns the button field):
+// conflate (doc 06 §2.6 does, and the mistake overruns the button field):
 //   on-air  bytes 4..7: (serial & 0x0FFFFFFF) | (btn << 28)   — full 28-bit serial
 //   encrypted word    : (cnt & 0xFFFF) | ((serial & 0x3FF) << 16) | (btn << 28)
 // Only the serial's low 10 bits enter the encrypted word. That is what makes the
@@ -6180,9 +6292,17 @@ static bool ks_decodeKiaV2(const char* mb,int ml,
     uint16_t rc=(uint16_t)((data>>4)&0xFFF);
     uint8_t  rxc=(uint8_t)(data&0x0F);
     if(sn==0||sn==0xFFFFFFFFUL||bn==0) continue;
+    // CRC4 over the twelve data nibbles, plus one. The +1 is part of the formula, and its
+    // absence was a real defect rather than a tolerant threshold: verified against the two
+    // genuine KIA/HYU V2 key files in the corpus (Hyundai_V2_N1, Hyundai_V2_Random_Habar),
+    // which pass ONLY with the +1, and against the seven Tesla 433.92 MHz captures this
+    // decoder used to fire on, which pass only WITHOUT it. The two sets are disjoint, so
+    // this single operator both validates real frames and removes the false positives.
+    // Ref: kia_v2.c in the RollJam protocol set of Flipper-ARF, which computes
+    // (crc + 1) & 0x0F. See CITATIONS_AND_REFERENCES.md item 14 and research/39.
     uint8_t calc=0;
     for(int n=1;n<=12;n++) calc^=(uint8_t)((data>>(n*4))&0x0F);
-    if(calc!=rxc) continue;
+    if(((calc+1)&0x0F)!=rxc) continue;
     serial=sn; ctr=((rc>>4)|(uint16_t)(rc<<8))&0xFFF; btn=bn; valid=true;
     return true;
   }
@@ -6193,7 +6313,9 @@ static bool ks_decodeKiaV2(const char* mb,int ml,
 // Camry/Corolla/RAV4/Tacoma/Tundra/Highlander/Yaris/Prius/Land Cruiser/Hilux/Lexus IS/ES/RX
 // Frequencies: 314.35/315 MHz (North America), 433.92 MHz (Europe/Japan)
 // TE ≈ 390-420 µs (NA) or 350-390 µs (EU/JP)
-// Preamble: ≥8 equal-width pulse pairs (each ≈ TE HI + TE LO)
+// Preamble: short on modern fobs, measured at 3-11 pairs across the corpus; the decoder
+//   requires 8. Only 2 of 64 Toyota/Lexus captures reach 8 pairs, and those are the only
+//   two it can currently resolve at all -- the rest fail at the data stage.
 // Sync (optional): ≈1 TE HI + 7-22 TE LO — absorbed if present, skipped if absent.
 //   At 433 MHz the sync gap (≈13*360=4680 µs) falls below the 5000 µs k-means clip
 //   threshold and corrupts the ratio estimate. This decoder re-measures TE directly
@@ -6234,9 +6356,19 @@ static bool ks_decodeToyota(const uint32_t* buf,int cnt,uint32_t& serial,uint8_t
     while(j+1<ccnt&&ks_inR(cbuf[j],te0,35)&&ks_inR(cbuf[j+1],te0,50)){
       teAcc+=cbuf[j]; pc++; j+=2;    // HI pulses only — LO is RSSI-lag inflated
     }
-    if(pc<3) continue;                             // require ≥3 preamble pairs; was 4 but RSSI trigger can fire
-                                                   // mid-preamble leaving fewer captured pairs — 3 pairs + sync
-                                                   // gate + 40 strict data-bit checks prevents false positives
+    // Require >=8 preamble pairs. The header always documented 8, but the code required 3
+    // with a note claiming 3 "prevents false positives"; measured, it does the opposite,
+    // admitting captures the foreign aliases satisfy. On the full corpus, 8 keeps the
+    // identical own-brand result (the same 2 Camry captures decode) while cutting the
+    // foreign hits from 8 to 5.
+    //
+    // The trade-off to state plainly: only 2 of 64 Toyota/Lexus captures have >=8
+    // detectable pairs, because a modern fob's preamble is short (Corolla 5, Tundra 11)
+    // and those captures fail later, at the data stage. So 8 does not exclude them for a
+    // reason of its own, but it would exclude them if that data stage were ever repaired.
+    // The two Camry files that do decode are the only ones this decoder can currently
+    // handle at all, so 8 is not losing working coverage today.
+    if(pc<8) continue;
     uint32_t te=(uint32_t)(teAcc/(uint64_t)pc);   // TE from HI-pulse average only
     // Sync gap: ≈1×TE HI followed by a long LO (carrier off) that separates the
     // preamble from the data frame.  Range is [3×TE … 28 000 µs].
@@ -6328,7 +6460,7 @@ static bool ks_decodeBMWCAS4(const char* mb,int ml,uint64_t& frame){
 String decodeSignal(){
   if(rfLen<18){ lastDecode="{\"error\":\"no-signal\",\"edges\":"+String(rfLen)+"}"; return lastDecode; }
 
-  // ── buf / kbuf are static (worklog §3.1) ─────────────────────────────────
+  // ── buf / kbuf are static (research/28 §3.1) ─────────────────────────────────
   //
   // These were two uint32_t[CAP_SZ] arrays on the stack: 2048 B each, 4 KB together, against
   // an 8 KB loopTask stack. With the JsonDocument, ~30 sequential decoder calls and ArduinoJson
@@ -6679,7 +6811,7 @@ String decodeSignal(){
       // preamble: a width-only capture cannot see the leading level that the
       // reference uses for is_v3_sync. Flag it as an inference, not a reading.
       doc["version_inferred"]=true;
-      // Reporting rule (worklog §3.2): the 12-bit check is strong (1/4096) but the
+      // Reporting rule (doc 06 §3.2): the 12-bit check is strong (1/4096) but the
       // candidate space is a single fixed key, so a lone frame is never called
       // crypto-confirmed. One frame is a candidate; agreement across two presses
       // is what promotes it — same contract as the HCS path, and the same gate,
@@ -6812,9 +6944,18 @@ String decodeSignal(){
     p["window"]=0;
     p["note"]="Toyota/Denso — only "+String(cnt)+" edges captured (need 60+); press fob closer or hold longer";
   }
-  // ratio≤2.5 guard (v3.54): mirrors fast-exit; prevents ks_decodeToyota from wasting cycles
-  // on large-ratio signals that the Ch-B catch-all (ratio≤3.0, v3.53) would reject anyway.
-  if(!decoded&&te_toy&&ratio<=2.5f){
+  // Ratio floor (3.5), replacing the ratio<=2.5 ceiling that used to sit here (and the
+  // ratio<=3.0 ceiling still used by the Ch-B soft-ID below).
+  //
+  // The ceilings were inverted. A Toyota capture that actually contains data measures a
+  // HIGH k-means ratio -- 6.6 to 13.2 across the corpus -- because the data region mixes
+  // 1T and 2T HI pulses with long inter-bit LO gaps, while the equal-width preamble
+  // collapses toward 1.0. Every non-Toyota file this decoder fires on measures ~2.0
+  // (2.01-4.62), and 53 of the 62 Toyota/Lexus captures measure above 3.0. So the old
+  // ceiling admitted the aliased population and excluded the brand it serves: the decoder
+  // was never called on ANY of its own 62 captures, while firing on 12 foreign files.
+  // A floor at 3.5 separates the two measured populations.
+  if(!decoded&&te_toy&&ratio>=3.5f){
     uint32_t tsn=0;uint8_t tbtn=0;uint16_t tctr=0;
     const char* tch=toyotaA?"A":toyotaB?"B":"";
     if(ks_decodeToyota(buf,cnt,tsn,tbtn,tctr)){
@@ -6964,6 +7105,11 @@ String decodeSignal(){
   // false positive in the catch-all has ratio > 3.0; every real preamble-only Toyota
   // capture has ratio < 3.0.  The ≤3.0 gate cleanly separates the two populations.
   // (v3.53)
+  // NOTE: this soft-ID deliberately keeps its ratio<=3.0 ceiling. Its job is to label an
+  // AMBIGUOUS Ch-B signal as "possible Toyota" when the real decoder cannot confirm a
+  // frame, and the low-ratio population is exactly that ambiguous case. The real decoder's
+  // guard is a floor (see the primary dispatch); leaving this one alone avoids relabelling
+  // high-ratio signals that are not being decoded as frames.
   if(!decoded&&toyotaB&&te_toy&&ratio<=3.0f){
     decoded=true;
     doc["proto"]="Toyota-Denso";
@@ -7483,11 +7629,11 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     }
   }
   // ── Uniform-pulse refusal ("no-bit-edges") ─────────────────────────────────
-  // The RX-side twin of the replayRaw false success (worklog §1, §2). On this board GDO0
+  // The RX-side twin of the replayRaw false success (research/19 §1, §2). On this board GDO0
   // is absent, so capture falls back to polling RSSI; the poll rate (~1600 µs, limited by
   // the SPI transaction time) is slower than a Kia V3/V4 short pulse, so the encoder sees a
   // uniform train and the decoders are fed non-data. A real capture came back as uniform
-  // ~1600 µs pulses and was still reported as "✓ 512 edges" with has_ctr:true (worklog).
+  // ~1600 µs pulses and was still reported as "✓ 512 edges" with has_ctr:true (research/13).
   //
   // A genuine OOK frame is short/long at roughly a 2:1 ratio. So: if essentially every
   // pulse sits within a few percent of the same width, there are no bit edges to decode and
@@ -7545,7 +7691,7 @@ void startJam(float mhz){
   scanActive=false;
   // Path choice. A toggling GPIO 48 is NOT evidence that the CC1101's GDO0 is readable:
   // on this board revision GPIO 48 is the SX1278's DIO0 and the CC1101's GDO0 is not routed
-  // at all (worklog, and the vendor firmware's own note that GDO0 is not wired to the
+  // at all (research/15, and the vendor firmware's own note that GDO0 is not wired to the
   // ESP32 on this PCB). A toggle can therefore come from the LoRa side, and choosing the
   // async path on that basis would transmit nothing -- the pin would be driven, but it is
   // not the CC1101's TX data input.
@@ -7661,7 +7807,7 @@ void stopJam(){
 //
 // The default preserves the old call sites that genuinely do start HIGH (the
 // protocol builders below generate buf[0] as a HIGH duration by construction).
-// ─── Packet-mode raw replay (worklog §5 step 4) ───────────────────────────
+// ─── Packet-mode raw replay (research/19 §5 step 4) ───────────────────────────
 //
 // replayRaw() takes an arbitrary list of pulse widths and, on a board with GDO0, bit-bangs
 // them. Where GDO0 is absent (this revision) packet mode is the only TX path, and the chip
@@ -7770,7 +7916,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
   if(reps>5) reps=5;
 
   // ── Symbol period from the protocol's te, not from min(data) ────────────────
-  // Deriving S from the shortest pulse is what worklog §2 caught: a real Kia V3 frame
+  // Deriving S from the shortest pulse is what research/20 §2 caught: a real Kia V3 frame
   // contains a single 132 us outlier, so min() gave S0=132 and the fit then had to coarsen
   // to 264 us — which quantises the protocol's two symbol widths to
   //    400 us -> 528 us (+32%)   and   800 us -> 792 us (-1%)
@@ -7801,7 +7947,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
   }
   if(S0<40) return false;                      // below this, real OOK shaping is not achievable
 
-  // ── Trim the true boundary artefacts (worklog §2.1, corrected) ───────────
+  // ── Trim the true boundary artefacts (research/21 §2.1, corrected) ───────────
   //
   // klTrimToFrame cuts a window around the separator: 20 pulses before it, then one
   // pitch. That window's ends are artefacts of where the cut landed, not protocol
@@ -7811,7 +7957,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
   //                       a 3.0x stretch on the FIRST pulse the receiver sees
   //   index 182 1188 us  the NEXT frame's separator
   //
-  // worklog §2.1 recommended trimming to the separator boundaries, i.e. dropping
+  // research/21 §2.1 recommended trimming to the separator boundaries, i.e. dropping
   // index 20 (1188 us) as well. MEASURED, that breaks the frame:
   //
   //   [0:183) 183 pulses -> decodes (ctr=38)
@@ -7820,7 +7966,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
   //   [20:182) 162 pulses -> NO DECODE          <- also drop the separator
   //   [21:182) 161 pulses -> NO DECODE
   //
-  // Index 20 is the frame's own SYNC, not an artefact: worklog records Kia V3/V4 as
+  // Index 20 is the frame's own SYNC, not an artefact: research/06 records Kia V3/V4 as
   // "preceded by 12 preamble pairs and a 1000-1500 us sync pulse", and the decoder scans
   // for that preamble to lock on. So the correct trim drops the partial leading pulse and
   // the trailing next-frame separator, and keeps the separator in the payload.
@@ -7887,7 +8033,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
     return false;
   }
 
-  // ── Ratio guard (worklog §2.2) ─────────────────────────────────────────
+  // ── Ratio guard (research/20 §2.2) ─────────────────────────────────────────
   // The recovered short and long widths must still look like the protocol's. Without this,
   // a grid that fits but distorts the ratio would transmit a frame no PWM receiver accepts,
   // and a bench failure would be unattributable. Refusing is the honest outcome.
@@ -7919,12 +8065,12 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
              ",\"te_short_us\":"+String(teShort)+",\"te_long_us\":"+String(teLong)+
              ",\"mult\":"+String(usedMult)+",\"bytes\":"+String(n)+
              ",\"worst_err_bound_us\":"+String((teShort>0)?(S/2):(S0/2))+","+
-             // worklog §2.1 asked for this to be visible: how many boundary pulses were
+             // research/21 §2.1 asked for this to be visible: how many boundary pulses were
              // dropped, and how many pulses the payload actually contains.
              "\"boundary_pulses\":"+String(boundaryPulses)+
              ",\"payload_pulses\":"+String(flen)+",\"input_pulses\":"+String(len)+","+
              "\"ratio_ok\":"+String((teLong>teShort)?"true":"false")+"}");
-  // worklog §3: apply `reps` here as the GDO0 path does. The original comment claimed
+  // research/20 §3: apply `reps` here as the GDO0 path does. The original comment claimed
   // repetition was "handled inside the packet", which is false — one packet is one frame —
   // so callers asking for 3 got 1 on this path. Rolling-code receivers commonly expect the
   // repetition a real fob sends, so send the packet `reps` times.
@@ -7952,10 +8098,10 @@ bool replayRaw(float mhz,uint16_t* data,int len,int reps=3,bool startHigh=true){
     serialEmit("{\"event\":\"tx_blocked\",\"reason\":\"low_battery\",\"v\":" + String(battV,2) + "}");
     return false;
   }
-  // ── TX path selection (worklog §1, §5 step 4) ───────────────────────────
+  // ── TX path selection (research/19 §1, §5 step 4) ───────────────────────────
   // The bit-bang below requires PIN_GDO0 to actually be the CC1101's async TX data input.
   // On this revision GPIO 48 is the SX1278's DIO0 and the CC1101's GDO0 is not routed
-  // (worklog), so bit-banging toggles the LoRa module's pin and this function used to
+  // (research/14), so bit-banging toggles the LoRa module's pin and this function used to
   // `return true` regardless — reporting a successful transmission of nothing. Every caller
   // then said ok:true, and C2 would report a completed RollBack having sent nothing.
   //
@@ -8754,7 +8900,7 @@ static void protectedRoute(const char* uri,HTTPMethod method,WebServer::THandler
 // Registering a raw-body callback makes core 3.x deliver bounded HTTP_RAW_BUFLEN
 // chunks instead. 8 KiB is more than enough for the 512 pulses replayRaw()
 // accepts, including a short text header and maximum-width signed pulse values.
-// Raised from 8192 in worklog §4 step 1's round: measured, the corpus's first
+// Raised from 8192 in research/23 §4 step 1's round: measured, the corpus's first
 // trimmable frame sits at pulse 2517, and at 4.38 bytes/pulse that needs ~11 KB of body.
 // 8192 bytes reached only 1868 pulses — the pulse cap could have been raised to 1868 (as
 // instructed) and the import would STILL have refused the corpus head, because the body
@@ -8833,7 +8979,7 @@ static bool parseSubReplayBody(const String& body,float& mhz,uint16_t* pulses,in
   int ri=body.indexOf("RAW_Data:");
   if(ri<0) return false;
   size_t pos=(size_t)ri+9;
-  // worklog §2.1: search the WHOLE body for a frame, not just the first line.
+  // research/23 §2.1: search the WHOLE body for a frame, not just the first line.
   //
   // Two limits had to move together. The pulse cap was 512, and the scan also stopped at
   // the first CR/LF — so only the first RAW_Data line was ever read. A corpus .sub has 512
@@ -9124,7 +9270,7 @@ void setupRoutes(){
     bool ok=rbArm();
     // A refusal must be diagnosable rather than silent: "nothing happened" is the
     // worst feedback for a feature whose failure mode is otherwise invisible
-    // (worklog 2.4). The reason names which check failed.
+    // (research/10 2.4). The reason names which check failed.
     String reason="";
     if(!ok){
       if(fbkCount<2)                              reason="need-2-codes";
@@ -9246,7 +9392,7 @@ void setupRoutes(){
          ",\"ts\":"+String(fbkBuf[i].ts)+",\"len\":"+String(fbkBuf[i].len)+
          // Surface the trim state here, not only at arm time: whether a capture is
          // one frame or several decides whether C1/C2 are correct at all, and it is
-         // the same reason the arm gate reports "untrimmed-block" (worklog §3 P1).
+         // the same reason the arm gate reports "untrimmed-block" (research/12 §3 P1).
          ",\"trimmed\":"+(fbkBuf[i].trimmed?"true":"false")+"}";
     }
     j+="]}";
@@ -9610,7 +9756,7 @@ void setupRoutes(){
       srv.send(400,"application/json","{\"ok\":false,\"error\":\"incomplete body\"}");
       return;
     }
-    uint16_t* sb=impStage;   // shared body stage (worklog §2): single loop task, no re-entry
+    uint16_t* sb=impStage;   // shared body stage (`research/24` §2): single loop task, no re-entry
     float mhz;
     int sc;
     bool hasRawData=parseSubReplayBody(subReplayBody,mhz,sb,sc);
@@ -9624,7 +9770,7 @@ void setupRoutes(){
 
   // POST /api/fbk_import  (body = FOBworks RAW or a .sub capture file)
   // Loads a stored frame into fbkBuf so C2 can be armed without a live capture. Same body
-  // format as /api/sub_replay, same trim and decoder as a capture (worklog §3).
+  // format as /api/sub_replay, same trim and decoder as a capture (research/22 §3).
   protectedRoute("/api/fbk_import",HTTP_POST,[](){
     if(isMultipartRequest()){
       resetSubReplayBody();
@@ -9662,7 +9808,7 @@ void setupRoutes(){
             ",\"has_ctr\":"+String(e.hasCtr?"true":"false")+
             ",\"ctr\":"+String(e.ctr);
     }
-    // worklog §2.2: name WHERE the frame was found. Without this a refusal gives no
+    // research/23 §2.2: name WHERE the frame was found. Without this a refusal gives no
     // hint whether the body was wrong or the search too narrow.
     body+=",\"anchor_index\":"+String(impLastAnchor)+
           ",\"payload_pulses\":"+String(fbkCount>0?fbkBuf[fbkCount-1].len:0);
@@ -10215,7 +10361,7 @@ static void processCommandLine(const String& ln){
     bool ok=rbArm();
     // Mirror the HTTP route's `reason` here too. The bench drives the card over
     // serial, and the reason is the whole point of the gate: without it a refusal
-    // is indistinguishable from a no-op, which is the failure mode worklog §3
+    // is indistinguishable from a no-op, which is the failure mode research/12 §3
     // P1 exists to remove.
     String reason="";
     if(!ok){
@@ -10987,7 +11133,7 @@ static void processCommandLine(const String& ln){
   }
   // {"cmd":"gdo0_isolate"} — which chip actually sinks GPIO48?
   //
-  // §5.5 of worklog leaves two candidates, and they need opposite fixes:
+  // §5.5 of research/14 leaves two candidates, and they need opposite fixes:
   //   · SX1278 DIO0        -> hardware change (sleep and reset both fail to release it)
   //   · CC1101's own GDO0  -> NOT a fault: IOCFG0=0x0D is SUPPOSED to drive the pin.
   //                           The real bug would be the toggle test running with no
@@ -11128,7 +11274,7 @@ static void processCommandLine(const String& ln){
         : "the SX1278 still answers SPI with RST held LOW, so the reset is not reaching the chip: on this board the reset cannot be relied on to release DIO0")+"\"}");
   }
   // {"cmd":"tx_fifo_test"} — prove a transmission actually leaves the board, with
-  // no GDO0 and no soldering. worklog §4 step 1.
+  // no GDO0 and no soldering. research/16 §4 step 1.
   //
   // Reads MARCSTATE and TXBYTES from the chip's own status registers, so the verdict
   // is the radio reporting on itself rather than the firmware assuming it worked.
@@ -11618,7 +11764,7 @@ void setup(){
   // A reset (watchdog, brownout, panic, reflash) does not run any cleanup path, so
   // a jam that was active when the CPU died can outlive it. That failure is both
   // silent and illegal, so it is defended deterministically here rather than by
-  // assert on the error paths alone (worklog §2.2).
+  // assert on the error paths alone (research/09 §2.2).
   //
   // The mechanism: startJam() leaves the CC1101 in TX (STX) and drives GDO0 HIGH.
   // In async TX GDO0 is the TX DATA input, so a held-high input means a continuous
@@ -11828,7 +11974,7 @@ void setup(){
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop(){
   // Sample the stack high-water mark first, so the running minimum is captured regardless of
-  // which path ran deepest and regardless of when /api/status is later queried (worklog §3).
+  // which path ran deepest and regardless of when /api/status is later queried (research/29 §3).
   stackSample();
   dnsServer.processNextRequest();
   srv.handleClient();

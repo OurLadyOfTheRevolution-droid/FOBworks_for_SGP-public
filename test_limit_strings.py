@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Assert every reported limit string in the source matches its constant.
 
-worklog §3.1: the suite missed two defects because neither was logic — both were a value
+research/24 §3.1: the suite missed two defects because neither was logic — both were a value
 that had stopped describing reality. Two routes reported `max_bytes:8192` while enforcing
 `SUB_REPLAY_MAX_BODY_BYTES=16384`, so a caller told "8192" who sent 9000 bytes was refused by
 a message that understated the limit. That is the same class of error as the FIFO count that
@@ -71,7 +71,7 @@ def main():
           + ("" if not stale else f" — lines {stale}"))
 
     print("\n=== the buffer consolidation holds ===")
-    # worklog §2: four copies of a 3740-entry array cost 29.9 KB and took RAM to 47%.
+    # research/24 §2: four copies of a 3740-entry array cost 29.9 KB and took RAM to 47%.
     # One body stage + one frame stage is the intent; assert nothing re-grew a copy.
     big = re.findall(r"(?:static\s+)?uint16_t\s+\w+\s*\[\s*SUB_REPLAY_MAX_PULSES\s*\]", src)
     check(len(big) == 1,
@@ -84,7 +84,7 @@ def main():
               f"{name} aliases the shared body stage rather than allocating a copy")
 
     print("\n=== the import staging comment matches the code beside it ===")
-    # worklog §2: a file-scope comment described the abandoned in-place design -- "the
+    # research/25 §2: a file-scope comment described the abandoned in-place design -- "the
     # SAME array ... writes frameStage over it in place" -- directly above two declarations of
     # SEPARATE arrays, and pointed at a call-site note saying the opposite. No test can judge
     # prose, but a comment that *contradicts the declaration beside it* is detectable, and
@@ -107,7 +107,7 @@ def main():
           "impStage and impFrame are declared as two distinct arrays")
 
     print("\n=== the dead flen guard is documented as dead ===")
-    # worklog §2.1: klTrimToFrame clamps to outCap, and the call passes CAP_SZ, so this
+    # research/25 §2.1: klTrimToFrame clamps to outCap, and the call passes CAP_SZ, so this
     # check cannot fire. It was noted rather than deleted; assert the note exists so a reader
     # is not misled into thinking it protects something.
     m = re.search(r"(// Note: this cannot fire\..*?)\n\s*if\(flen>\(int\)CAP_SZ\)", src, re.S)

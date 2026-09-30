@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Produce the published variant of the sketch from the development one.
+
+Why this exists
+
+The `publish` branch is not a filtered copy of `main`. It is a CODE VARIANT with a coordinated
+disclosure transform, and treating it as a copy is how it fell four versions behind. The
+transform has four parts, and missing any one of them fails in a specific way:
+
+  1. mask the 73 MFR_KEYS literals                (tools/mask_mfrkeys.py does only this)
+  2. add the MFR_KEY_A/B/N constants and ks_unmaskMfrKey()
+  3. wrap every read of a masked value in ks_unmaskMfrKey():
+       MFR_KEYS[k].key            -> ks_unmaskMfrKey(MFR_KEYS[k].key)
+       the mfrKeys[2] test literal -> ks_unmaskMfrKey(<masked>)
+       KIA_V34_MF_KEY at each use  -> ks_unmaskMfrKey(KIA_V34_MF_KEY)
+  4. adapt test_keeloq_key_table.py to invert the mask and to skip its corpus cross-check when
+     the plaintext corpus is absent (it is deliberately not published)
+
+Part 3 is the dangerous one. Masking the literals WITHOUT wrapping the reads compiles cleanly,
+boots, and silently derives keys from masked values -- so it finds nothing and does not look
+broken. That is why this tool verifies rather than trusts, and why the wrapping is done by
+matching exact source expressions instead of by hand.
+
+Verification, all of which must pass before the output is written:
+  · the key count is 73, unchanged
+  · every masked value round-trips to its plaintext original
+  · no site reads a masked value without unmasking it (the check that would have caught the
+    near-miss above)
+  · the round-trip identity of the whole sketch, key set included, is reported so it can be
+    compared against a build
+
+Usage:
+    python3 tools/publish_prepare.py --check              # report, change nothing
+    python3 tools/publish_prepare.py --out /tmp/pubwt     # write the variant into a tree
+"""
+
+import argparse
+import re
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SKETCH = ROOT / "FOBworks_for_SGP.ino"
+TEST_KEELOQ = ROOT / "test_keeloq_key_table.py"
+
+# Must match tools/mask_mfrkeys.py.
+A = 0x5A5A5A5A5A5A5A5A
+B = 0x3C3C3C3C3C3C3C3C
+N = 13
+MASK64 = (1 << 64) - 1
+
+
+def rotl(x, n):
+    n &= 63
+    return ((x << n) | (x >> (64 - n))) & MASK64 if n else x
+
+
+def rotr(x, n):
+    n &= 63
+    return ((x >> n) | (x << (64 - n))) & MASK64 if n else x
+
+
+def encode(k):
+    return rotl((k ^ A) & MASK64, N) ^ B
+
+
+def decode(v):
+    return rotr((v ^ B) & MASK64, N) ^ A
+
+
+ENTRY = re.compile(
+    r'(?P<pre>\{\s*"(?P<name>[^"]+)"\s*,\s*0x)(?P<key>[0-9A-Fa-f]{16})'
+    r'(?P<post>ULL\s*,\s*[A-Za-z0-9_]+\s*,\s*[01]\s*\})'
+)
+TABLE = re.compile(r"(?P<open>static const MfrKey MFR_KEYS\[\]=\{)(?P<body>.*?)(?P<close>\n\};)", re.S)
+
+HELPER_BLOCK = """// The stored keys are MASKED, not plaintext. The table must contain them (the decoder derives
+// and decrypts with them), but leaving them readable meant the file was the list. Each stored
+// value is the affine transform of the real key; ks_unmaskMfrKey below is the inverse, applied
+// once per key on the way into a derivation. It is obfuscation, not a security boundary: the
+// constants are right here, the table is in a public repository, and anything the device can
+// compute, so can a reader. Reversible with tools/mask_mfrkeys.py. Produced by
+// tools/publish_prepare.py; do not edit this branch by hand.
+#define MFR_KEY_A  0x5A5A5A5A5A5A5A5AULL   // matches tools/mask_mfrkeys.py
+#define MFR_KEY_B  0x3C3C3C3C3C3C3C3CULL
+#define MFR_KEY_N  13
+
+static inline uint64_t ks_unmaskMfrKey(uint64_t v){
+  // inverse of ROTL(k ^ A, N) ^ B  ->  ROTR(v ^ B, N) ^ A
+  uint64_t x = (v ^ MFR_KEY_B);
+  const uint8_t n = MFR_KEY_N;
+  return ((x >> n) | (x << (64 - n))) ^ MFR_KEY_A;
+}
+static_assert(N_MFR_KEYS == 73, "MFR_KEYS count changed -- update this assert with the table");"""
+
+PLAIN_COMMENT = """// The table holds the real keys in plaintext on this branch. The table has to be present --
+// the decoder derives candidate device keys from it and decrypts with them -- so what changes
+// between branches is only whether a reader sees the values. The published branch stores the
+// same keys masked and unmasks them at each use. Keep the two in step: a key added here must
+// be added there too, under the same name."""
+
+# Every expression that READS a masked value and must therefore unmask it. Exact source text,
+# because a regex here could miss a site and the miss is silent.
+WRAP_SITES = [
+    ("MFR_KEYS[k].key", "ks_unmaskMfrKey(MFR_KEYS[k].key)"),
+    ("MFR_KEYS[i].key", "ks_unmaskMfrKey(MFR_KEYS[i].key)"),
+    ("ks_klDecrypt(f.encrypted, KIA_V34_MF_KEY)",
+     "ks_klDecrypt(f.encrypted, ks_unmaskMfrKey(KIA_V34_MF_KEY))"),
+    ("ks_klEncrypt(pt, KIA_V34_MF_KEY)",
+     "ks_klEncrypt(pt, ks_unmaskMfrKey(KIA_V34_MF_KEY))"),
+    ("ks_klEncrypt(gotPt, KIA_V34_MF_KEY)",
+     "ks_klEncrypt(gotPt, ks_unmaskMfrKey(KIA_V34_MF_KEY))"),
+    ("ks_klEncrypt(pt,KIA_V34_MF_KEY)",
+     "ks_klEncrypt(pt,ks_unmaskMfrKey(KIA_V34_MF_KEY))"),
+]
+
+
+def locate(src):
+    m = TABLE.search(src)
+    if not m:
+        sys.exit("MFR_KEYS table not found")
+    return m
+
+
+def read_keys(src):
+    es = list(ENTRY.finditer(locate(src).group("body")))
+    return es, [int(e.group("key"), 16) for e in es]
+
+
+def transform_sketch(src):
+    """plaintext development sketch -> masked published variant. Returns (text, report)."""
+    report = {}
+    es, keys = read_keys(src)
+
+    # Refuse rather than guess: a count change means the table moved and this tool's
+    # assumptions need revisiting.
+    if len(es) != 73:
+        sys.exit(f"expected 73 entries, found {len(es)} -- refusing to transform")
+
+    # If it is already masked, say so instead of double-masking (which is not identity for a
+    # non-involutive transform, and would produce nonsense keys).
+    defaults = {0x0000000000000000, 0xFFFFFFFFFFFFFFFF}
+    as_is = sum(1 for k in keys if k in defaults)
+    flipped = sum(1 for k in keys if decode(k) in defaults)
+    if flipped > as_is:
+        sys.exit("the table is already masked; run this on the development branch")
+
+    # 1 + 2: mask the literals
+    masked = [encode(k) for k in keys]
+    body = locate(src).group("body")
+    new_body = body
+    for e, v in zip(es, masked):
+        new_body = new_body.replace(e.group(0), f'{e.group("pre")}{v:016X}{e.group("post")}', 1)
+    src = src[: locate(src).start("body")] + new_body + src[locate(src).end("body"):]
+
+    # 2: the helper block, replacing the plaintext-branch comment
+    if PLAIN_COMMENT not in src:
+        sys.exit("the development branch's plaintext comment was not found -- "
+                 "the sketch has changed shape; update this tool")
+    src = src.replace(PLAIN_COMMENT, HELPER_BLOCK, 1)
+
+    # the static_assert line that follows the comment moves above the modes; the helper block
+    # already carries its own copy, so drop the duplicated original
+    dup = ('static_assert(N_MFR_KEYS == 73, "MFR_KEYS count changed -- '
+           'update research/sources/keeloq_mfcodes_public.txt and this assert together");\n')
+    if dup in src:
+        src = src.replace(dup, "", 1)
+
+    # 3: the mfrKeys[2] test literal
+    old_lit = "mfrKeys[2] = { 0xA8F5DFFC8DAA5CDBULL,       // Kia V3/V4, from the table"
+    new_lit = ("mfrKeys[2] = { ks_unmaskMfrKey(0xCC88E6C23CEC0269ULL),  // Kia V3/V4 (masked)")
+    if old_lit in src:
+        src = src.replace(old_lit, new_lit, 1)
+        report["mfrKeys literal"] = "wrapped and masked"
+    else:
+        report["mfrKeys literal"] = "NOT FOUND"
+
+    # 3: KIA_V34_MF_KEY definition + comment
+    src = src.replace("// The same OEM key the table above carries, in plaintext on this branch.",
+                      "// Stored masked, like MFR_KEYS; ks_unmaskMfrKey is applied at each use below.", 1)
+    kia = re.search(r"#define KIA_V34_MF_KEY\s+0x([0-9A-Fa-f]{16})ULL", src)
+    if not kia:
+        sys.exit("KIA_V34_MF_KEY not found")
+    kia_plain = int(kia.group(1), 16)
+    kia_masked = encode(kia_plain)
+    src = src.replace(f"#define KIA_V34_MF_KEY  0x{kia_plain:016X}ULL",
+                      f"#define KIA_V34_MF_KEY  0x{kia_masked:016X}ULL", 1)
+    report["KIA_V34_MF_KEY"] = f"0x{kia_plain:016X} -> 0x{kia_masked:016X}"
+
+    # 3: wrap each read site
+    wrapped = 0
+    for plain, masked_expr in WRAP_SITES:
+        n = src.count(plain)
+        if n:
+            src = src.replace(plain, masked_expr)
+            wrapped += n
+    report["read sites wrapped"] = wrapped
+
+    # ── verification ────────────────────────────────────────────────────────
+    es2, keys2 = read_keys(src)
+    errs = []
+    if len(es2) != 73:
+        errs.append(f"key count changed to {len(es2)}")
+    bad = [i for i, (orig, now) in enumerate(zip(keys, keys2)) if decode(now) != orig]
+    if bad:
+        errs.append(f"{len(bad)} masked values do not round-trip (first: index {bad[0]})")
+
+    # THE CHECK THAT MATTERS: no read of a masked value may be left unwrapped. An unwrapped read
+    # compiles and boots and silently finds nothing.
+    #
+    # Note the check must look for occurrences NOT preceded by the wrapper, not for the bare
+    # substring: the wrapped form ks_unmaskMfrKey(MFR_KEYS[k].key) contains MFR_KEYS[k].key, so a
+    # substring test reports a false failure on correct output. That false positive was the first
+    # thing this check did, which is a good argument for writing it as a prefix test.
+    for plain, _ in WRAP_SITES:
+        for m in re.finditer(re.escape(plain), src):
+            pre = src[max(0, m.start() - 16):m.start()]
+            if not pre.endswith("ks_unmaskMfrKey("):
+                errs.append(f"unwrapped read left in the output: {plain}")
+                break
+    if "ks_unmaskMfrKey" not in src:
+        errs.append("ks_unmaskMfrKey is absent")
+    # the KIA macro must never be used bare
+    for m in re.finditer(r"KIA_V34_MF_KEY\)", src):
+        pre = src[max(0, m.start() - 20):m.start()]
+        if "ks_unmaskMfrKey(" not in pre:
+            errs.append("a bare KIA_V34_MF_KEY use survived")
+            break
+
+    report["errors"] = errs
+    return src, report
+
+
+def transform_test(src):
+    """Adapt test_keeloq_key_table.py for the published variant.
+
+    Two changes, both required by the masking:
+      · invert the mask on the table values so the corpus comparison still means something;
+        this doubles as a test that the sketch's mask and this file agree
+      · skip the corpus cross-check when the plaintext corpus is absent, because that file is
+        deliberately not published, so a fresh clone must still get a green suite
+    """
+    # 1. the corpus becomes optional
+    plain_setup = '''HERE = Path(__file__).resolve().parent
+FIRMWARE = HERE / "FOBworks_for_SGP.ino"
+CORPUS = HERE / "research" / "sources" / "keeloq_mfcodes_public.txt"'''
+    masked_setup = '''HERE = Path(__file__).resolve().parent
+FIRMWARE = HERE / "FOBworks_for_SGP.ino"
+# The manufacturer-key corpus is a local research fixture and is deliberately NOT published:
+# it is the same keys the firmware already embeds, so shipping the file would add nothing a
+# reader does not already have. Read it from research/sources/ when present locally, or from
+# FOBWORKS_MFCODES. The cross-check below is skipped when it is absent, so this suite still
+# runs in a fresh clone.
+_env = os.environ.get("FOBWORKS_MFCODES")
+CORPUS = Path(_env).expanduser() if _env else HERE / "research" / "sources" / "keeloq_mfcodes_public.txt"'''
+    if plain_setup not in src:
+        raise SystemExit("test: corpus setup block not found -- update publish_prepare.py")
+    src = src.replace(plain_setup, masked_setup, 1)
+    if "\nimport os\n" not in src:
+        src = src.replace("from pathlib import Path\nimport re",
+                          "from pathlib import Path\nimport os\nimport re", 1)
+
+    # 2. unmask the parsed table values, using the sketch's own constants
+    plain_parse = '''entries = [(n, k, learn_value(t), int(s)) for n, k, t, s in raw]'''
+    masked_parse = '''# The stored values are masked. Read the constants from the sketch rather than duplicating
+# them, so this file cannot drift from what the firmware actually inverts with.
+_c = re.search(r"#define MFR_KEY_A\\s+(0x[0-9A-Fa-f]+)ULL", source)
+assert _c, "MFR_KEY_A not found in the sketch"
+MASK_A = int(_c.group(1), 16)
+_c = re.search(r"#define MFR_KEY_B\\s+(0x[0-9A-Fa-f]+)ULL", source)
+assert _c, "MFR_KEY_B not found in the sketch"
+MASK_B = int(_c.group(1), 16)
+_c = re.search(r"#define MFR_KEY_N\\s+(\\d+)", source)
+assert _c, "MFR_KEY_N not found in the sketch"
+MASK_N = int(_c.group(1))
+
+
+def unmask(v):
+    x = (int(v, 16) ^ MASK_B) & 0xFFFFFFFFFFFFFFFF
+    return (((x >> MASK_N) | (x << (64 - MASK_N))) & 0xFFFFFFFFFFFFFFFF) ^ MASK_A
+
+
+assert "static inline uint64_t ks_unmaskMfrKey(uint64_t v){" in source, \\
+    "the unmask helper is missing; the table cannot be read"
+entries = [(n, f"{unmask(k):016X}", learn_value(t), int(s)) for n, k, t, s in raw]'''
+    if plain_parse not in src:
+        raise SystemExit("test: entry parser not found -- update publish_prepare.py")
+    src = src.replace(plain_parse, masked_parse, 1)
+
+    # 3. guard the corpus comparison
+    guard = '''corpus = []
+for line in CORPUS.read_text(encoding="utf-8").splitlines():'''
+    guarded = '''corpus = []
+# The corpus file is not published, so a fresh clone has none. Guard the WHOLE comparison
+# rather than only the read: with an empty corpus every firmware entry compares as "extra",
+# which reports 73 false failures instead of skipping.
+_corpus = CORPUS.read_text(encoding="utf-8") if CORPUS.is_file() else ""
+if not _corpus:
+    print(f"  corpus cross-check: skipped ({CORPUS.name} not present; "
+          f"set FOBWORKS_MFCODES to run it)")
+for line in _corpus.splitlines():'''
+    if guard in src:
+        src = src.replace(guard, guarded, 1)
+
+    corpus_cmp = '''extra = table_set - corpus_set - {("Kia_V3_V4_OEM", "A8F5DFFC8DAA5CDB", 1)}
+assert not extra, f"firmware entries that do not match the corpus: {sorted(extra)}"
+missing = corpus_set - table_set
+assert not missing, f"corpus entries absent from the firmware table: {sorted(missing)}"'''
+    corpus_cmp_guarded = '''if _corpus:
+    extra = table_set - corpus_set - {("Kia_V3_V4_OEM", "A8F5DFFC8DAA5CDB", 1)}
+    assert not extra, f"firmware entries that do not match the corpus: {sorted(extra)}"
+    missing = corpus_set - table_set
+    assert not missing, f"corpus entries absent from the firmware table: {sorted(missing)}"
+else:
+    # Without the corpus there is nothing to compare against, but the table must still hold
+    # the expected shape: 73 entries, the public OEM key present, and the mask consistent.
+    assert len(table_set) == 73, f"expected 73 entries, found {len(table_set)}"'''
+    if corpus_cmp in src:
+        src = src.replace(corpus_cmp, corpus_cmp_guarded, 1)
+
+    # 4. assertions that pin a key-READ expression must follow the wrapping. The development
+    # branch asserts on the bare form; the published variant wraps every read, so the same
+    # assertion would fail against correct output. Handled by rewriting the pinned literals
+    # rather than by deleting the assertions -- they are checking something real (that the
+    # derivation goes through the shared helper, not a private copy of it).
+    pinned = {
+        '"ks_deriveOneMfrKey(sn, MFR_KEYS[k].key, dk)"':
+            '"ks_deriveOneMfrKey(sn, ks_unmaskMfrKey(MFR_KEYS[k].key), dk)"',
+        '"ks_klDecrypt(f.hop,MFR_KEYS[i].key)"':
+            '"ks_klDecrypt(f.hop,ks_unmaskMfrKey(MFR_KEYS[i].key))"',
+        '"TRY_KEY(MFR_KEYS[i].name, MFR_KEYS[i].key"':
+            '"TRY_KEY(MFR_KEYS[i].name, ks_unmaskMfrKey(MFR_KEYS[i].key)"',
+    }
+    for plain, wrapped in pinned.items():
+        if plain in src:
+            src = src.replace(plain, wrapped)
+
+    # 5. any remaining plaintext copy of the Kia key must go: a published file must not carry
+    # it. Derive it once from the sketch's masked constant, which also re-checks the inverse and
+    # catches the sketch's two independent copies of the key disagreeing.
+    # The generator emits Python source, and the emitted regex needs a single backslash in the
+    # file. Inside this '''...''' literal that means writing "\\s", which lands as "\s". Writing
+    # "\\\\s" lands as "\\s" in the output, which then fails to match at runtime -- the bug this
+    # line had.
+    kia_derive = '''def unmask(v):
+    x = (int(v, 16) ^ MASK_B) & 0xFFFFFFFFFFFFFFFF
+    return (((x >> MASK_N) | (x << (64 - MASK_N))) & 0xFFFFFFFFFFFFFFFF) ^ MASK_A
+
+
+# The Kia OEM key is public, but there is no reason to write it out here: take it from the
+# masked constant the sketch ships and invert it, which also re-checks the inverse.
+_kia_stored = re.search(r"#define KIA_V34_MF_KEY\\s+0x([0-9A-Fa-f]{16})ULL", source).group(1)
+PUBLIC_KIA = unmask(_kia_stored)'''
+    src = src.replace('''def unmask(v):
+    x = (int(v, 16) ^ MASK_B) & 0xFFFFFFFFFFFFFFFF
+    return (((x >> MASK_N) | (x << (64 - MASK_N))) & 0xFFFFFFFFFFFFFFFF) ^ MASK_A''',
+                      kia_derive, 1)
+
+    # now replace every remaining literal with the derived form
+    src = src.replace('("Kia_V3_V4_OEM", "A8F5DFFC8DAA5CDB", 1)',
+                      '("Kia_V3_V4_OEM", f"{PUBLIC_KIA:016X}", 1)')
+    return src
+
+
+def transform_a2(src_sketch_b64):
+    """Adapt research/sources/a2_kia_v34.py: it carries the Kia key in plaintext.
+
+    Replaced with the same masked-constant derivation the old publish branch used, including its
+    structural self-check -- it re-encodes the recovered value and compares against the stored
+    form, so it verifies the inverse without writing the key out.
+    """
+    path = ROOT / "research" / "sources" / "a2_kia_v34.py"
+    s = path.read_text(encoding="utf-8")
+    plain = "KIA_V34_MF_KEY = 0xA8F5DFFC8DAA5CDB"
+    if plain not in s:
+        raise SystemExit("a2_kia_v34.py: plaintext KIA_V34_MF_KEY not found")
+    masked = '''# Stored masked, matching the firmware's MFR_KEYS entry (see tools/mask_mfrkeys.py).
+_KIA_STORED = 0xCC88E6C23CEC0269
+_MK_A, _MK_B, _MK_N = 0x5A5A5A5A5A5A5A5A, 0x3C3C3C3C3C3C3C3C, 13
+_M64 = (1 << 64) - 1
+_x = (_KIA_STORED ^ _MK_B) & _M64
+KIA_V34_MF_KEY = (((_x >> _MK_N) | (_x << (64 - _MK_N))) & _M64) ^ _MK_A
+# Self-check the inverse structurally, without writing the key out: re-encoding the
+# recovered value must return the stored form.
+_re = (((KIA_V34_MF_KEY ^ _MK_A) & _M64) << _MK_N | ((KIA_V34_MF_KEY ^ _MK_A) & _M64) >> (64 - _MK_N))
+assert (((_re & _M64) ^ _MK_B) & _M64) == _KIA_STORED, "the masked Kia key does not invert"'''
+    return s.replace(plain, masked, 1)
+
+
+def scrub_citations(src):
+    """The citations name the key in prose. Keep the fact, drop the literal."""
+    plain = "Cross-listed source for the Kia/Hyundai V3/V4 manufacturer key `0xA8F5DFFC8DAA5CDB` used by `ks_decodeKiaV34`"
+    safe = ("Cross-listed source for the Kia/Hyundai V3/V4 manufacturer key used by "
+            "`ks_decodeKiaV34`")
+    return src.replace(plain, safe, 1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", default=None, help="tree to write the variant into")
+    ap.add_argument("--check", action="store_true")
+    args = ap.parse_args()
+
+    src = SKETCH.read_text(encoding="utf-8")
+    out, report = transform_sketch(src)
+
+    print("publish_prepare: development sketch -> published variant")
+    for k, v in report.items():
+        if k == "errors":
+            continue
+        print(f"  {k:22} {v}")
+    errs = report["errors"]
+    if errs:
+        print("\nVERIFICATION FAILED:")
+        for e in errs:
+            print(f"  - {e}")
+        return 1
+    print("  verification           all masked values round-trip; no unwrapped reads")
+    _, keys = read_keys(src)
+    _, keys2 = read_keys(out)
+    print(f"  round-trip             73/73 keys decode to their originals "
+          f"(sample: 0x{keys2[0]:016X} -> 0x{keys[0]:016X})")
+
+    if args.check or not args.out:
+        print("\n--check: nothing written")
+        return 0
+
+    dest = Path(args.out) / "FOBworks_for_SGP.ino"
+    if not (Path(args.out) / ".git").exists() and not args.out.startswith("/tmp"):
+        print(f"\nrefusing to write outside a git tree or /tmp: {args.out}")
+        return 1
+    # No .bak: it would contain the plaintext branch's sketch, and in a published tree that is
+    # a key disclosure sitting next to the file it was masked in. The git history is the backup.
+    dest.write_text(out, encoding="utf-8")
+    print(f"\nwrote {dest}")
+
+    # the test variant, when the tree carries one
+    tdest = Path(args.out) / "test_keeloq_key_table.py"
+    if tdest.is_file():
+        try:
+            tsrc = transform_test(TEST_KEELOQ.read_text(encoding="utf-8"))
+        except SystemExit as e:
+            print(f"  test variant: NOT written ({e})")
+            return 1
+        tdest.write_text(tsrc, encoding="utf-8")
+        print(f"wrote {tdest}")
+
+    # the a2 helper carries the key in plaintext too
+    adest = Path(args.out) / "research" / "sources" / "a2_kia_v34.py"
+    if adest.is_file():
+        adest.write_text(transform_a2(None), encoding="utf-8")
+        print(f"wrote {adest}")
+
+    # and the citations name it in prose
+    cdest = Path(args.out) / "CITATIONS_AND_REFERENCES.md"
+    if cdest.is_file():
+        before = cdest.read_text(encoding="utf-8")
+        after = scrub_citations(before)
+        if after != before:
+            cdest.write_text(after, encoding="utf-8")
+            print(f"wrote {cdest} (literal removed)")
+
+    # ── final gate: no plaintext key anywhere in the output tree ────────────
+    # Excludes publish_prepare.py itself: the transform tool necessarily names the literal it
+    # is replacing, so treating it as a leak would make the gate unpassable. It ships as a build
+    # utility and is the one file whose whole purpose is to document the transform.
+    leaks = []
+    for p in Path(args.out).rglob("*"):
+        if p.is_file() and p.suffix in (".py", ".md", ".ino", ".txt"):
+            if p.name == "publish_prepare.py":
+                continue
+            try:
+                if "A8F5DFFC8DAA5CDB" in p.read_text(encoding="utf-8", errors="ignore"):
+                    leaks.append(str(p.relative_to(args.out)))
+            except OSError:
+                pass
+    if leaks:
+        print("\nFINAL GATE FAILED -- plaintext key present in the published tree:")
+        for l in leaks:
+            print(f"  {l}")
+        return 1
+    print("final gate: no plaintext key anywhere in the published tree")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

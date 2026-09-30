@@ -16,24 +16,30 @@
 //   loop() -> handleSerial() -> fbkImportFrame() -> decodeSignal()
 //     -> ArduinoJson operator=<String> -> heap alloc
 //
-// Live captures use the same decodeSignal() path. The board's unwired GDO0 had hidden
-// the problem: RSSI captures did not produce decodable frames. The earlier "silent import"
-// was this crash and reboot, not a dropped line.
+// Live captures use the same decodeSignal() path, so the fault was never import-specific.
+// The board's unwired GDO0 had hidden it: RSSI captures did not produce decodable frames.
+// The earlier "silent import" symptom was this crash and reboot, not a dropped line.
 //
-// Use 12 KB, not the earlier 32 KB guess. The loop stack comes from the heap; the
-// larger setting left too little room for an 822-byte JSON document and caused
-// "bad-json / NoMemory" during import.
+// 12 KB, MEASURED -- not 32 KB. An earlier version used 32 KB as "a common figure for
+// decode-heavy sketches", which turned out to be actively harmful: the loop task stack is
+// heap-allocated, so +24 KB of stack took 24 KB from the heap, and the heap then could not
+// serve an 822-byte JSON document. The symptom was "bad-json / NoMemory" on the import --
+// the stack override was CAUSING the failure it was meant to prevent.
 //
-// These hardware readings are from different stack sizes:
+// Measured on hardware, and the two readings must not be confused:
 //
-//   before decode: 29,860 B free of 32,768 B (~2,908 B used)
-//   after decode:   7,664 B free of 12,288 B (4,624 B used)
+//   no-decode baseline : 29860 B free of a 32768-byte stack -> ~2908 B used
+//                        (taken BEFORE the import could reach the decoder, so it excludes it)
+//   after a decode     :  7664 B free of the 12288-byte stack -> 4624 B used
+//                        (research/31: stack_hwm == stack_hwm_after_decode == 7664)
 //
-// The first reading predates decode and understates peak use by about 1,716 B; use
-// the second when sizing this path.
+// The decode adds ~1716 B beyond the no-decode baseline. So the baseline must NOT be used to
+// size the decode path -- an earlier version of this comment did exactly that
+// (12288 - 2908 = "~9.4 KB"), overstating the real margin by 1716 B while the correct measured
+// figure was already in hand. It is kept above as information, not as a basis.
 //
-// The 12 KB setting leaves 7,664 B after the deepest measured decode and returns
-// 20,480 B to the heap compared with the old 32 KB setting. Recheck both margins if
-// the decode path grows.
+// 12 KB therefore gives 12288 - 4624 = 7664 B free after the deepest decode, while returning
+// 20,480 B to the heap against the 32 KB override. If stack_hwm_after_decode later shows the
+// margin is thin, raise this against the measured heap cost rather than guessing again.
 #include <Arduino.h>
 SET_LOOP_TASK_STACK_SIZE(12 * 1024);

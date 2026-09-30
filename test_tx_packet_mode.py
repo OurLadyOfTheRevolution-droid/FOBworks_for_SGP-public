@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify the packet-mode TX path's register values against the CC1101 datasheet.
 
-worklog §4 step 1: packet mode drives the PA from the chip's own TX FIFO, so it needs
+research/16 §4 step 1: packet mode drives the PA from the chip's own TX FIFO, so it needs
 no GDO0 — which is the whole point on this board. But the whole thing rests on a handful of
 register numbers being correct, and if any is wrong the test would report a false failure
 on hardware and send the investigation somewhere useless. So they are checked here first,
@@ -224,7 +224,7 @@ def main():
     check(re.search(r'\+\"\\\",\"\+\s*\n\s*\"\\\"marcstate\\\":\"', src) is not None,
           "jam_status serial emit: path ends with \", and marcstate opens the next fragment")
 
-    print("\n=== replayRaw refuses on a dead TX path (worklog §1) ===")
+    print("\n=== replayRaw refuses on a dead TX path (research/19 §1) ===")
     rr2 = extract_fn(src, "replayRaw")
     check(rr2 is not None, "replayRaw extracted")
     if rr2:
@@ -236,7 +236,7 @@ def main():
         # real test of txPathLive and the refusal to sit inside it.
         check(re.search(r"if\s*\(\s*!\s*txPathLive\s*\)", body_r) is not None,
               "replayRaw guards on `if(!txPathLive)`, not a constant")
-        # The guard branch must DO something truthful. In worklog §5 step 4 it now
+        # The guard branch must DO something truthful. In research/19 §5 step 4 it now
         # routes to packet mode (a real transmission) and only refuses if that cannot work —
         # so the requirement is that the branch calls replayViaFifo and cannot silently
         # succeed without one of the two outcomes being named.
@@ -257,13 +257,13 @@ def main():
         check(i_live != -1 and i_bb != -1 and i_live < i_bb,
               "the liveness guard precedes the bit-bang loop")
 
-    print("\n=== captures without bit edges are refused (worklog §2) ===")
+    print("\n=== captures without bit edges are refused (research/19 §2) ===")
     cs = extract_fn(src, "captureSignal")
     check(cs is not None, "captureSignal extracted")
     if cs:
         body_c2 = re.sub(r"//.*", "", cs)
         check("no-bit-edges" in cs, "captureSignal reports reason no-bit-edges")
-        # The predicate was factored into ks_noBitEdges (worklog §3) so the live capture
+        # The predicate was factored into ks_noBitEdges (research/22 §3) so the live capture
         # and the stored-frame import apply the SAME test. Assert the call site and the
         # predicate separately; a mutation to `if(false)` is still caught because the call
         # must be present, and the arithmetic is checked on the predicate itself.

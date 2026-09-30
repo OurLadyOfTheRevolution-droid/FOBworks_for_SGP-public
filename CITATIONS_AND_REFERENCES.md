@@ -1,12 +1,12 @@
 # Citations and references
 
-This list covers the sources used for FOBworks for SGP v3.76, which targets the May 2026 SGP Card Mini. It includes the KeeLoq references, radio and board datasheets, and documentation for the WebSocket transport.
+This list covers the sources used for FOBworks for SGP v3.79, which targets the May 2026 SGP Card Mini. It includes the KeeLoq references, radio and board datasheets, the board's own vendor documentation and firmware, documentation for the WebSocket transport, and the repositories this project drew protocol work from.
 
 ## KeeLoq
 
 Three note numbers in the source do not identify a published Microchip KeeLoq document. The table maps each source label to the document relevant to that code path.
 
-As of v3.71, current KeeLoq comments cite the correct notes. Some dated changelog entries retain the old labels as a record of past releases; the table maps each label to the relevant publication.
+**Status (v3.71):** the comments the v3.71 KeeLoq work touched now cite the real notes directly. The three wrong labels below still appear in dated changelog entries and in comments not yet revisited; that cleanup is item F3 in the worklog. This table stays until F3 is finished.
 
 The firmware's 73-entry manufacturer-key table comes from the public list at `github.com/HiennNek/non-flipper-rolling-code-support` (`keeloq_mfcodes_user`). The source file is not included here because it contains the same keys already present in the firmware. Each entry's learning type (see `enum KLLearn` in the sketch) determines which derivation is used.
 
@@ -32,17 +32,45 @@ The firmware's 73-entry manufacturer-key table comes from the public list at `gi
 10. Espressif Systems, *ESP32-S3-MINI-1 & ESP32-S3-MINI-1U Datasheet*. The N8 order code specifies 8 MB quad flash and no PSRAM. The module has dual-core LX7, Wi-Fi 802.11 b/g/n, and BLE 5. The sketch header uses matching flash settings.
 11. Analog Devices, *MAX17048/MAX17049 Data Sheet*. VCELL is register `0x02`, state of charge is register `0x04`, and the gauge on this card responds at I2C address `0x36`.
 
+### The board vendor's own material
+
+The board's vendor ships a documentation set and a firmware collection for this hardware. Both were used directly, and one of them settles a question the register measurements could only narrow. The files are in `reference sources/drive-download-20260926T184334Z-1-001.zip`; `reference sources/` is untracked, so re-fetch rather than expect them in a clone.
+
+12. **Vendor firmware**, `APK DEMO sgp card mini/SGP_CardMini.ino` in that archive. Decisive for the GDO0 question. Its pin block states the hardware reality directly:
+
+```c
+#define PIN_CC1101_GDO0  -1   // GDO0 NO está cableado al ESP32 en este PCB.
+                              // Antes era 48, pero 48 es DIO0 del LoRa.
+                              // Sin GDO0 no se puede hacer replay bit-bang;
+                              // se hará via FIFO/PA del CC1101.
+#define PIN_CC1101_GDO2  -1   // Tampoco está cableado.
+```
+
+Two things come from this comment. The CC1101's GDO0 and GDO2 are not wired at all on this revision, which three independent register measurements during the bench rounds had established; the vendor states it outright. And the FIFO/PA route is the vendor's own intended firmware workaround for the missing GDO0, which is why the bench work can conclude that C1/C2 transmit was never hardware-blocked. `GDO2` is `-1` as well, so the "wire GDO2 instead" option README.md mentions is not one this firmware takes.
+
+13. **Vendor board documentation**, `pinout.html` and `APK DEMO sgp card mini/SGP_Card_Mini_User_Manual.pdf` in the same archive. `pinout.html` is the source for the two I2C devices on the shared bus: the PN532 NFC controller at `0x24` and the MAX17048 gauge at `0x36`. A caveat worth recording rather than smoothing over: `pinout.html` labels GPIO 48 as "GDO0 shared with LoRa DIO0", which the vendor's own firmware contradicts. The measurements side with the firmware, so this project treats the pinout label as the stale of the two. That disagreement is written up in the worklog rather than resolved here.
+
+## Repositories this project drew from
+
+Only the first two contributed protocol detail to this firmware; the note against each says what was taken, so a reader can tell a protocol reference from a bundled data table.
+
+14. **Flipper-ARF** (`D4C1-Labs`). The RollJam protocol set's `kia_v2.c` is the reference for the KIA/HYU V2 CRC4. This firmware's `ks_decodeKiaV2` had the formula wrong until v3.77: the check is `(xor of the twelve data nibbles + 1) & 0x0F`, and the missing `+ 1` is why the decoder rejected every genuine V2 frame while accepting a family of noise. The derivation and the corpus evidence are in the worklog. A local copy is in `reference sources/reference repositories/Flipper-ARF-main 2/`.
+15. **ProtoPirate**. Cross-listed source for the Kia/Hyundai V3/V4 manufacturer key used by `ks_decodeKiaV34`, alongside the key-availability table and the URH-NG crypto toolkit. Cross-checked rather than taken from one place, per the manufacturer-key survey.
+16. **RocketGods-SubGHz-Toolkit**. Its "export keys" function writes the decrypted `keeloq_mfcodes` table to `/ext/subghz/analysis/keeloq_keys.txt`, the documented route other projects use to obtain that table from a Flipper's secure enclave. This firmware does not embed the decrypted table; it carries 73 keys from the public list in item 17. Listed because the manufacturer-key survey assesses it as the practical route to keys not in any firmware, and that assessment is part of the reasoning here.
+
+Four further repositories sit in `reference sources/reference repositories/` but contributed nothing to this firmware: `Flipper-Zero-SUB-Analyzer`, `Flipper-Zero-SubGHz-Signal-Generator`, `flipper-zero-carjacker`, and the non-Kia protocols of the RollJam sources. They are named so the untracked folder's contents are not mistaken for sources of the code above.
+
 ## WebSocket transport (v3.73)
 
-12. Espressif Systems, *ESP HTTP Server*, `esp_http_server.h`. The port-81 transport uses `httpd_start`, `httpd_register_uri_handler` with `is_websocket`, `httpd_ws_recv_frame`, and `httpd_ws_send_frame_async`. Arduino `WebServer` cannot upgrade a connection, so the firmware uses this server instead. It requires `CONFIG_HTTPD_WS_SUPPORT`, enabled in the ESP32 core 3.3.12 SDK for this target.
-13. Espressif Systems, *ESP-IDF FreeRTOS*, `portmacro.h`. On this port, `portSTACK_TYPE` is `uint8_t`, so `uxTaskGetStackHighWaterMark()` returns **bytes**, not words. The status command reports `stack_hwm` in bytes. An earlier calculation multiplied the value by four and overstated the remaining stack.
-14. Espressif Systems, *ESP32 Arduino core*, `cores/esp32/main.cpp` and `Arduino.h`. `ARDUINO_LOOP_STACK_SIZE` defaults to 8192 bytes; `SET_LOOP_TASK_STACK_SIZE()` overrides it. The macro expands to a function definition, so it belongs in `loop_stack.cpp`, not in the sketch. See the note in that file.
+17. Espressif Systems, *ESP HTTP Server*, `esp_http_server.h`. The port-81 transport uses `httpd_start`, `httpd_register_uri_handler` with `is_websocket`, `httpd_ws_recv_frame`, and `httpd_ws_send_frame_async`. Arduino `WebServer` cannot upgrade a connection, so the firmware uses this server instead. It requires `CONFIG_HTTPD_WS_SUPPORT`, enabled in the ESP32 core 3.3.12 SDK for this target.
+18. Espressif Systems, *ESP-IDF FreeRTOS*, `portmacro.h`. On this port, `portSTACK_TYPE` is `uint8_t`, so `uxTaskGetStackHighWaterMark()` returns **bytes**, not words. The status command reports `stack_hwm` in bytes. An earlier calculation multiplied the value by four and overstated the remaining stack.
+19. Espressif Systems, *ESP32 Arduino core*, `cores/esp32/main.cpp` and `Arduino.h`. `ARDUINO_LOOP_STACK_SIZE` defaults to 8192 bytes; `SET_LOOP_TASK_STACK_SIZE()` overrides it. The macro expands to a function definition, so it belongs in `loop_stack.cpp`, not in the sketch. See the note in that file.
 
 ## Automotive RKE background
 
-15. Garcia, Oswald, Kasper, Pavlides, *Lock It and Still Lose It — On the (In)Security of Automotive Remote Keyless Entry Systems*, USENIX Security 2016. Describes the RollBack mechanism implemented by the C2 sequencer and the Hitag2 correlation attack.
-16. Eisenbarth, Kasper, Moradi, Paar, Salmasizadeh, Manzuri Shalmani, *Physical Cryptanalysis of KeeLoq Code Hopping Applications*, IACR ePrint 2008/058; CRYPTO 2008, LNCS 5157, pp. 203–220. See item 7 above.
-17. Bianchi, Brighente, Conti, Pavan, *SoK: Stealing Cars Since Remote Keyless Entry Introduction and How to Defend From It*, USENIX VehicleSec 2025. Surveys more than 35 attacks and 13 defenses.
-18. *Attacking Automotive RKE Security: How Smart are your 'Smart' Keys?* IACR ePrint 2024/1816. Surveys RollJam and RollBack attacks on Honda, Toyota, Maruti-Suzuki, and Mahindra vehicles.
-19. RfidResearchGroup, *proxmark3*, `tools/hitag2crack/`. `ht2crack4` and `ht2crack5` implement fast-correlation key recovery for Hitag2 and inform the estimate of 4–8 captured pairs.
+20. Garcia, Oswald, Kasper, Pavlides, *Lock It and Still Lose It — On the (In)Security of Automotive Remote Keyless Entry Systems*, USENIX Security 2016. Describes the RollBack mechanism implemented by the C2 sequencer and the Hitag2 correlation attack.
+21. Eisenbarth, Kasper, Moradi, Paar, Salmasizadeh, Manzuri Shalmani, *Physical Cryptanalysis of KeeLoq Code Hopping Applications*, IACR ePrint 2008/058; CRYPTO 2008, LNCS 5157, pp. 203–220. See item 7 above.
+22. Bianchi, Brighente, Conti, Pavan, *SoK: Stealing Cars Since Remote Keyless Entry Introduction and How to Defend From It*, USENIX VehicleSec 2025. Surveys more than 35 attacks and 13 defenses.
+23. *Attacking Automotive RKE Security: How Smart are your 'Smart' Keys?* IACR ePrint 2024/1816. Surveys RollJam and RollBack attacks on Honda, Toyota, Maruti-Suzuki, and Mahindra vehicles.
+24. RfidResearchGroup, *proxmark3*, `tools/hitag2crack/`. `ht2crack4` and `ht2crack5` implement fast-correlation key recovery for Hitag2 and inform the estimate of 4–8 captured pairs.
 

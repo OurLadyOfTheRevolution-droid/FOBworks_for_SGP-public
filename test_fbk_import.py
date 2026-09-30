@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the stored-frame import path (worklog §3) against real capture data.
+"""Verify the stored-frame import path (research/22 §3) against real capture data.
 
 The blocker this closes: fbkBuf had exactly one writer, the armed live-capture path, and on
 this board that path cannot produce a usable code — RSSI fallback fills the buffer with
@@ -298,9 +298,19 @@ int main(void){
             whole.extend(abs(int(x)) for x in re.findall(r'-?\d+', line[9:]))
     tl2 = trim_len(whole[:512])
     check(tl2 == 0,
-          "the corpus file's first 512 pulses do NOT trim, so the import is refused "
-          "rather than replaying an unbounded block")
-    print(f"    -> that body gives trimmed=false -> rbArm refuses on untrimmed-block")
+          "the corpus file's first 512 pulses do NOT trim (no Kia pitch pair in that window)")
+    # v3.79 changed what happens next. The import no longer REFUSES an untrimmable body; it
+    # keeps the raw block, matching fbkAppend's live-capture behaviour, so a non-Kia protocol
+    # can be imported at all. The safety property that matters is preserved and moved: rbArm
+    # still refuses an untrimmed block, so C2 cannot transmit a multi-repeat body as if it
+    # were one press. Assert THAT, because it is the guard, not the refusal.
+    print(f"    -> trimmed=false, body kept as a raw block")
+    check("e.trimmed=didTrim" in src.replace(" ", ""),
+          "the entry records trimmed=false for a kept-raw body")
+    check('reason=="untrimmed-block"' in src,
+          "rbArm still refuses an untrimmed block, so C2 cannot fire it")
+    check("import_kept_raw" in src,
+          "the kept-raw import is reported as an event rather than a silent acceptance")
 
     print("\n=== the endpoint and serial mirror exist ===")
     check('"/api/fbk_import"' in src, "the HTTP import endpoint is registered")

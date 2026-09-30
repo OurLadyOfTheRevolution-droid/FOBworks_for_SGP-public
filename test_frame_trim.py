@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""F5 — validate frame trimming against a real capture (worklog §2 F5).
+"""F5 — validate frame trimming against a real capture (research/11 §2 F5).
 
 A capture is not one code. `captureSignal` fills CAP_SZ=512 pulses, and a fob press
 emits its frame repeatedly, so one stored block holds several repeats of the SAME
@@ -89,12 +89,18 @@ PARTS = [
 ]
 for c in ("KIA_V34_MF_KEY", "KIA_V34_TE_SHORT", "KIA_V34_TE_LONG", "KIA_V34_TE_DELTA",
           "KIA_V34_MIN_BITS", "KIA_V34_FRAME_GAP_US", "KIA_V34_FRAME_PITCH_PULS",
-          "MFR_KEY_A", "MFR_KEY_B", "MFR_KEY_N",
           "KIA_V34_FRAME_PITCH_TOL"):
     PARTS.append(line(f"#define {c}"))
+# The published branch stores KIA_V34_MF_KEY masked and unwraps it at each use, so its cipher
+# calls read ks_unmaskMfrKey(KIA_V34_MF_KEY). Include the helper when the sketch defines it,
+# so this harness compiles against both branches without a per-branch copy. The mask constants
+# it references are emitted with it.
+if "static inline uint64_t ks_unmaskMfrKey(" in src:
+    for c in ("MFR_KEY_A", "MFR_KEY_B", "MFR_KEY_N"):
+        PARTS.append(line(f"#define {c}"))
+    PARTS.append(block("static inline uint64_t ks_unmaskMfrKey("))
 # cipher, then decoder, then trim
-for fn in ("static inline uint64_t ks_unmaskMfrKey(",
-           "static inline uint32_t ks_nlf(", "static inline uint32_t ks_bit(",
+for fn in ("static inline uint32_t ks_nlf(", "static inline uint32_t ks_bit(",
            "static uint32_t ks_klEncrypt(", "static uint32_t ks_klDecrypt(",
            "static inline uint8_t ks_kiaV34Rev8(", "static inline bool ks_kiaV34Match(",
            "static void ks_kiaV34Extract(", "static bool ks_kiaV34Validate(",

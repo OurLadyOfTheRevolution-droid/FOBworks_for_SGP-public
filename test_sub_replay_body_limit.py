@@ -27,7 +27,7 @@ limit = re.search(r"SUB_REPLAY_MAX_BODY_BYTES\s*=\s*(\d+)", source)
 # The property this check exists for is that the body is BOUNDED, not that the bound is
 # 8192. It was raised to 16384 because the corpus's first trimmable frame sits at pulse
 # 2517 and an 8192-byte body reaches only 1868 pulses -- so the smaller bound made the
-# import refuse the very corpus it was written for (worklog §4 step 1). Assert a
+# import refuse the very corpus it was written for (research/23 §4 step 1). Assert a
 # bounded value in a sane range, and that the 413 path below still guards it.
 assert limit, "replay body limit is not defined"
 limit_bytes = int(limit.group(1))

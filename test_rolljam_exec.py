@@ -5,9 +5,9 @@ C1 was shipped as a JavaScript state machine in html_page.h (FOBcatch's `fccPhas
 polling three HTTP endpoints every 1.5 s. That put the jam under the browser's
 control, so closing the tab or losing Wi-Fi mid-sequence left the carrier running
 with nothing to stop it — the same class of failure as the reset-path jam
-(worklog §2.2), one layer up. It also had no deadline, no single-shot lockout,
+(research/09 §2.2), one layer up. It also had no deadline, no single-shot lockout,
 and no check that the two "codes" banked were two different codes (the defect
-worklog §2.5 fixed in C2).
+research/10 §2.5 fixed in C2).
 
 The port moves the sequencing into firmware. This test extracts the shipped
 `rjArm`/`rjStart`/`rjTick`/`rjCtrOrder` verbatim, compiles them against mocks for the
@@ -81,7 +81,7 @@ assert "rjCtrOrder()" in block("static void rjTick()"), \
 RJ_DEFINES = [line("#define RJ_WINDOW_MS"), line("#define RJ_CAP_GAP_US"),
               line("#define RJ_CAP_TIMEOUT"), line("#define RJ_JAM_SETTLE_US")]
 # Frame constants + the trim helper, so C1's captures are trimmed exactly as the
-# firmware trims them (worklog §2 F4).
+# firmware trims them (research/11 §2 F4).
 TRIM_PARTS = [
     line("#define KIA_V34_FRAME_GAP_US"),
     line("#define KIA_V34_FRAME_PITCH_PULS"),
@@ -170,7 +170,7 @@ static StringStub g_dec;
 static String lastDecode;   // what captureSignal leaves for the caller
 // Faithful stand-in for captureSignal. The previous version IGNORED both parameters,
 // which is why this test could see neither that gapUs had no effect nor that a stored
-// block held several repeats (worklog §1.3). This one records the parameters,
+// block held several repeats (research/11 §1.3). This one records the parameters,
 // emits a realistic frame train (g_repeats copies of a one-frame pattern, so the block
 // genuinely holds multiple repeats of ONE code), and treats timeoutMs==0 as "no data".
 bool captureSignal(uint16_t timeoutMs,uint32_t gapUs){
@@ -325,7 +325,7 @@ int main(){
   CHECK(!jamActive, "jam survived the backward abort");
   printf("  backward counters -> tx=%d jam=%d\n", g_txCount, (int)jamActive);
 
-  // ── 2b. Untrimmed blocks must be refused (worklog §2/§3 P1) ──────────
+  // ── 2b. Untrimmed blocks must be refused (research/12 §2/§3 P1) ──────────
   // C1 replays press 1. If the capture could not be reduced to one frame, the replay
   // carries several repeats of press 1 and the car sees three presses. Refuse, and say
   // so, rather than sending a sequence that may be wrong invisibly.
