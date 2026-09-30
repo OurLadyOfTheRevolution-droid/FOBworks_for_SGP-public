@@ -48,7 +48,7 @@ The board's vendor ships a documentation set and a firmware collection for this 
 
 Two things come from this comment. The CC1101's GDO0 and GDO2 are not wired at all on this revision, which three independent register measurements during the bench rounds had established; the vendor states it outright. And the FIFO/PA route is the vendor's own intended firmware workaround for the missing GDO0, which is why the bench work can conclude that C1/C2 transmit was never hardware-blocked. `GDO2` is `-1` as well, so the "wire GDO2 instead" option README.md mentions is not one this firmware takes.
 
-13. **Vendor board documentation**, the board's pinout page and user manual. The pinout is the source for the two I2C devices on the shared bus: the PN532 NFC controller at `0x24` and the MAX17048 gauge at `0x36`. A caveat worth recording rather than smoothing over: the vendor's pinout labels GPIO 48 as "GDO0 shared with LoRa DIO0", which the vendor's own firmware contradicts. The measurements side with the firmware, so this project treats the pinout label as the stale of the two. That disagreement is written up in the worklog rather than resolved here.
+13. **Vendor board documentation**, the board's pinout page and user manual. The pinout is the source for the two I2C devices on the shared bus: the PN532 NFC controller at `0x24` and the MAX17048 gauge at `0x36`. The vendor's pinout labels GPIO 48 as "GDO0 shared with LoRa DIO0", which the vendor's own firmware contradicts. The measurements side with the firmware, so this project treats the pinout label as the stale of the two. That disagreement is written up in the worklog rather than resolved here.
 
 ## Repositories this project drew from
 

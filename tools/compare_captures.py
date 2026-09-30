@@ -3,8 +3,8 @@
 
 Why this exists: the corpus has been the only input this project has had, and research/38
 showed its scaling is unreliable -- some Kia captures sit at 2.0x nominal, which is a
-capture-method artefact rather than a property of the fob. A single capture cannot tell you
-whether a strange pulse timebase is the fob or the recorder.
+capture-method artefact rather than a property of the fob. A single capture cannot show whether
+a strange pulse timebase is the fob or the recorder.
 
 Two independently-recorded captures of the same press can. If both devices report the same
 cluster widths, the timebase is a property of the fob and a decoder should model it. If they
