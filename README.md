@@ -1,6 +1,6 @@
 # FOBworks for SGP
 
-FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 3.76.
+FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 3.79.
 
 This build targets the SGP Card Mini stock acquired in May 2026: an ESP32-S3-MINI-1-N8 with a dual-core LX7 at 240 MHz, 8 MB quad flash, no PSRAM, Wi-Fi 802.11 b/g/n, and BLE 5. The sub-GHz radio is the onboard CC1101, using OOK and 2FSK across the 39 channels listed in the sketch between 300–348, 387–464, and 779–928 MHz. The board also has a Ra-02 SX1278 LoRa module. GPIO 48 is connected to the SX1278's DIO0; the CC1101's GDO0 is not routed to a readable GPIO. Resetting or sleeping the SX1278 does not provide a CC1101 data connection. GPIO 26 is reserved on the PCB for a future SX1262 and is unused. The MAX17048 fuel gauge is at I2C address `0x36`. Kept decodes are written to the microSD card as FOBworks RAW files, which the dashboard can read back. The firmware accepts CC1101 version-register values `0x04` and `0x14`; the detected value appears in the status chip.
 
@@ -182,11 +182,15 @@ The CC1101's GDO0 output is not connected to a readable GPIO on this board. GPIO
 - **Transmit does not depend on GDO0.** Packet mode drives the CC1101's own PA from the TX FIFO, so replay, jamming and the sequencers work. This was verified by an external receiver decoding a transmitted frame.
 - Routing GDO0 (chip pin 6) or GDO2 (pin 3) to a free GPIO fixes capture quality. GDO2 is easier to reach but is output-only, so it gives capture without transmit.
 
-**There is no low-frequency front end.** The CC1101 covers 300–928 MHz, so 125 kHz passive-entry wake-up and the Hitag2, Megamos, and DST40 immobilisers below 300 MHz are out of range.
+**There is no 125 kHz LF front end.** The CC1101 covers 300–928 MHz, so 125 kHz passive-entry wake-up and the below-300 MHz immobilisers (Hitag2, Megamos, DST40) are out of reach on this board.
+
+**The board does have a 13.56 MHz HF front end, and this firmware does not use it.** A PN532 sits on the shared I2C bus at address 0x24, alongside the MAX17048 gauge at 0x36. The stock tool for it drives ISO14443A passive-target reads; nothing in FOBworks touches it, and no command, decode or replay path depends on it. If NFC is wanted here, it is a separate feature rather than an extension of the sub-GHz work.
 
 The current build uses **45% of RAM**. The decode path and WebSocket inbound queue are the largest consumers. Check `stack_hwm` and `heap_free` in the `status` response before extending the decode path.
 
 ## Development notes
+
+`research/sources/` holds the capture corpus the decoder regression runs against, and the tooling that reads it. The working notes themselves are kept separately and are not part of this repository.
 
 The `test_*.py` suites check parser boundaries, safety guards, and JSON formatting. `tools/corpus_regression.py` extracts and compiles the firmware's decoders, then runs them against a corpus of real captures:
 

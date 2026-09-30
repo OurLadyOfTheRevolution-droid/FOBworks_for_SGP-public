@@ -44,3 +44,4 @@ build/
 # serial. Never commit it, and never commit raw bench logs that may quote it.
 bench_token.txt
 bench_*.log
+*.bak

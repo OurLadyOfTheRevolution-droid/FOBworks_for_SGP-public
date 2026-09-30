@@ -20,9 +20,11 @@ int/float/bool where they look like one.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import select
+import struct
 import sys
 import termios
 import time
@@ -87,6 +89,16 @@ def main():
     a[6][termios.VTIME] = 0
     termios.tcsetattr(fd, termios.TCSANOW, a)
     termios.tcflush(fd, termios.TCIOFLUSH)
+
+    # Opening the port asserts DTR and RTS. On the SGP Card Mini the bridge maps
+    # RTS -> GPIO0 (the boot strap) and DTR -> EN, OPPOSITE to the usual convention, so an
+    # untouched open pulls GPIO0 low and holds the chip in the ROM downloader. The firmware
+    # then never runs and every command looks like a dead card. Observed directly: boot:0x0
+    # (DOWNLOAD) with the lines left alone, boot:0x8 (SPI_FAST_FLASH_BOOT) once RTS is
+    # deasserted. RTS is deasserted here, which is also what pyserial's default does on a
+    # normal board, so this is safe on either mapping. DTR is left alone so a reset is not
+    # triggered by the mere act of sending a command.
+    fcntl.ioctl(fd, termios.TIOCMBIC, struct.pack("I", termios.TIOCM_RTS))
 
     line = json.dumps(payload) + "\n"
     # Echo the command with the token masked, so pasted output is safe.
