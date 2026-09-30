@@ -168,7 +168,35 @@ for _f in _PUB_DOCS:
                 _bad.append(f"{_f}:{_i} -> {_r} (not in this tree)")
             elif _UNPUBLISHED.match(_r):
                 _bad.append(f"{_f}:{_i} -> {_r} (not published; a reader cannot open it)")
-assert not _bad, f"published docs reference paths a reader cannot open: {_bad}"
-print(f"  published-reference check: {len(_PUB_DOCS)} docs, every cited path resolves")
+# Third correction, prompted by the citations listing repositories that live in the untracked
+# `reference sources/` folder. That folder is gitignored, so it is absent from every clone, and
+# naming it -- or any path inside it -- sends a reader looking for something they cannot have.
+# The check above missed this entirely because it only matched spans beginning `research/` or
+# `tools/`. This pass is deliberately broader: ANY backticked span that names a gitignored path,
+# or looks like a file inside one, is a defect.
+#
+# A citation should credit a source, not inventory a private folder, so the fix is to name the
+# upstream project rather than the local copy of it.
+_IGNORED = []
+for _line in (HERE / ".gitignore").read_text(encoding="utf-8").split("\n"):
+    _line = _line.split("#")[0].strip()
+    if _line:
+        _IGNORED.append(_line.strip("/"))
+_ANY = re.compile(r"`([^`\n]{2,120})`")
+_private = []
+for _f in _PUB_DOCS:
+    _p = HERE / _f
+    if not _p.is_file():
+        continue
+    for _i, _line in enumerate(_p.read_text(encoding="utf-8").split("\n"), 1):
+        for _m in _ANY.finditer(_line):
+            _s = _m.group(1).strip()
+            for _ig in _IGNORED:
+                if _ig and (_s == _ig or _s.startswith(_ig + "/")):
+                    _private.append(f"{_f}:{_i} -> {_s} (inside gitignored `{_ig}`)")
+                    break
+assert not _private, (
+    f"published docs point at gitignored paths a reader cannot obtain: {_private}")
+print(f"  private-path check: no published doc names anything inside a gitignored folder")
 
 print(f"review-finding checks passed on v{_ver} (websocket auth, GDO0 routing, capture budget, can_send)")
