@@ -34,9 +34,9 @@ The firmware's 73-entry manufacturer-key table comes from the public list at `gi
 
 ### The board vendor's own material
 
-The board's vendor ships a documentation set and a firmware collection for this hardware. Both were used directly, and one of them settles a question the register measurements could only narrow. The files are in `reference sources/drive-download-20260926T184334Z-1-001.zip`; `reference sources/` is untracked, so re-fetch rather than expect them in a clone.
+The board's vendor ships a documentation set and a firmware collection for this hardware. Both were used directly, and one of them settles a question the register measurements could only narrow. They are distributed with the board rather than in this repository, so obtain them from the vendor: the documentation is the board's own pinout page and user manual, and the firmware is the vendor's sample sketch for this card.
 
-12. **Vendor firmware**, `APK DEMO sgp card mini/SGP_CardMini.ino` in that archive. Decisive for the GDO0 question. Its pin block states the hardware reality directly:
+12. **Vendor firmware**, the board's sample sketch for this card (`SGP_CardMini`). Decisive for the GDO0 question. Its pin block states the hardware reality directly:
 
 ```c
 #define PIN_CC1101_GDO0  -1   // GDO0 NO está cableado al ESP32 en este PCB.
@@ -48,17 +48,15 @@ The board's vendor ships a documentation set and a firmware collection for this 
 
 Two things come from this comment. The CC1101's GDO0 and GDO2 are not wired at all on this revision, which three independent register measurements during the bench rounds had established; the vendor states it outright. And the FIFO/PA route is the vendor's own intended firmware workaround for the missing GDO0, which is why the bench work can conclude that C1/C2 transmit was never hardware-blocked. `GDO2` is `-1` as well, so the "wire GDO2 instead" option README.md mentions is not one this firmware takes.
 
-13. **Vendor board documentation**, `pinout.html` and `APK DEMO sgp card mini/SGP_Card_Mini_User_Manual.pdf` in the same archive. `pinout.html` is the source for the two I2C devices on the shared bus: the PN532 NFC controller at `0x24` and the MAX17048 gauge at `0x36`. A caveat worth recording rather than smoothing over: `pinout.html` labels GPIO 48 as "GDO0 shared with LoRa DIO0", which the vendor's own firmware contradicts. The measurements side with the firmware, so this project treats the pinout label as the stale of the two. That disagreement is written up in the worklog rather than resolved here.
+13. **Vendor board documentation**, the board's pinout page and user manual. The pinout is the source for the two I2C devices on the shared bus: the PN532 NFC controller at `0x24` and the MAX17048 gauge at `0x36`. A caveat worth recording rather than smoothing over: the vendor's pinout labels GPIO 48 as "GDO0 shared with LoRa DIO0", which the vendor's own firmware contradicts. The measurements side with the firmware, so this project treats the pinout label as the stale of the two. That disagreement is written up in the worklog rather than resolved here.
 
 ## Repositories this project drew from
 
-Only the first two contributed protocol detail to this firmware; the note against each says what was taken, so a reader can tell a protocol reference from a bundled data table.
+Each of these contributed protocol detail that is actually in the firmware; the note against each says what was taken. Repositories consulted but not drawn from are not listed: a citations document credits sources, and naming material that left no trace in the code would suggest a debt that does not exist.
 
-14. **Flipper-ARF** (`D4C1-Labs`). The RollJam protocol set's `kia_v2.c` is the reference for the KIA/HYU V2 CRC4. This firmware's `ks_decodeKiaV2` had the formula wrong until v3.77: the check is `(xor of the twelve data nibbles + 1) & 0x0F`, and the missing `+ 1` is why the decoder rejected every genuine V2 frame while accepting a family of noise. The derivation and the corpus evidence are in the worklog. A local copy is in `reference sources/reference repositories/Flipper-ARF-main 2/`.
-15. **ProtoPirate**. Cross-listed source for the Kia/Hyundai V3/V4 manufacturer key used by `ks_decodeKiaV34`, alongside the key-availability table and the URH-NG crypto toolkit. Cross-checked rather than taken from one place, per the manufacturer-key survey.
+14. **Flipper-ARF** (`D4C1-Labs`). The RollJam protocol set's `kia_v2.c` is the reference for the KIA/HYU V2 CRC4. This firmware's `ks_decodeKiaV2` had the formula wrong until v3.77: the check is `(xor of the twelve data nibbles + 1) & 0x0F`, and the missing `+ 1` is why the decoder rejected every genuine V2 frame while accepting a family of noise. The derivation and the corpus evidence are in the worklog.
+15. **ProtoPirate**. Cross-listed source for the Kia/Hyundai V3/V4 manufacturer key `0xA8F5DFFC8DAA5CDB` used by `ks_decodeKiaV34`, alongside the key-availability table and the URH-NG crypto toolkit. Cross-checked rather than taken from one place, per the manufacturer-key survey.
 16. **RocketGods-SubGHz-Toolkit**. Its "export keys" function writes the decrypted `keeloq_mfcodes` table to `/ext/subghz/analysis/keeloq_keys.txt`, the documented route other projects use to obtain that table from a Flipper's secure enclave. This firmware does not embed the decrypted table; it carries 73 keys from the public list in item 17. Listed because the manufacturer-key survey assesses it as the practical route to keys not in any firmware, and that assessment is part of the reasoning here.
-
-Four further repositories sit in `reference sources/reference repositories/` but contributed nothing to this firmware: `Flipper-Zero-SUB-Analyzer`, `Flipper-Zero-SubGHz-Signal-Generator`, `flipper-zero-carjacker`, and the non-Kia protocols of the RollJam sources. They are named so the untracked folder's contents are not mistaken for sources of the code above.
 
 ## WebSocket transport (v3.73)
 
