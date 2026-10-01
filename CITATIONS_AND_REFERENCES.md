@@ -1,6 +1,6 @@
 # Citations and references
 
-This list covers the sources used for FOBworks for SGP v3.79, which targets the May 2026 SGP Card Mini. It includes the KeeLoq references, radio and board datasheets, the board's own vendor documentation and firmware, documentation for the WebSocket transport, and the repositories this project drew protocol work from.
+This list covers the sources used for FOBworks for SGP v3.82, which targets the May 2026 SGP Card Mini. It includes the KeeLoq references, radio and board datasheets, the board's own vendor documentation and firmware, documentation for the WebSocket transport, and the repositories this project drew protocol work from.
 
 ## KeeLoq
 
@@ -48,14 +48,14 @@ The board's vendor ships a documentation set and a firmware collection for this 
 
 Two things come from this comment. The CC1101's GDO0 and GDO2 are not wired at all on this revision, which three independent register measurements during the bench rounds had established; the vendor states it outright. And the FIFO/PA route is the vendor's own intended firmware workaround for the missing GDO0, which is why the bench work can conclude that C1/C2 transmit was never hardware-blocked. `GDO2` is `-1` as well, so the "wire GDO2 instead" option README.md mentions is not one this firmware takes.
 
-13. **Vendor board documentation**, the board's pinout page and user manual. The pinout is the source for the two I2C devices on the shared bus: the PN532 NFC controller at `0x24` and the MAX17048 gauge at `0x36`. The vendor's pinout labels GPIO 48 as "GDO0 shared with LoRa DIO0", which the vendor's own firmware contradicts. The measurements side with the firmware, so this project treats the pinout label as the stale of the two. That disagreement is written up in the worklog rather than resolved here.
+13. **Vendor board documentation**, the board's pinout page and user manual. The pinout is the source for the two I2C devices on the shared bus: the PN532 NFC controller at `0x24` and the MAX17048 gauge at `0x36`. A caveat worth recording rather than smoothing over: the vendor's pinout labels GPIO 48 as "GDO0 shared with LoRa DIO0", which the vendor's own firmware contradicts. The measurements side with the firmware, so this project treats the pinout label as the stale of the two. That disagreement is written up in the worklog rather than resolved here.
 
 ## Repositories this project drew from
 
 Each of these contributed protocol detail that is actually in the firmware; the note against each says what was taken. Repositories consulted but not drawn from are not listed: a citations document credits sources, and naming material that left no trace in the code would suggest a debt that does not exist.
 
 14. **Flipper-ARF** (`D4C1-Labs`). The RollJam protocol set's `kia_v2.c` is the reference for the KIA/HYU V2 CRC4. This firmware's `ks_decodeKiaV2` had the formula wrong until v3.77: the check is `(xor of the twelve data nibbles + 1) & 0x0F`, and the missing `+ 1` is why the decoder rejected every genuine V2 frame while accepting a family of noise. The derivation and the corpus evidence are in the worklog.
-15. **ProtoPirate**. Cross-listed source for the Kia/Hyundai V3/V4 manufacturer key `0xA8F5DFFC8DAA5CDB` used by `ks_decodeKiaV34`, alongside the key-availability table and the URH-NG crypto toolkit. Cross-checked rather than taken from one place, per the manufacturer-key survey.
+15. **ProtoPirate**. Cross-listed source for the Kia/Hyundai V3/V4 manufacturer key used by `ks_decodeKiaV34`, alongside the key-availability table and the URH-NG crypto toolkit. Cross-checked rather than taken from one place, per the manufacturer-key survey.
 16. **RocketGods-SubGHz-Toolkit**. Its "export keys" function writes the decrypted `keeloq_mfcodes` table to `/ext/subghz/analysis/keeloq_keys.txt`, the documented route other projects use to obtain that table from a Flipper's secure enclave. This firmware does not embed the decrypted table; it carries 73 keys from the public list in item 17. Listed because the manufacturer-key survey assesses it as the practical route to keys not in any firmware, and that assessment is part of the reasoning here.
 
 ## WebSocket transport (v3.73)

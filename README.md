@@ -1,6 +1,6 @@
 # FOBworks for SGP
 
-FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 3.79.
+FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 3.82.
 
 This build targets the SGP Card Mini stock acquired in May 2026: an ESP32-S3-MINI-1-N8 with a dual-core LX7 at 240 MHz, 8 MB quad flash, no PSRAM, Wi-Fi 802.11 b/g/n, and BLE 5. The sub-GHz radio is the onboard CC1101, using OOK and 2FSK across the 39 channels listed in the sketch between 300–348, 387–464, and 779–928 MHz. The board also has a Ra-02 SX1278 LoRa module. GPIO 48 is connected to the SX1278's DIO0; the CC1101's GDO0 is not routed to a readable GPIO. Resetting or sleeping the SX1278 does not provide a CC1101 data connection. GPIO 26 is reserved on the PCB for a future SX1262 and is unused. The MAX17048 fuel gauge is at I2C address `0x36`. Kept decodes are written to the microSD card as FOBworks RAW files, which the dashboard can read back. The firmware accepts CC1101 version-register values `0x04` and `0x14`; the detected value appears in the status chip.
 
@@ -111,6 +111,18 @@ Use Arduino IDE with ESP32 core 3.x. This sketch was compiled with core 3.3.12.
 - Upload speed: 921600
 
 Leave PSRAM disabled. Enabling OPI PSRAM would claim GPIO 33–37, which this board uses for the CC1101 SPI bus and the user button.
+
+`CDCOnBoot` is not optional. This board's USB is the chip's own USB-Serial-JTAG, so with `USB CDC on boot` left at its default the sketch's `Serial` output goes to the UART pins and the card looks dead over USB: no boot log, no reply to commands, nothing. Every board symptom described in the worklog turned out to be this setting, so check it before diagnosing anything else.
+
+The whole set as one command line, for `arduino-cli`:
+
+```
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=8M,PartitionScheme=huge_app,PSRAM=disabled,CDCOnBoot=cdc,USBMode=hwcdc" .
+arduino-cli upload  -p /dev/cu.usbmodem1101 \
+   --fqbn "esp32:esp32:esp32s3:FlashSize=8M,PartitionScheme=huge_app,PSRAM=disabled,CDCOnBoot=cdc,USBMode=hwcdc" .
+```
+
+A full-image flash erases NVS, which regenerates the Wi-Fi password and dashboard access code. Read the new ones from the boot log; an old token answers `{"ok":false,"error":"unauthorized"}`, which is the card working, not failing.
 
 Libraries: Adafruit NeoPixel 1.12 or newer, ArduinoJson 7.x. SD, SPI, Wire, Preferences, DNSServer, WiFi, and `esp_http_server` come with the ESP32 core.
 

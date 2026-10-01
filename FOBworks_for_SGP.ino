@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v3.79
+// Version  : FOBworks for SGP v3.82
 // Board    : May 2026 stock, ESP32-S3-MINI-1-N8, 8 MB flash, no PSRAM
 // Radio    : CC1101, OOK and 2FSK, 300–928 MHz
 // Dashboard: http://192.168.4.1; per-device Wi-Fi credentials are printed over USB
@@ -192,8 +192,119 @@
 //   · localStorage persistence — signal library + manual groups survive refresh
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
-// ── CHANGELOG ─────────────────────────────────────────────────────────────────
-// v3.79 (2026-09-29) — a stored frame can be imported even when its protocol has no trim.
+  // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+  // v3.82 (2026-09-30) — hold the LoRa module in reset, which stops the false captures.
+  //
+  //   [BUG] The card fired captures with NOTHING transmitting, at bands no consumer device
+  //     uses and with a floor of -101 dBm. The source was the SX1278: setup() raises the 3.3 V
+  //     sensor rail, which also powers LoRa, and nothing on the normal boot path put the module
+  //     to sleep -- the only loraHardReset() calls are inside captureSignal(), so between boot
+  //     and the first capture it sat powered and awake on the shared front end.
+  //
+  //     Measured at 700 MHz with nothing transmitting: floor -101/-102 dBm and 3 of 3 false
+  //     captures with the module awake; floor -112 dBm and 0 of 3 with RST held LOW. A capture
+  //     fires when RSSI crosses trigThr, which is floor+10, so the 11 dB moved the trigger from
+  //     -91 to -102 and the module's own noise stopped crossing it.
+  //
+  //     loraParkReset() deselects CS and holds RST LOW, in setup() after the rail comes up and
+  //     in captureSignal() after the existing reset. Holding RST low is the vendor's own
+  //     documented lowest-power state ("LoRa RST -> hold LOW"); the previous code relied on the
+  //     SPI sleep register and released RST. That write DID land -- loraSleepNow() reads
+  //     RegOpMode back and it reports 0x00 -- so this was the wrong state, not a failed write.
+  //     The SPI reset still runs first, because it is what guarantees DIO0 goes high-Z and
+  //     GPIO 48 is shared with the CC1101.
+  //
+  //     Clearest indicator: every capture used to report raw=512, the buffer filling on LoRa
+  //     noise faster than any modulation. A real signal now reports raw=34.
+  //
+  //   [NOT FIXED] 433.92 still fires with nothing transmitting, and 868.35 fires 2 of 3.
+  //     433.92 reads -81 dBm where every other band reads -101, a 20 dB difference no on-board
+  //     source explains. That is the signature of real local RF in a dense building on the
+  //     busiest ISM band, so it is recorded as probably environmental rather than a defect.
+  //     Whether the card should capture on ambient RF at all is open as a design question.
+  //
+  //   research/55 records the measurements. This also explains research/49's headline: what
+  //   "worked" at 433.92 included ambient and LoRa noise, so that comparison was never
+  //   measuring the capture path.
+  //
+  //   Compile: 1,775,112 B flash of 3,145,728 (56%), 149,764 B RAM of 327,680 (45%).
+  //   All 18 suites pass.
+  //
+  // v3.81 (2026-09-30) — the FSK noise floor is an AGC target, not a dead radio.
+  // See research/48.
+  //
+  //   [FINDING] research/47 left the FSK floor reading ~15 dB below the OOK one
+  //     (-100 vs -86 dBm), and a -100 dBm reading is what a CC1101 returns when it
+  //     is not receiving. That mattered because captureSignal() derives its trigger
+  //     from it (trigThr = floor + 10).
+  //
+  //     The chip is receiving: MARCSTATE stays 13 (RX) through the FSK writes and
+  //     every later phase. The two figures were never comparable, because
+  //     AGCCTRL2.MAGN_TARGET names a target by index against TWO tables, one for
+  //     OOK/ASK and one for 2-FSK/GFSK/MSK. This configuration carries the OOK value
+  //     (0x43 -> MAGN_TARGET=3) into FSK.
+  //
+  //     Measured, sweeping the field in FSK across all eight values: the floor moves
+  //     from -85 to -101 dBm. At MAGN_TARGET=0 the FSK floor is -85.5 dBm, identical
+  //     to the OOK floor. The rule the reference implementation states -- "MAGN_TARGET
+  //     for RX filter BW =< 100 kHz is 0x3. For higher RX filter BW's MAGN_TARGET is
+  //     0x7" -- is consistent with this: the board runs a 406 kHz filter carrying 0x3.
+  //
+  //     Not changed: the MAGN_TARGET value itself. Which index the datasheet intends
+  //     for a 406 kHz FSK filter is not something the bench can settle without a
+  //     signal source, and 0 is the most sensitive target -- picking it because it
+  //     makes the two modes agree would be fitting the number to the appearance.
+  //
+  //   [DIAG] rx_floor_check now reports magn_target_sweep_fsk, so the field's influence
+  //     is visible on the card in one command, and its note no longer claims the floor
+  //     is implausible. The FLOOR_UNREALISTIC verdict still fires below -90 dBm but the
+  //     note now says what that means.
+  //
+  //     A fourth phase reading the floor in IDLE was tried and removed: RSSI is not
+  //     maintained in IDLE, so it returns a stale register and the samples jumped
+  //     between -86 and -99 across runs. Recorded in research/48 §4 rather than left in.
+  //
+  //   Compile: 1,771,164 B flash, 149,764 B RAM. All 18 suites pass.
+  //
+  // v3.80 (2026-09-30) — the noise-floor diagnostics were measuring the sweep, not
+  // the radio. See research/47.
+  //
+  //   [BUG] rx_floor_check and rssi_path_check gave a different answer on every run,
+  //     including two different verdicts from the same command. Three runs with the
+  //     scan active returned floors of -85, -108 and -100 dBm, and MARCSTATE read 1
+  //     (IDLE) on one run and 13 (RX) on the next.
+  //
+  //     Two faults, both in the diagnostics rather than the radio:
+  //
+  //     · Neither paused the background sweep. scanTick() runs after handleSerial()
+  //       in loop() and retunes the chip on its own schedule, so each invocation
+  //       began from whatever state the previous sweep tick left behind. The loop is
+  //       single-threaded, so this is not a race inside the handler -- it is the
+  //       starting state that varied.
+  //     · Neither allowed the chip to settle between strobes. captureSignal() uses
+  //       `0x36; delay(1); 0x3A; delay(1); 0x34; delay(10)`; the diagnostic ran the
+  //       same three strobes back to back and then read MARCSTATE before the
+  //       transition to RX had landed. With the sweep paused, `after_srx` reported
+  //       IDLE every time and only reached RX after a later strobe pair that did
+  //       carry the 1 ms gap.
+  //
+  //     Both diagnostics now pause the sweep and use captureSignal()'s timing
+  //     verbatim. Four consecutive runs with the sweep active are identical, and the
+  //     first MARCSTATE reading is 13 as it should be.
+  //
+  //   [BUG] The same missing sweep guard was on four direct-transmit handlers:
+  //     `replay`, `fbk_replay`, `rolljam_replay` and `play_key`. A sweep tick between
+  //     the command and the burst could retune the CC1101 out from under it. All four
+  //     now pause and restore. The sequencers (rbStart, rjStart, startJam) and the
+  //     capture/replay_seq/dual_band_replay paths already did this.
+  //
+  //     The /api/* twins of several of these are still unguarded. Not changed here:
+  //     the serial paths are what the bench exercises and what the host suite covers,
+  //     and the HTTP change has no bench evidence yet. Recorded in research/47 §3.
+  //
+  //   Compile: 1,770,476 B flash, 149,764 B RAM. All 18 suites pass.
+  //
+  // v3.79 (2026-09-29) — a stored frame can be imported even when its protocol has no trim.
 //
 //   [BUG] fbk_import refused any body that rjTrimKiaV34 could not bound, so only Kia V3/V4
 //     format captures could ever be imported. rjTrimKiaV34 looks for the 162-pulse Kia
@@ -1380,7 +1491,7 @@
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v3.79"
+#define FW_VER        "FOBworks for SGP v3.82"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
@@ -1561,6 +1672,12 @@ uint32_t capMaxMsOverride = 0;
 // the vendor firmware says the same; neither is a reason to probe for it at runtime, because a
 // probe cannot tell the two chips' pins apart.
 bool gdo0Routed = false;
+
+// Per-stage capture diagnostics. Off by default; `{"cmd":"cap_diag","on":true}` turns it on
+// and the next capture logs how many pulses survive each post-processing stage. This exists
+// because a capture that reaches the gates with transitions and leaves empty reports only
+// "Too few edges", which does not say which gate dropped it (research/50 §4).
+bool lastCapDiag = false;
 
 bool captureSignal(uint16_t timeoutMs,uint32_t gapUs);
 
@@ -2671,6 +2788,31 @@ static void loraHardReset(){
   SPI.beginTransaction(SPISettings(1000000,MSBFIRST,SPI_MODE0));
   loraSleepNow();
   SPI.endTransaction();
+}
+
+// ─── Park the SX1278 for RF work ─────────────────────────────────────────────
+// Hold the module in reset rather than relying on the SPI sleep register. The register
+// write does land -- loraSleepNow() reads RegOpMode back and reports 0x00 -- but the part
+// still contributes noise to the shared front end, and the vendor's own documentation says
+// the lowest-power state is RST held LOW ("LoRa RST -> hold LOW (reset = lowest power)").
+//
+// Measured on the card at 700 MHz, a band no consumer device uses:
+//
+//   rail powered, module slept by register   floor -101/-102 dBm   3 of 3 false captures
+//   RST held LOW                             floor -112 dBm         0 of 3
+//
+// A capture fires when the RSSI crosses trigThr, which is floor+10, so an 11 dB lower floor
+// moves the trigger from -91 to -102 and the module's own noise stops crossing it. The false
+// captures were the SX1278 being powered and awake, not local RF: the same test at 700 MHz
+// rules neighbours out, because nothing transmits there.
+//
+// loraHardReset() above still runs first, because the SPI sleep is what guarantees DIO0 goes
+// high-Z, and GPIO 48 is shared with the CC1101. RST-low is added on top as the quieter state.
+static void loraParkReset(){
+  pinMode(PIN_LORA_CS, OUTPUT);
+  digitalWrite(PIN_LORA_CS, HIGH);   // deselect, or it drives MISO into the shared bus
+  pinMode(PIN_LORA_RST, OUTPUT);
+  digitalWrite(PIN_LORA_RST, LOW);   // held low: lowest power, per the vendor's sequence
 }
 uint8_t cc_xfer(uint8_t b){ return SPI.transfer(b); }
 void cc_strobe(uint8_t s){ cc_cs(true); cc_waitMISO(); cc_xfer(s); cc_cs(false); }
@@ -7398,6 +7540,11 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   // Reset and sleep the SX1278 before using the SPI bus. This does not connect the
   // CC1101 GDO0 to GPIO 48; that path is disabled unless gdo0Routed is set.
   loraHardReset();
+  // Then hold the module in reset for the capture itself. loraHardReset() writes the SPI
+  // sleep register and releases RST, which leaves the part powered and contributing noise to
+  // the shared front end; measurements are in loraParkReset(). Without this the floor reads
+  // about 11 dB high and the trigger at floor+10 crosses on the module's own noise.
+  loraParkReset();
   // SIDLE, flush the TX FIFO (0x3A), then SRX.
   SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
   cc_strobe(0x36); delay(1); cc_strobe(0x3A); delay(1); cc_strobe(0x34); delay(10);
@@ -7552,6 +7699,12 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     SPI.endTransaction();
   }
   rfRssi=peak;
+  // Stage counts for diagnosis. Each post-processing filter below can empty a burst, and
+  // the failure message ("Too few edges") does not say which one did. With captureDiag on,
+  // every stage reports what it saw and what survived, so a burst that reaches the gates
+  // with transitions but leaves empty names the gate that dropped it.
+  int diagRaw=rawLen, diagAfter75=0, diagAfterToy=0;
+  bool captureDiag = lastCapDiag;
   if(rawLen<16){addLog("  ⚠ Too few edges ("+String(rawLen)+") — likely noise");setLed(0,150,65);return false;}
 
   // Filter sub-75 µs glitches and merge adjacent pulses.
@@ -7572,6 +7725,7 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     if(rawBuf[i]>=75){ rfBuf[rfLen]=rawBuf[i]; rfLvl[rfLen]=lvl?1:0; rfLen++; }
     else if(rfLen>0&&i+1<rawLen){rfBuf[rfLen-1]+=rawBuf[i]+rawBuf[i+1];i++;}
   }
+  diagAfter75=rfLen;
   // Toyota-band secondary noise filter: fold edges 75–149 µs into their neighbours.
   //
   // This used to DROP sub-150 µs pulses (`if(rfBuf[k]>=150) rfBuf[rn++]=...`), which
@@ -7602,6 +7756,11 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     }
     rfLen=rn;
   }
+  diagAfterToy=rfLen;
+  if(captureDiag){
+    addLog("  [DIAG] raw="+String(diagRaw)+" after75="+String(diagAfter75)+
+           " afterToy="+String(diagAfterToy)+" toyBand="+String(_toyBand?"1":"0"));
+  }
   // Level of rfBuf[0] after filtering. Defaults to HIGH only when nothing
   // survived, which callers treat as "no capture".
   rfStartHigh = (rfLen>0) ? (rfLvl[0]!=0) : true;
@@ -7614,6 +7773,7 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     uint32_t cA2=0,cB2=0;
     if(!ks_km2(tmp,rfLen,cA2,cB2)){
       addLog("  ⚠ Incoherent pulses ("+String(rfLen)+" edges) — discarded as noise");
+      if(captureDiag) addLog("  [DIAG] dropped at ks_km2 coherence gate, rfLen="+String(rfLen));
       rfLen=0; setLed(0,150,65); return false;
     }
   }
@@ -7625,6 +7785,7 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     for(int i=0;i<rfLen;i++) totalUs+=rfBuf[i];
     if(totalUs<5000){
       addLog("  ⚠ Burst too short ("+String(totalUs)+" µs total) — likely noise");
+      if(captureDiag) addLog("  [DIAG] dropped at totalUs gate, rfLen="+String(rfLen)+" totalUs="+String(totalUs));
       rfLen=0; setLed(0,150,65); return false;
     }
   }
@@ -10185,10 +10346,15 @@ static void processCommandLine(const String& ln){
   else if(op=="decode"){
     serialEmit(lastDecode.length()>2?lastDecode:"{\"cmd\":\"decode\",\"error\":\"no-data\"}");
   }
-  else if(op=="replay"){
-    bool ok=replayRaw(rfFreq, rfBuf, rfLen, 3, rfStartHigh);
-    serialEmit(String("{\"cmd\":\"replay\",\"ok\":")+( ok?"true":"false")+"}");
-  }
+    else if(op=="replay"){
+      // Pause the sweep across the transmission, as replay_seq and dual_band_replay already
+      // do. scanTick() runs after handleSerial() in loop() and retunes the chip on its own
+      // schedule, so without this a sweep tick can retune the CC1101 out from under the burst.
+      bool wasScanRp=scanActive; scanActive=false;
+      bool ok=replayRaw(rfFreq, rfBuf, rfLen, 3, rfStartHigh);
+      scanActive=wasScanRp;
+      serialEmit(String("{\"cmd\":\"replay\",\"ok\":")+( ok?"true":"false")+"}");
+    }
   else if(op=="replay_predicted"){
     serialEmit(replayPredicted());
   }
@@ -10274,10 +10440,12 @@ static void processCommandLine(const String& ln){
     int n=max(0,(int)(jcmd["n"]|0));
     if(n>=fbkCount){
       serialEmit("{\"cmd\":\"fbk_replay\",\"ok\":false,\"error\":\"idx-out-of-range\",\"count\":"+String(fbkCount)+"}");
-    } else {
-      int gap=(int)(jcmd["gap_ms"]|0); if(gap>0&&gap<=3000) delay(gap);
-      bool ok=replayRaw(fbkBuf[n].freq, fbkBuf[n].w, fbkBuf[n].len, 3, fbkBuf[n].sh);
-      serialEmit(String("{\"cmd\":\"fbk_replay\",\"ok\":")+( ok?"true":"false")+
+      } else {
+        int gap=(int)(jcmd["gap_ms"]|0); if(gap>0&&gap<=3000) delay(gap);
+        bool wasScanFb=scanActive; scanActive=false;
+        bool ok=replayRaw(fbkBuf[n].freq, fbkBuf[n].w, fbkBuf[n].len, 3, fbkBuf[n].sh);
+        scanActive=wasScanFb;
+        serialEmit(String("{\"cmd\":\"fbk_replay\",\"ok\":")+( ok?"true":"false")+
         ",\"idx\":"+String(n)+",\"freq\":"+String(fbkBuf[n].freq,2)+"}");
     }
   }
@@ -10411,7 +10579,9 @@ static void processCommandLine(const String& ln){
     if(rjLen2<8){
       serialEmit("{\"cmd\":\"rolljam_replay\",\"ok\":false,\"error\":\"no-held-code\"}");
     } else {
+      bool wasScanRj=scanActive; scanActive=false;
       bool ok=replayRaw(rjFreq, rjBuf2, rjLen2, 3, rjSh2);
+      scanActive=wasScanRj;
       serialEmit(String("{\"cmd\":\"rolljam_replay\",\"ok\":")+(ok?"true":"false")+
         ",\"len\":"+String(rjLen2)+"}");
     }
@@ -10491,7 +10661,9 @@ static void processCommandLine(const String& ln){
     if(idx<0||idx>=MAX_KEYS||!keys[idx].used){
       serialEmit("{\"cmd\":\"play_key\",\"ok\":false}");
     } else {
+      bool wasScanPk=scanActive; scanActive=false;
       bool ok=replayRaw(keys[idx].freq, keys[idx].data, keys[idx].len, 3, keys[idx].sh);
+      scanActive=wasScanPk;
       serialEmit(String("{\"cmd\":\"play_key\",\"ok\":")+( ok?"true":"false")+",\"i\":"+String(idx)+"}");
     }
   }
@@ -11461,8 +11633,98 @@ static void processCommandLine(const String& ln){
               : String("never reached TX; MARCSTATE was ")+String(lastTxMarcState)+
                 " (19,20=TX  8=CALIBRATE  9-11=SETTLING  22=TXFIFO_UNDERFLOW)"))) +"\"}");
   }
+  // {"cmd":"cap_diag","on":true|false} — per-stage capture diagnostics.
+  // With it on, the next capture logs how many pulses survive each post-processing stage,
+  // so a burst that empties out names the gate that dropped it instead of reporting only
+  // "Too few edges". Off by default: it adds a log line per stage.
+  else if(op=="cap_diag"){
+    if(jcmd.containsKey("on")) lastCapDiag=(bool)jcmd["on"];
+    else lastCapDiag=!lastCapDiag;
+    serialEmit(String("{\"cmd\":\"cap_diag\",\"on\":")+String(lastCapDiag?"true":"false")+"}");
+  }
+  // {"cmd":"rssi_scope","f":315.0,"ms":2000} — what does the edge detector actually see?
+  //
+  // A capture either produces a report or "no-signal", and neither says *why*. This
+  // samples cc_fastRSSI() at the capture loop's own rate for a window and reports the
+  // distribution, the achieved poll rate, and how many excursions crossed a threshold.
+  // That separates "the signal never crossed the threshold" from "it crossed but the
+  // poller was too slow to catch the transitions".
+  //
+  // Receive-only. Pauses the sweep for the duration and restores it.
+  else if(op=="rssi_scope"){
+    bool wasScanS=scanActive; scanActive=false;
+    float f=jcmd.containsKey("f")?(float)jcmd["f"]:315.0f;
+    int ms=(int)(jcmd["ms"]|2000); if(ms<200)ms=200; if(ms>8000)ms=8000;
+    SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+    cc_setFreq(f);
+    cc_strobe(0x36); delay(1); cc_strobe(0x3A); delay(1); cc_strobe(0x34); delay(10);
+    SPI.endTransaction();
+    // settle, then take the floor the same way captureSignal does
+    int lo=999, hi=-999; long sum=0; int n=0;
+    int first[64]; int firstN=0;
+    unsigned long t0=micros();    SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+    while((int)(micros()-t0) < ms*1000){
+      int r=cc_fastRSSI();
+      if(firstN<64) first[firstN++]=r;
+      if(r<lo)lo=r; if(r>hi)hi=r; sum+=r; n++;
+    }
+    SPI.endTransaction();
+    unsigned long elapsed=micros()-t0;
+    // re-enter the shipping capture configuration
+    SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+    cc_strobe(0x36); delay(1); cc_strobe(0x34);
+    SPI.endTransaction();
+    int avg = n? (int)(sum/n) : 0;
+    // Optional explicit threshold, so the host can pass the floor measured in a quiet
+    // window and have this window counted against it. Without it, the threshold is
+    // derived from this window's own mean -- which the signal itself skews, and which
+    // made an earlier version of this command report max=-21 dBm alongside zero
+    // crossings. Measuring the floor and counting crossings must be separate passes.
+    int edge = jcmd.containsKey("thr") ? (int)jcmd["thr"]
+                                        : (avg + ((f>=309.0f&&f<=316.0f)?5:8));
+    int trig = edge + 5;
+    // Count runs, in this same pass, against that threshold. A "run" is a maximal span
+    // of samples on the same side of the threshold; run lengths are what the capture
+    // loop turns into pulses.
+    long runs=0, runsGe100us=0, runsLt100us=0, above=0, maxRun=0;
+    bool st=false, haveSt=false; long runLen=0;
+    SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+    unsigned long t1=micros();
+    while((int)(micros()-t1) < ms*1000){
+      int r=cc_fastRSSI();
+      bool cur=(r>edge);
+      if(!haveSt){ st=cur; haveSt=true; runLen=1; }
+      else if(cur==st){ runLen++; }
+      else {
+        runs++;
+        if(runLen>maxRun) maxRun=runLen;
+        if(runLen>=100) runsGe100us++; else runsLt100us++;
+        st=cur; runLen=1;
+      }
+      if(r>trig) above++;
+    }
+    if(haveSt){ runs++; if(runLen>=100) runsGe100us++; else runsLt100us++; if(runLen>maxRun) maxRun=runLen; }
+    SPI.endTransaction();
+    String s="[";
+    for(int i=0;i<firstN;i++){ if(i)s+=","; s+=String(first[i]); }
+    s+="]";
+    serialEmit(String("{\"cmd\":\"rssi_scope\",\"freq\":")+String(f,2)+
+      ",\"ms\":"+String(ms)+",\"samples\":"+String(n)+
+      ",\"elapsed_us\":"+String((unsigned long)elapsed)+
+      ",\"us_per_sample\":"+String(n?((float)elapsed/n):0.0f,2)+
+      ",\"min\":"+String(lo)+",\"max\":"+String(hi)+",\"avg\":"+String(avg)+
+      ",\"span\":"+String(hi-lo)+
+      ",\"trig\":"+String(trig)+",\"edge\":"+String(edge)+
+      ",\"runs\":"+String(runs)+
+      ",\"runs_ge100us\":"+String(runsGe100us)+
+      ",\"runs_lt100us\":"+String(runsLt100us)+
+      ",\"max_run_samples\":"+String(maxRun)+
+      ",\"above_trig_samples\":"+String(above)+
+      ",\"first64\":"+s+"}");
+    scanActive=wasScanS;
+  }
   // {"cmd":"rx_floor_check"} — is the CC1101 actually in RX when the noise floor is
-  // sampled?
+  // sampled, and is the figure comparable between modulations?
   //
   // Motivated by a real observation: a capture attempt reported
   //     Floor: -100 dBm  Trig: -90 / Edge: -95
@@ -11470,13 +11732,38 @@ static void processCommandLine(const String& ln){
   // CC1101 returns when it is not receiving anything, so every threshold derived from it
   // is wrong by ~35 dB and no fob press can trigger a capture.
   //
-  // The suspect is the order in captureSignal(): it strobes SRX, then writes MDMCFG2 for
-  // FSK, then samples the floor. The datasheet says packet-handling fields should only be
-  // altered in IDLE (line 2853), so the question is whether that write silently drops the
-  // chip out of RX — after which the "noise floor" is measured on an idle radio.
+  // Two suspects were tested and one was eliminated:
+  //
+  //   · Ordering. captureSignal() strobes SRX, then writes MDMCFG2 for FSK, then samples
+  //     the floor. The datasheet says packet-handling fields should only be altered in
+  //     IDLE, so the write might silently drop the chip out of RX. Measured: MARCSTATE
+  //     stays 13 (RX) through the writes. The ordering is not the cause. (The strobes do
+  //     need their settling gaps, which this command now matches captureSignal() on --
+  //     see research/47.)
+  //
+  //   · AGCCTRL2.MAGN_TARGET. This is the cause, and it is not a fault: the same field
+  //     value means different things in OOK and in FSK, because the datasheet gives
+  //     MAGN_TARGET two different tables by modulation. The configuration carries the
+  //     OOK value (3) into FSK, so the FSK figure is a different measurement, not a
+  //     worse one. `magn_target_sweep_fsk` sweeps all eight values and shows the field
+  //     moving the reading across ~15 dB, which is the evidence for that reading.
+  //
+  //     A fourth phase reading the floor with the chip in IDLE (MARCSTATE 5) was tried
+  //     and removed: RSSI is not maintained in IDLE, so the register holds whatever the
+  //     last RX left there and the samples jumped between -86 and -99 on consecutive
+  //     runs. It looked like a clean control and was not one.
+  //
+  // Established: MARCSTATE stays 13 (RX) through the FSK writes, so the chip is
+  // genuinely receiving; and a low FSK floor reflects the AGC target, not an idle
+  // radio. See research/48.
   //
   // This reads MARCSTATE and RSSI at each step, so the answer is measured, not argued.
   else if(op=="rx_floor_check"){
+    // Pause the sweep first. scanTick() runs after handleSerial() in loop() and
+    // retunes/strobes SRX unconditionally, so with the scan active it clobbers this
+    // measurement between the read and the average -- which made three identical runs
+    // return three different floors, and two different verdicts.
+    bool wasScanF=scanActive; scanActive=false;
     auto rssi=[]()->int{
       SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
       int r=cc_fastRSSI();
@@ -11493,9 +11780,12 @@ static void processCommandLine(const String& ln){
       long s=0; for(int i=0;i<n;i++){ s+=rssi(); delayMicroseconds(500); }
       return (int)(s/n);
     };
+    // Settle between strobes, exactly as captureSignal() does. Back-to-back strobes
+    // leave SRX unlanded when MARCSTATE is read, so the chip still reports IDLE (1)
+    // and the "floor" is then sampled on a radio that is not receiving.
     SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
     cc_setFreq(315.0f);
-    cc_strobe(0x36); cc_strobe(0x3A); cc_strobe(0x34); delay(10);
+    cc_strobe(0x36); delay(1); cc_strobe(0x3A); delay(1); cc_strobe(0x34); delay(10);
     SPI.endTransaction();
     int mAfterSrx=marc();
     int fAfterSrx=floorAvg(24);
@@ -11505,9 +11795,29 @@ static void processCommandLine(const String& ln){
     SPI.endTransaction();
     int mAfterFsk=marc();
     int fAfterFsk=floorAvg(24);
+    // Third phase: sweep AGCCTRL2.MAGN_TARGET across all eight values in FSK mode.
+    // The CC1101 gives MAGN_TARGET two different tables, one for OOK/ASK and one for
+    // 2-FSK/GFSK/MSK, so the same field value is not the same target in both modes.
+    // The reference implementation in `reference sources/` states the rule directly:
+    // "MAGN_TARGET for RX filter BW =< 100 kHz is 0x3. For higher RX filter BW's
+    // MAGN_TARGET is 0x7." This board runs a 406 kHz filter with 0x3.
+    String mtSweep="[";
+    for(int mt=0;mt<8;mt++){
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      cc_writeReg(0x1B,(uint8_t)(0x40|mt));   // same MAX_LNA/DVGA bits, MAGN_TARGET=mt
+      SPI.endTransaction();
+      int f=floorAvg(20);
+      if(mt) mtSweep+=",";
+      mtSweep+="{\"mt\":"+String(mt)+",\"floor_dbm\":"+String(f)+"}";
+    }
+    // restore the shipped value before anything else reads it
+    SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+    cc_writeReg(0x1B,0x43);
+    SPI.endTransaction();
+    mtSweep+="]";
     // and with an explicit re-entry into RX afterwards
     SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
-    cc_strobe(0x36); cc_strobe(0x34); delay(10);
+    cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(10);
     SPI.endTransaction();
     int mReSrx=marc();
     int fReSrx=floorAvg(24);
@@ -11520,13 +11830,15 @@ static void processCommandLine(const String& ln){
       "\"after_srx\":{\"marcstate\":"+String(mAfterSrx)+",\"floor_dbm\":"+String(fAfterSrx)+"},"+
       "\"after_fsk_writes\":{\"marcstate\":"+String(mAfterFsk)+",\"floor_dbm\":"+String(fAfterFsk)+"},"+
       "\"after_re_srx\":{\"marcstate\":"+String(mReSrx)+",\"floor_dbm\":"+String(fReSrx)+"},"+
+      "\"magn_target_sweep_fsk\":"+mtSweep+","+
       "\"verdict\":\""+String(mAfterFsk!=13?"FSK_WRITE_DROPS_RX":
          (fAfterFsk<-90?"FLOOR_UNREALISTIC":"OK"))+"\","+
       "\"note\":\""+String(mAfterFsk!=13
         ? "MARCSTATE is not RX (13) after the FSK register writes, so the noise floor is sampled on a radio that is not receiving"
         : (fAfterFsk<-90
-           ? "the chip reports RX but the floor is below -90 dBm, which is not plausible: the RSSI path must be wrong"
+           ? "the chip is in RX, but the floor is read with AGCCTRL2.MAGN_TARGET at its OOK value. That field selects a target from two different tables depending on modulation, so this figure is not comparable with the OOK one -- see magn_target_sweep_fsk"
            : "the chip stays in RX through the FSK writes and the floor is plausible"))+"\"}");
+    scanActive=wasScanF;
   }
   // {"cmd":"rssi_path_check"} — are the two RSSI read paths in agreement?
   //
@@ -11539,9 +11851,15 @@ static void processCommandLine(const String& ln){
   // and why every threshold derived from it is then ~25 dB too high to trigger on a fob.
   // This reads the same register both ways, repeatedly, and reports the pair.
   else if(op=="rssi_path_check"){
+    // Same two faults as rx_floor_check above, and the same fixes: pause the sweep so
+    // scanTick() cannot retune between reads, and settle between strobes so SRX lands
+    // before the RSSI register is sampled. The retune matters most here -- this command
+    // averages 40 paired reads over ~32 ms, which is long enough for a sweep tick to
+    // land in the middle of it.
+    bool wasScanR=scanActive; scanActive=false;
     SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
     cc_setFreq(315.0f);
-    cc_strobe(0x36); cc_strobe(0x34); delay(10);
+    cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(10);
     SPI.endTransaction();
     long fastSum=0, safeSum=0; int nFast=0,nSafe=0;
     int fastMin=999,fastMax=-999,safeMin=999,safeMax=-999;
@@ -11567,6 +11885,7 @@ static void processCommandLine(const String& ln){
       "\"note\":\""+String(diff>=4
         ? "the two read paths differ by 4 dB or more: one of them is not reading the RSSI register correctly, and the noise floor is only as trustworthy as the path that measured it"
         : "both paths agree, so the floor reading is not a read-path artefact")+"\"}");
+    scanActive=wasScanR;
   }
   // {"cmd":"headless","on":true|false}  — start/stop standalone headless scan
   // Omit "on" to toggle.
@@ -11802,6 +12121,19 @@ void setup(){
 
   // ── 3.3 V sensor rail (powers RGB level-shifter) ─────────────────────────
   pinMode(PIN_SENSOR_CE,OUTPUT); digitalWrite(PIN_SENSOR_CE,HIGH); delay(50);
+
+  // ── Park the LoRa module ─────────────────────────────────────────────────
+  // This rail also powers the SX1278, so raising it here brings LoRa up. Nothing on the
+  // normal boot path put it to sleep afterwards: the only loraHardReset() calls are inside
+  // captureSignal(), so between boot and the first capture the module sat powered and
+  // awake, contributing noise to the shared front end.
+  //
+  // Measured effect: the capture noise floor read -101/-102 dBm with LoRa awake and
+  // -112 dBm once parked, and at 700 MHz -- a band nothing consumer uses -- the card fired
+  // captures with NOTHING transmitting, 3 of 3, before the park and 0 of 3 after. The
+  // trigger is floor+10, so those 11 dB moved it from -91 to -102 and the module's own
+  // noise stopped crossing it. See loraParkReset() for the mechanism and the vendor's note.
+  loraParkReset();
 
   // ── Button + CS pins ──────────────────────────────────────────────────────
   pinMode(PIN_BTN,INPUT_PULLUP);
