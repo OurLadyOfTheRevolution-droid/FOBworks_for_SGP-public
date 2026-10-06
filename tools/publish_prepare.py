@@ -423,12 +423,23 @@ _WORKLOG_NUM = re.compile(r"\bworklog[ \t]*`?\d+")
 # comment or a string literal.
 _VERB = r"(?:see|per|from|in|at|via|as|of|to|and|recorded in|noted in|documented in|" \
         r"described in|detailed in|captured in|measured in|analysed in|analyzed in)"
+# A citation phrase can wrap: the verb ends one line and the reference opens the
+# next ("...signature described in\nworklog `13`: the capture..."). A line-by-line
+# pass never sees that pair together, so the verb is left dangling. This pass runs on
+# the whole text first. Its verb set is narrow -- no bare "in"/"at"/"via", which occur
+# constantly in ordinary prose and would let the pattern eat a real word.
+_XVERB = r"(?:see|per|from|of|recorded in|noted in|documented in|described in|" \
+         r"detailed in|captured in|measured in|analysed in|analyzed in|" \
+         r"set out in|listed in|written up in)"
+_XLINE = re.compile(r"\b" + _XVERB + r"[ \t]*\r?\n[ \t]*(?:`?research/\d+`?|worklog[ \t]*`?\d+`?)")
+_XTIDY = re.compile(r"[ \t]+(?=:)")
+
 _SEAMS = [
     # a whole sentence that points at a worklog entry ("research/79 is the full audit.")
     re.compile(r"`?research/\d+`?[ \t]+is\b[^.]*\.[ \t]?"),
     # a whole parenthetical built around a reference, verb prefix or not:
     # "(research/58 §7.2)", "(see research/01, section 1)", "(research/61 N14, research/69)"
-    re.compile(r"\([ \t]*(?:" + _VERB + r"[ \t]+)?research/\d+[^()]*\)[ \t]?"),
+    re.compile(r"\([ \t]*(?:" + _VERB + r"[ \t]+)?(?:research/\d+|worklog[ \t]*`?\d+`?)[^()]*\)[ \t]?"),
     # "worklog `36`" / "worklog 36" -- an id under a different label
     re.compile(r"\bworklog[ \t]*`?\d+`?[ \t]*[.,]?"),
     # `research/24` -- the backticks go with it
@@ -480,6 +491,8 @@ def strip_worklog_refs(src):
     actually contained a reference removes that whole class of bug; unchanged lines
     are returned byte for byte.
     """
+    src = _XLINE.sub("", src)   # citation whose reference wrapped to the next line
+    src = _XTIDY.sub("", src)   # "signature : the" -> "signature: the"
     out = []
     for line in src.split("\n"):
         if "research/" not in line and "worklog" not in line:

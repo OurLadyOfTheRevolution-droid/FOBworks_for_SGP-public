@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Dump every accepted Renault V1 (Hitag2) frame from a capture, in order.
 
-The on-air path is dead on this board (RSSI-edge mode, no GDO0 — see
-), so the real data available is the corpus recording, which carries a
+The on-air path is dead on this board (RSSI-edge mode, no GDO0), so the real data available is the corpus recording, which carries a
 run of consecutive frames as the counter walks. Layer-1 decode is all this needs;
 no epoch search, no crypto, no model assumptions. Compiled from an embedded
 source so it is independent of the firmware.

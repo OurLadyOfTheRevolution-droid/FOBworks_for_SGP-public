@@ -4,8 +4,7 @@
 Why this exists: the corpus regression run found four Kia decoders
 that never fire against 33 on-brand captures each. One of those files,
 `Kia_V1_N1_RAW.sub`, was measured at 807/1611 us against a nominal 400/800 --
-exactly 2.02x and 2.01x. That is the RSSI-quantisation signature described in
-the capture is not in the waveform the decoder models, so the
+exactly 2.02x and 2.01x. That is the RSSI-quantisation signature: the capture is not in the waveform the decoder models, so the
 decoder refuses it correctly.
 
 That was verified on ONE file of 33. This script measures the same property
