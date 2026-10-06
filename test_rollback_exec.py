@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C2 RollBack — executable state-machine test (research/09 §2.1, §5.3).
+"""C2 RollBack — executable state-machine test.
 
 `test_rollback_c2.py` greps the source; this one *runs* the sequencer. It extracts
 the shipped `rbArm` / `rbStart` / `rbTick` from FOBworks_for_SGP.ino verbatim,
@@ -36,10 +36,20 @@ src = SKETCH.read_text(encoding="utf-8")
 
 
 def block(marker: str) -> str:
-    """Return the definition starting at `marker`, brace-matched."""
-    i = src.index(marker)
-    i = src.rindex("\n", 0, i) + 1
-    j = src.index("{", i)
+    """Return the definition starting at `marker`, brace-matched.
+
+    Skips forward declarations (marker lines ending in ';' before the '{'),
+    which sit above the definitions since the N10 consensus work.
+    """
+    pos = 0
+    while True:
+        i = src.index(marker, pos)
+        i = src.rindex("\n", 0, i) + 1
+        j = src.index("{", i)
+        semi = src.find(";", i, j)
+        if semi < 0:
+            break
+        pos = semi + 1
     depth, k = 0, j
     while k < len(src):
         if src[k] == "{":
@@ -68,7 +78,7 @@ pieces = [
     src[src.index("enum RBPhase"):src.index("\n\n// Gap bounds")],
     block("static void rbReset()"),
     block("static bool fbkParseCtr("),
-    # fbkAppend now trims to one frame before storing (research/11 F2), so the trim
+    # fbkAppend now trims to one frame before storing , so the trim
     # helper and its constants must come with it.
     block("static int klTrimToFrame("),
     block("static int rjTrimKiaV34("),
@@ -204,7 +214,7 @@ static void resetAll(){
 }
 
 // Fixtures must now look like two DIFFERENT codes, because rbArm rejects a pair
-// carrying the same counter (research/10 §2.5). Each call assigns the next counter
+// carrying the same counter. Each call assigns the next counter
 // so a normal two-code fixture is accepted, and the width arrays differ by counter
 // so the content-identity fallback also sees them as distinct.
 static void addCode(int len, float mhz, bool sh){
@@ -212,7 +222,7 @@ static void addCode(int len, float mhz, bool sh){
   fbkBuf[fbkCount].ctr=0x1000+(uint32_t)fbkCount;   // 0x1000, 0x1001, ...
   fbkBuf[fbkCount].hasCtr=true;
   // Mark as frame-trimmed. rbArm now gates on this, because a multi-repeat block makes
-  // C2 transmit several presses of each code (research/12 §3 P1). The synthetic-capture
+  // C2 transmit several presses of each code. The synthetic-capture
   // section below sets it from the real trim result instead.
   fbkBuf[fbkCount].trimmed=true;
   for(int i=0;i<len&&i<CAP_SZ;i++) fbkBuf[fbkCount].w[i]=(uint16_t)(400+i+fbkCount);
@@ -353,7 +363,7 @@ int main(){
   printf("  second TX fails with jam active -> stopJam x%d, phase=%d, jamActive=%d\n",
          g_stopJamN, (int)rbPhase, (int)jamActive);
 
-  // ── 4b. Same-code refusal (research/10 §2.5) ────────────────────────────
+  // ── 4b. Same-code refusal ────────────────────────────
   // One press can append two entries, so two entries are NOT two codes. If both
   // carry the same counter, RollBack transmits one code twice and the receiver sees
   // no forward step: the attack fails silently. rbArm must refuse.
@@ -385,7 +395,7 @@ int main(){
   CHECK(rbArm(), "a valid forward counter pair was refused");
   printf("  valid forward pair (0x%X -> 0x%X) -> accepted\n", fbkBuf[0].ctr, fbkBuf[1].ctr);
 
-  // ── 4c. An untrimmed block must be refused (research/12 §2/§3 P1) ───────
+  // ── 4c. An untrimmed block must be refused ───────
   // C2 is only correct for protocols whose captures reduce to one frame. For every
   // other protocol the raw multi-repeat block is kept, and transmitting it sends
   // several presses of each code — a failure the operator cannot see. Refuse instead.
@@ -423,7 +433,7 @@ int main(){
   printf("  after completion: phase=%d armed=%d; fresh arm accepted\n",
          (int)rbPhase, (int)rbArmed);
 
-  // ── 7. The path research/10 §2.6 says was never exercised: a synthetic
+  // ── 7. The path §2.6 says was never exercised: a synthetic
   //       multi-repeat capture pushed through the real append, then arm/fire. ──
   printf("\n=== synthetic multi-repeat capture -> append -> arm -> fire ===\n");
   // Build a capture the way a real one arrives: N repeats of one frame (same
@@ -448,7 +458,7 @@ int main(){
     CHECK(fbkBuf[0].ctr==0x26, "counter parsed as 0x%X, want 0x26", fbkBuf[0].ctr);
     printf("  capture 1 appended: len=%d ctr=0x%X hasCtr=%d\n",
            fbkBuf[0].len, fbkBuf[0].ctr, (int)fbkBuf[0].hasCtr);
-    // The append must store ONE frame, not the raw multi-repeat block (research/11
+    // The append must store ONE frame, not the raw multi-repeat block (
     // F2). CAP_SZ is 512 and one frame is 183, so a stored 512 means the trim was
     // skipped — and C2 would then transmit ~3 presses instead of one.
     CHECK(fbkBuf[0].trimmed, "append did not mark the entry as trimmed");

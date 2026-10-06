@@ -2,14 +2,14 @@
 """Measure the ambient floor at a band before trusting any capture result.
 
 Why this exists: a capture that does not trigger emits no diagnostics, and reading the previous
-capture's decode object makes it look as though one fired. In research/52 and 53 that produced two
+capture's decode object makes it look as though one fired. In that produced two
 contradictory readings of the same setup, and one of them was wrong. Measuring the baseline first
 removes the ambiguity: if ambient captures nothing, any subsequent capture is signal.
 
 Three trials, no transmitter. Reports the floor, whether the trigger fired, and the stage counts.
 
 Drains are bounded by elapsed time. The card streams ticks and heartbeats continuously, so a loop
-that waits for select() to go idle never exits; that fault held the port in research/46 and 52.
+that waits for select to go idle never exits; that fault held the port in
 
 Usage:
     python3 tools/ambient_baseline.py 315.0

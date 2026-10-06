@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the stored-frame import path (research/22 §3) against real capture data.
+"""Verify the stored-frame import path against real capture data.
 
 The blocker this closes: fbkBuf had exactly one writer, the armed live-capture path, and on
 this board that path cannot produce a usable code — RSSI fallback fills the buffer with
@@ -317,6 +317,26 @@ int main(void){
     check('op=="fbk_import"' in src, "the serial import command is registered")
     check("receiveSubReplayBody" in src and "parseSubReplayBody" in src,
           "the import reuses the existing .sub body parser")
+
+    print("\n=== the chunked add reports an empty slice rather than passing silently (61 §2.2) ===")
+    # The one-shot import died on heap while still replying ok:true; the chunked add must
+    # not repeat that class of silent failure. A line that carried a `pulses` field but
+    # staged none has to reply ok:false with a named reason.
+    addm = re.search(r'else if\(op=="fbk_pulses_add"\)\{.*?\n  \}', src, re.S)
+    check(addm is not None, "the fbk_pulses_add handler extracted")
+    if addm:
+        h = addm.group(0)
+        check("emptyAdd" in h and "empty-pulses" in h,
+              "an add that stages zero pulses replies ok:false with reason empty-pulses")
+        check("carried" in h,
+              "the guard distinguishes a carried-but-empty field from an absent one")
+    # And the documented slice size must stay half the measured heap boundary.
+    m96 = re.search(r"up to 9[0-9] pulses", src)
+    check(m96 is None, "no 90s-pulse slice guidance remains in the source")
+    m48 = re.search(r"up to 48 pulses", src)
+    check(m48 is not None, "the source documents 48 pulses per add (half the boundary)")
+    check("48 values" in (ROOT / "README.md").read_text(encoding="utf-8"),
+          "README documents 48 values per add")
 
     print()
     if FAILS:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C2 RollBack checks — guard rails and sequencing (research/04 C2).
+"""C2 RollBack checks — guard rails and sequencing.
 
 C2 transmits: it sends capture 1, waits, then sends capture 2, so the receiver
 re-learns its counter and the code it never heard becomes replayable. That makes
@@ -14,7 +14,7 @@ the guard rails the safety-critical part, and they are what this test pins:
   · it never fires from a scan or a decode
 
 The RF behaviour itself (does a given car actually re-learn?) needs a bench and
-is out of scope for a host test; research/04 lists that under Part 5.
+is out of scope for a host test; lists that under Part 5.
 
 Run: python3 test_rollback_c2.py
 """
@@ -120,7 +120,7 @@ assert "/api/rollback_arm" in ui and "/api/rollback_fire" in ui, \
 print("rollback C2 checks passed")
 
 
-# ── Reset-path jam guard (research/09 §2.2, §5.4) ────────────────────────────
+# ── Reset-path jam guard ────────────────────────────
 # A reset runs no cleanup path, so a jam active when the CPU died can outlive it.
 # That failure is silent and illegal, so it must be defended structurally rather
 # than by asserting the error paths are complete.

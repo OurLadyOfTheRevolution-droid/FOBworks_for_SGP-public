@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare two or more .sub captures of the same press, taken on different devices.
 
-Why this exists: the corpus has been the only input this project has had, and research/38
+Why this exists: the corpus has been the only input this project has had,
 showed its scaling is unreliable -- some Kia captures sit at 2.0x nominal, which is a
 capture-method artefact rather than a property of the fob. A single capture cannot show whether
 whether a strange pulse timebase is the fob or the recorder.

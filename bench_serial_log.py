@@ -2,7 +2,7 @@
 """Bench harness for C1 RollJam / C2 RollBack against real hardware.
 
 C1 has been through five rounds of review and two behavioural suites and has never
-driven a radio (research/12 §3 P3). This logs the card's serial JSON verbatim with
+driven a radio. This logs the card's serial JSON verbatim with
 timestamps and calls out the events that matter for a bench pass — arm, phase
 changes, jam on/off, each capture, and every transmit — so there is evidence the
 sequence actually ran, independent of what the dashboard appeared to show.
@@ -56,7 +56,7 @@ def open_port(path):
     # pulls GPIO0 low and holds the chip in the ROM downloader: the firmware never runs and
     # the card looks dead. Observed directly as boot:0x0 (DOWNLOAD) with the lines alone and
     # boot:0x8 (SPI_FAST_FLASH_BOOT) once RTS was deasserted. Both bench tools had this, which
-    # is why watching the device could itself stop it from booting (research/43 §3).
+    # is why watching the device could itself stop it from booting.
     # Deasserting RTS is also pyserial's default on a normal board, so this is safe either way.
     fcntl.ioctl(fd, termios.TIOCMBIC, struct.pack("I", termios.TIOCM_RTS))
     return fd

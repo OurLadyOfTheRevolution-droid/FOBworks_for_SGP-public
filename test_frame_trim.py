@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""F5 — validate frame trimming against a real capture (research/11 §2 F5).
+"""F5 — validate frame trimming against a real capture.
 
 A capture is not one code. `captureSignal` fills CAP_SZ=512 pulses, and a fob press
 emits its frame repeatedly, so one stored block holds several repeats of the SAME
@@ -39,10 +39,20 @@ src = SKETCH.read_text(encoding="utf-8")
 
 
 def block(marker: str) -> str:
-    """Definition starting at `marker`, brace-matched, keeping a trailing ';'."""
-    i = src.index(marker)
-    i = src.rindex("\n", 0, i) + 1
-    j = src.index("{", i)
+    """Definition starting at `marker`, brace-matched, keeping a trailing ';'.
+
+    Skips forward declarations (marker lines ending in ';' before the '{'),
+    which sit above the definitions since the N10 consensus work.
+    """
+    pos = 0
+    while True:
+        i = src.index(marker, pos)
+        i = src.rindex("\n", 0, i) + 1
+        j = src.index("{", i)
+        semi = src.find(";", i, j)
+        if semi < 0:
+            break
+        pos = semi + 1
     depth, k = 0, j
     while k < len(src):
         if src[k] == "{":
