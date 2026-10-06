@@ -9,7 +9,7 @@ removes the ambiguity: if ambient captures nothing, any subsequent capture is si
 Three trials, no transmitter. Reports the floor, whether the trigger fired, and the stage counts.
 
 Drains are bounded by elapsed time. The card streams ticks and heartbeats continuously, so a loop
-that waits for select to go idle never exits; that fault held the port in
+that waits for select() to go idle never exits; that fault held the port in
 
 Usage:
     python3 tools/ambient_baseline.py 315.0

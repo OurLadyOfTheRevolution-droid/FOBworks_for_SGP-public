@@ -10,7 +10,7 @@ FOBcatch and FOBback are guided transmit sequences. C1 and C2 are their respecti
 
 ## FOBscan
 
-FOBscan is the workbench for capture, sweep, decode, prediction, key management, the signal library, and Bluetooth. These tools are arranged across six tabs.
+FOBscan is the workbench for capture, sweep, decode, prediction, key management, and the signal library. These tools are arranged across six tabs.
 
 **Capture** starts and stops listening, selects OOK or 2FSK, and shows the latest burst. **Scan** cycles through the card's channels or stays on one channel. **Decode** reports the protocol, serial, button, counter, and frame-check result. **Predict** shows the next counter inferred from frames in memory. **Keys** lets you add, test, or clear a saved manufacturer key. **Library** lists captures stored on the card, grouped by protocol and serial.
 
@@ -49,7 +49,7 @@ A standalone FOBworks RAW file contains a short header, frequency, and pulse lis
 
 Key recovery is intended for a KeeLoq fob you own. Press the same button two to five times while the card listens. Recovery checks the built-in table and any keys saved on the card. It keeps a candidate only if every press decrypts to the same serial and button with a counter that advances. A match to a filler pattern in the built-in table is labeled **pattern match**; a saved key is reported separately. If no key matches, recovery reports no match. It does not derive a manufacturer key from a transmission.
 
-The built-in table contains 73 entries. In the corpus used for this project, four Kia decoders have not matched a real capture; 31 of 41 decoders have no match at all, mostly because the corpus contains few gate and garage signals. `tools/corpus_regression.py` reproduces these counts and its header comment records the results.
+The built-in table contains 73 entries. Of this firmware's 44 decoders, 33 have never fired on the corpus, and 258 of 301 captures are matched by none — mostly because the corpus is car fobs while the never-firing set is largely gate and garage protocols (Came, Nice, FAAC, Hörmann, Sommer, and the like). Kia is the exception worth naming: both V1 and V34 match, and after the claim-bug fix the V1 decoder runs on the card as well as in the host harness; the four Kia decoders that still find nothing are V0, V2, V7, and SantaFe. `tools/corpus_regression.py` reproduces these counts and its header comment records the results.
 
 Recovery reports a candidate only when it decrypts two consecutive frames consistently. A single frame is not enough: this check uses 12 bits, so a wrong key may match one frame about once in 4,000 tries. Transmitting a code derived from a wrong key could desynchronize the fob.
 
@@ -69,7 +69,21 @@ The CC1101 cannot jam and listen simultaneously. The sequence drops the carrier 
 
 ## Bluetooth
 
-**Scan** lists advertisements the card can hear. **Pair** opens a short advertising window named `SGP Card Mini` so a phone can bond. **Paired devices** shows the bond list. The card does not expose identity keys.
+Bluetooth is reachable over the HTTP API, not the card dashboard. `GET /api/ble_scan?duration=N` starts a passive advertisement scan of one to thirty seconds and returns immediately; `GET /api/ble_results` polls the list of up to twenty advertisers — MAC address, name, RSSI, service UUIDs, and the first sixteen bytes of manufacturer data. Names and UUIDs are matched against known car-security and smart-lock systems. **Pair** opens a short GATT advertising window named `SGP Card Mini` so a phone can bond (`/api/ble_pair_start`, `/api/ble_pair_status`, `/api/ble_pair_stop`); **Paired devices** lists bonded-device metadata (`/api/ble_paired_devices`). The card does not expose identity keys.
+
+## Diagnostics
+
+Four read-outs run alongside the modes. They are serial and HTTP first; the card's dashboard does not surface them, so reach them over the `{"cmd":…}` path or the matching route.
+
+**Claim trace.** The last eight decodes, newest first, each with the timing it decoded at, the pulse count, the timing spread, which gate ran, and the protocol label it produced. The gate reads `loose` for a bare claim, `gate` for a candidate, `known` for a confirmed decode. This is the view that shows a mis-gated frame next to the timing that produced it. `{"cmd":"claim_trace"}`, `{"cmd":"claim_trace","clear":true}`, or `GET /api/claim_trace`.
+
+**Resync curve.** A receiver's resynchronization window drawn as a curve rather than a single ramp: forward offsets, a backward step, and a replay of an already-seen code. Each probe transmits, then listens after a settle gap; a reply is marked only when the band rises 8 dB over idle for three samples. A body controller that does not acknowledge over RF yields `unknown`, not `reject`, and you can mark a probe by hand after watching the car. `{"cmd":"resync_curve"}`, `{"cmd":"resync_curve_status"}`, `{"cmd":"resync_mark","r":"accept"}`, `GET /api/resync_curve`.
+
+**Parked RollJam watchdog.** With the card parked and listening, this watches the idle noise floor against a fast-attack, slow-decay baseline and looks for the RollJam shape: the floor lifted by a jammer, then two KeeLoq frames from the same fob and button with consecutive counters inside 1.2 s. A passing car keying up is a spike and moves nothing; a jammer held on is a plateau. The score rides along on the next KeeLoq decode as `rolljam_ids`, `rolljam_jam` and `rolljam_floor_db`, and `{"cmd":"p5_ids"}` or `GET /api/p5_ids` reports it directly.
+
+**Hop-XOR strip.** For two same-button KeeLoq hops the XOR is key-independent — it equals the XOR of the two encoded plaintexts, not of the hopping codes — so the Decode tab shows it as a bit strip without recovering a key first. Read it as a fingerprint of two presses, not as a decode.
+
+**Second-radio CW probe.** `{"cmd":"lora_cw_probe"}` keys the SX1278 as a continuous-wave carrier and reads the rise back at the CC1101, measuring how much the second radio lifts the CC1101's own floor. It is a bench measurement, not a mode.
 
 ## A basic capture workflow
 
