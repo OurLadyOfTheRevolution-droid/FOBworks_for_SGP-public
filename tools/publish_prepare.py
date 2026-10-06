@@ -431,8 +431,15 @@ _VERB = r"(?:see|per|from|in|at|via|as|of|to|and|recorded in|noted in|documented
 _XVERB = r"(?:see|per|from|of|recorded in|noted in|documented in|described in|" \
          r"detailed in|captured in|measured in|analysed in|analyzed in|" \
          r"set out in|listed in|written up in)"
-_XLINE = re.compile(r"\b" + _XVERB + r"[ \t]*\r?\n[ \t]*(?:`?research/\d+`?|worklog[ \t]*`?\d+`?)")
-_XTIDY = re.compile(r"[ \t]+(?=:)")
+# The match includes the whitespace before the verb and the optional colon after the
+# reference, so the replacement is the whole separator: a colon when the reference
+# introduced a clause, a single space otherwise. One match, no second pass -- the
+# first cut at this ran a global space-before-colon rule, which flattened every
+# aligned comment header in the sketch ("Version  :" -> "Version:").
+# A parenthetical can open before the wrapped verb: "a (see\nresearch/01) b" removes the
+# whole clause, parens included.
+_XPAREN_LINE = re.compile(r"\([ \t]*(?:" + _XVERB + r")[ \t]*\r?\n[ \t]*(?:`?research/\d+`?|worklog[ \t]*`?\d+`?)[^()\n]*\)[ \t]?")
+_XLINE = re.compile(r"([ \t]+)" + _XVERB + r"[ \t]*\r?\n[ \t]*(?:`?research/\d+`?|worklog[ \t]*`?\d+`?)[ \t]*(:?)")
 
 _SEAMS = [
     # a whole sentence that points at a worklog entry ("research/79 is the full audit.")
@@ -456,9 +463,12 @@ _SEAMS = [
 # move indentation: the run collapse demands a non-space on both sides, so leading
 # whitespace survives and a Python continuation line cannot be reflowed.
 _TIDY = [
+    (re.compile(r"\x01"), ""),                          # marker from the cross-line join
+    (re.compile(r"\([ \t]*(?:see|per|from|of|in|at|via)[ \t]*\)"), ""),  # "(see )" -> gone
     (re.compile(r"\([ \t]*\)"), ""),                # emptied paren, only at a seam
     (re.compile(r"\([ \t]+"), "("),                 # "( §4)" -> "(§4)"
     (re.compile(r"([,;])[ \t]*\)"), r"\1)"),        # "(N14, )" -> "(N14)"
+    (re.compile(r"[ \t]*[—–][ \t]*\)"), ")"),      # "no GDO0 — )" -> "no GDO0)"
     (re.compile(r"^//[ \t]*[.,;][ \t]*"), "// "),   # "// . Measured" -> "// Measured"
     (re.compile(r"^[ \t]*[:;][ \t]+"), ""),           # ": text" at a line start -> "text"
     (re.compile(r"^//[ \t]{2,}"), "// "),           # normalise a comment-only line
@@ -486,25 +496,30 @@ def strip_worklog_refs(src):
     and are left alone, as are real worklog filenames ("research/79_....md").
 
     Every edit is anchored to an actual reference, then tidied only within that line.
-    An earlier draft collapsed parens and spacing across the whole file, which deleted
-    the "()" in a "[](){" lambda and broke the build. Scoping each edit to a line that
-    actually contained a reference removes that whole class of bug; unchanged lines
-    are returned byte for byte.
+    The first cut at this collapsed parens and spacing across the whole file, which
+    deleted the "()" in a "[](){" lambda and broke the build. Tying every edit to a
+    line that actually contains a reference is what stops that from coming back;
+    unchanged lines come back byte for byte.
     """
-    src = _XLINE.sub("", src)   # citation whose reference wrapped to the next line
-    src = _XTIDY.sub("", src)   # "signature : the" -> "signature: the"
+    # a citation whose reference wrapped to the next line; the match spans the
+    # The join can strand punctuation the per-line tidy would otherwise fix ("no
+    # GDO0 — see\nresearch/74)" -> "no GDO0 — )"), but the joined line no longer
+    # contains a reference, so the gate below would skip it. Mark the joined line
+    # with \x01 so it is processed regardless, and drop the marker in _tidy.
+    src = _XPAREN_LINE.sub("", src)
+    src = _XLINE.sub(lambda m: ("\x01:" if m.group(2) else "\x01 "), src)
     out = []
     for line in src.split("\n"):
-        if "research/" not in line and "worklog" not in line:
+        if "\x01" not in line and "research/" not in line and "worklog" not in line:
             out.append(line)
             continue
-        if not (_REF.search(line) or _WORKLOG_NUM.search(line)):
+        if "\x01" not in line and not (_REF.search(line) or _WORKLOG_NUM.search(line)):
             out.append(line)
             continue
         new = line
         for pat in _SEAMS:
             new = pat.sub("", new)
-        if new == line:
+        if new == line and "\x01" not in line:
             out.append(line)      # only path-shaped refs; leave untouched
             continue
         cut = new.find("//")

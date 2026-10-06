@@ -2,13 +2,12 @@
 # Stage the public tree from a git ref, excluding what must not be published, then
 # run the disclosure transform over it.
 #
-# Why a script instead of an rsync of the working tree: the working tree carries
-# untracked third-party material ("reference sources/", cloned Flipper repos and a
-# stray download archive) that is not this project's to publish -- an rsync of the
-# working directory copies it wholesale. Staging from a git ref copies only what is
-# actually tracked. The two files dropped below are the plaintext manufacturer-key
-# corpus and its regression result: the key table is exactly what the transform
-# masks elsewhere, so shipping it would undo the masking.
+# The working tree can't be rsynced out: it holds untracked third-party material
+# ("reference sources/", cloned Flipper repos and a stray download archive) that is
+# not this project's to publish, and an rsync copies it wholesale. A git archive
+# of a ref takes only what is tracked. The two files dropped below are the
+# plaintext manufacturer-key corpus and its regression result: the key table is
+# exactly what the transform masks elsewhere, so shipping it would undo the masking.
 #
 # Usage:  tools/publish_stage.sh <ref> <outdir>     (default: main /tmp/pubtree)
 set -eu
