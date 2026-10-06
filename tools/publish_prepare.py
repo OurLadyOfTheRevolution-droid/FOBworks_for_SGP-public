@@ -70,6 +70,16 @@ def decode(v):
     return rotr((v ^ B) & MASK64, N) ^ A
 
 
+# The Kia/Hyundai V3/V4 manufacturer key, held MASKED for the same reason the sketch holds the
+# table masked: this file ships in the published tree, so writing the value out here would undo
+# the transform it is performing. The plaintext exists only as a computed local. The self-check
+# below re-encodes it, which verifies the inverse without a second copy of the literal.
+_KIA_STORED = 0xCC88E6C23CEC0269
+_KIA_PLAIN = decode(_KIA_STORED)
+assert encode(_KIA_PLAIN) == _KIA_STORED, "the masked Kia key does not invert"
+KIA_PLAIN = f"{_KIA_PLAIN:016X}"
+
+
 ENTRY = re.compile(
     r'(?P<pre>\{\s*"(?P<name>[^"]+)"\s*,\s*0x)(?P<key>[0-9A-Fa-f]{16})'
     r'(?P<post>ULL\s*,\s*[A-Za-z0-9_]+\s*,\s*[01]\s*\})'
@@ -169,7 +179,7 @@ def transform_sketch(src):
         src = src.replace(dup, "", 1)
 
     # 3: the mfrKeys[2] test literal
-    old_lit = "mfrKeys[2] = { 0xA8F5DFFC8DAA5CDBULL,       // Kia V3/V4, from the table"
+    old_lit = f"mfrKeys[2] = {{ 0x{KIA_PLAIN}ULL,       // Kia V3/V4, from the table"
     new_lit = ("mfrKeys[2] = { ks_unmaskMfrKey(0xCC88E6C23CEC0269ULL),  // Kia V3/V4 (masked)")
     if old_lit in src:
         src = src.replace(old_lit, new_lit, 1)
@@ -187,7 +197,7 @@ def transform_sketch(src):
     kia_masked = encode(kia_plain)
     src = src.replace(f"#define KIA_V34_MF_KEY  0x{kia_plain:016X}ULL",
                       f"#define KIA_V34_MF_KEY  0x{kia_masked:016X}ULL", 1)
-    report["KIA_V34_MF_KEY"] = f"0x{kia_plain:016X} -> 0x{kia_masked:016X}"
+    report["KIA_V34_MF_KEY"] = f"masked 0x{kia_masked:016X} (plaintext not printed)"
 
     # 3: wrap each read site
     wrapped = 0
@@ -304,19 +314,24 @@ for line in _corpus.splitlines():'''
     if guard in src:
         src = src.replace(guard, guarded, 1)
 
-    corpus_cmp = '''extra = table_set - corpus_set - {("Kia_V3_V4_OEM", "A8F5DFFC8DAA5CDB", 1)}
+    # The snippet text is Python source being written into another file, so it cannot be an
+    # f-string of our own (it carries its own {sorted(...)} expressions). A placeholder token
+    # followed by a substitution keeps the plaintext out of this tool while the emitted pattern
+    # still matches the development test exactly.
+    _corpus_tmpl = '''extra = table_set - corpus_set - {("Kia_V3_V4_OEM", "@KIA@", 1)}
 assert not extra, f"firmware entries that do not match the corpus: {sorted(extra)}"
 missing = corpus_set - table_set
-assert not missing, f"corpus entries absent from the firmware table: {sorted(missing)}"'''
-    corpus_cmp_guarded = '''if _corpus:
-    extra = table_set - corpus_set - {("Kia_V3_V4_OEM", "A8F5DFFC8DAA5CDB", 1)}
+assert not missing, f"corpus entries absent from the firmware table: {sorted(missing)}"'''.replace("@KIA@", KIA_PLAIN)
+    _corpus_tmpl_guarded = '''if _corpus:
+    extra = table_set - corpus_set - {("Kia_V3_V4_OEM", "@KIA@", 1)}
     assert not extra, f"firmware entries that do not match the corpus: {sorted(extra)}"
     missing = corpus_set - table_set
     assert not missing, f"corpus entries absent from the firmware table: {sorted(missing)}"
 else:
     # Without the corpus there is nothing to compare against, but the table must still hold
     # the expected shape: 73 entries, the public OEM key present, and the mask consistent.
-    assert len(table_set) == 73, f"expected 73 entries, found {len(table_set)}"'''
+    assert len(table_set) == 73, f"expected 73 entries, found {len(table_set)}"'''.replace("@KIA@", KIA_PLAIN)
+    corpus_cmp, corpus_cmp_guarded = _corpus_tmpl, _corpus_tmpl_guarded
     if corpus_cmp in src:
         src = src.replace(corpus_cmp, corpus_cmp_guarded, 1)
 
@@ -359,7 +374,7 @@ PUBLIC_KIA = unmask(_kia_stored)'''
                       kia_derive, 1)
 
     # now replace every remaining literal with the derived form
-    src = src.replace('("Kia_V3_V4_OEM", "A8F5DFFC8DAA5CDB", 1)',
+    src = src.replace(f'("Kia_V3_V4_OEM", "{KIA_PLAIN}", 1)',
                       '("Kia_V3_V4_OEM", f"{PUBLIC_KIA:016X}", 1)')
     return src
 
@@ -375,11 +390,11 @@ def transform_hop_xor(src):
     just before it is compiled. The literal then exists only in the temporary
     build file, never in the repository.
     """
-    if "A8F5DFFC8DAA5CDB" not in src:
+    if KIA_PLAIN not in src:
         return src  # already masked or never had it
 
     # 1. neutralise the literal in the emitted C, leaving a token to substitute.
-    src = src.replace("#define KIA_V34_MF_KEY 0xA8F5DFFC8DAA5CDBULL",
+    src = src.replace(f"#define KIA_V34_MF_KEY 0x{KIA_PLAIN}ULL",
                       "#define KIA_V34_MF_KEY __KIA_ULL__", 1)
 
     # 2. a run-time deriver, dropped in after the imports so Path is available.
@@ -572,7 +587,7 @@ def transform_a2(src_sketch_b64):
     """
     path = ROOT / "research" / "sources" / "a2_kia_v34.py"
     s = path.read_text(encoding="utf-8")
-    plain = "KIA_V34_MF_KEY = 0xA8F5DFFC8DAA5CDB"
+    plain = f"KIA_V34_MF_KEY = 0x{KIA_PLAIN}"
     if plain not in s:
         raise SystemExit("a2_kia_v34.py: plaintext KIA_V34_MF_KEY not found")
     masked = '''# Stored masked, matching the firmware's MFR_KEYS entry (see tools/mask_mfrkeys.py).
@@ -590,7 +605,7 @@ assert (((_re & _M64) ^ _MK_B) & _M64) == _KIA_STORED, "the masked Kia key does 
 
 def scrub_citations(src):
     """The citations name the key in prose. Keep the fact, drop the literal."""
-    plain = "Cross-listed source for the Kia/Hyundai V3/V4 manufacturer key `0xA8F5DFFC8DAA5CDB` used by `ks_decodeKiaV34`"
+    plain = f"Cross-listed source for the Kia/Hyundai V3/V4 manufacturer key `0x{KIA_PLAIN}` used by `ks_decodeKiaV34`"
     safe = ("Cross-listed source for the Kia/Hyundai V3/V4 manufacturer key used by "
             "`ks_decodeKiaV34`")
     return src.replace(plain, safe, 1)
@@ -619,8 +634,13 @@ def main():
     print("  verification           all masked values round-trip; no unwrapped reads")
     _, keys = read_keys(src)
     _, keys2 = read_keys(out)
-    print(f"  round-trip             73/73 keys decode to their originals "
-          f"(sample: 0x{keys2[0]:016X} -> 0x{keys[0]:016X})")
+    # Report the mask -> mask identity, not a plaintext sample: this console output is echoed
+    # into build logs and chat, and the plaintext sample printed here was a second way the key
+    # left the development tree.
+    # No sample value at all: keys[] comes from the development sketch and is the plaintext,
+    # and printing it -- even beside its masked twin -- writes the key into the build log. The
+    # round-trip is already asserted above; the count is all this line needs to say.
+    print("  round-trip             73/73 keys decode to their originals")
 
     if args.check or not args.out:
         print("\n--check: nothing written")
@@ -726,16 +746,17 @@ def main():
               f"(e.g. {', '.join(stripped[:3])}{'…' if len(stripped) > 3 else ''})")
 
     # ── final gate: no plaintext key anywhere in the output tree ────────────
-    # Excludes publish_prepare.py itself: the transform tool necessarily names the literal it
-    # is replacing, so treating it as a leak would make the gate unpassable. It ships as a build
-    # utility and is the one file whose whole purpose is to document the transform.
+    # No exemptions. This earlier excluded publish_prepare.py "so the gate would pass", which
+    # meant the tool's own copy of the key shipped in the published tree and quietly defeated
+    # the transform. The tool now holds the key masked and derives it at run time, so the file
+    # the gate reads contains no plaintext either -- and the gate can scan every file. The
+    # needle is computed from the stored form, so it is not written here either.
+    needle = f"{decode(_KIA_STORED):016X}"
     leaks = []
     for p in Path(args.out).rglob("*"):
-        if p.is_file() and p.suffix in (".py", ".md", ".ino", ".txt"):
-            if p.name == "publish_prepare.py":
-                continue
+        if p.is_file() and p.suffix in (".py", ".md", ".ino", ".txt", ".h", ".cpp", ".sh", ".json"):
             try:
-                if "A8F5DFFC8DAA5CDB" in p.read_text(encoding="utf-8", errors="ignore"):
+                if needle in p.read_text(encoding="utf-8", errors="ignore"):
                     leaks.append(str(p.relative_to(args.out)))
             except OSError:
                 pass

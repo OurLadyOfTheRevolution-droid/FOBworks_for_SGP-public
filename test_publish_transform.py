@@ -177,6 +177,27 @@ def main():
                     found.append(p.name)
         check("planted plaintext key is detected", found == ["leak.md"], str(found))
 
+    print("\n=== the transform tool does not leak the key it is hiding ===")
+    # The tool ships in the published tree. If it holds the plaintext to do a literal
+    # replacement, the masking elsewhere is undone -- the reader only needs the one value.
+    # This happened: publish_prepare.py carried the Kia key in eight places and the final
+    # gate exempted the file "so the gate would pass", which is the same as not having the
+    # gate. The tool now carries the masked constant and derives the plaintext at run time.
+    tool_src = (TOOLS / "publish_prepare.py").read_text(encoding="utf-8")
+    check("publish_prepare.py holds no plaintext Kia key", KIA_HEX not in tool_src)
+    check("publish_prepare.py holds the masked form instead",
+          f"{pp.encode(KIA):016X}" in tool_src)
+    check("the transform's own round-trip still inverts the stored constant",
+          pp.decode(pp.encode(KIA)) == KIA)
+    # A gate with an exemption for the file most likely to carry the key is not a gate. Only
+    # the leak scan must be exemption-free; the scrub and mangled-call passes skip this tool
+    # for reasons of their own and are checked by their output, not here.
+    leak_fn = tool_src[tool_src.index("final gate: no plaintext key anywhere"):
+                       tool_src.index("final gate: no scrub mangled")]
+    check("the final leak gate exempts no file",
+          "continue" not in leak_fn and "p.name" not in leak_fn,
+          "the leak scan must cover every file, including the tool itself")
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
         print("failed:", ", ".join(FAIL))

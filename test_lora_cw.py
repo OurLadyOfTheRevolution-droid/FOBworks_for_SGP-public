@@ -85,9 +85,16 @@ def main():
 #include <cstring>
 struct Write { uint8_t a, v; };
 static Write g_w[32]; static int g_n=0;
-static void loraWriteReg(uint8_t a, uint8_t v){ if(g_n<32){ g_w[g_n].a=a; g_w[g_n].v=v; g_n++; } }
+static uint8_t g_op[8]; static int g_opn=0;   // every RegOpMode write, in order
+static void loraWriteReg(uint8_t a, uint8_t v){
+  if(g_n<32){ g_w[g_n].a=a; g_w[g_n].v=v; g_n++; }
+  if(a==0x01 && g_opn<8) g_op[g_opn++]=v;
+}
 static void loraParkReset(){ if(g_n<32){ g_w[g_n].a=0xFF; g_w[g_n].v=0; g_n++; } }
 static uint8_t find(uint8_t a){ uint8_t v=0xFF; for(int i=0;i<g_n;i++) if(g_w[i].a==a) v=g_w[i].v; return v; }
+static uint8_t loraReadReg(uint8_t a){ return find(a); }
+static void delayMicroseconds(unsigned){ /* settle stubs for the host */ }
+static void delay(unsigned){ }
 """ + (setup or "") + "\n" + (stop or "") + "\n"
 
     body = r"""
@@ -95,15 +102,17 @@ static int recoverFrf(uint32_t frf){ return (int)((double)frf*61.03515625/1e6); 
 int main(void){
   printf("K %f\n", 61.03515625);
   // LF band: 433.92 MHz.
-  g_n=0; loraCwSetup(433.92f, 15);
+  g_n=0; g_opn=0; loraCwSetup(433.92f, 15);
   uint32_t frf=((uint32_t)find(0x06)<<16)|((uint32_t)find(0x07)<<8)|find(0x08);
   printf("FRF_433 %u\n", (unsigned)frf);
   printf("RECOVER_433 %d\n", recoverFrf(frf));
+  printf("NOP_433 %d\n", g_opn);
+  printf("OPSTANDBY_433 %u\n", (unsigned)g_op[1]);
   printf("OP_433 %u\n", (unsigned)find(0x01));
   printf("PA_433 %u\n", (unsigned)find(0x09));
   printf("SLEEP_FIRST %u\n", (unsigned)g_w[0].a);
   // HF band: 868.0 MHz.
-  g_n=0; loraCwSetup(868.0f, 15);
+  g_n=0; g_opn=0; loraCwSetup(868.0f, 15);
   uint32_t frf2=((uint32_t)find(0x06)<<16)|((uint32_t)find(0x07)<<8)|find(0x08);
   printf("FRF_868 %u\n", (unsigned)frf2);
   printf("RECOVER_868 %d\n", recoverFrf(frf2));
@@ -142,10 +151,14 @@ int main(void){
               "433.92 MHz recovers to 434 MHz within the Frf bin")
         check(num("RECOVER_868") is not None and abs(num("RECOVER_868") - 868) <= 1,
               "868.0 MHz recovers to 868 MHz within the Frf bin")
-        check(num("OP_433") == 0x0A,
-              "below 525 MHz the mode word sets LF band + TX (0x0A)")
-        check(num("OP_868") == 0x02,
-              "above 525 MHz the mode word is TX only, HF band (0x02)")
+        check(num("OP_433") == 0x0B,
+              "below 525 MHz the mode word sets LF band + TX, Mode=3 (0x0B)")
+        check(num("OP_868") == 0x03,
+              "above 525 MHz the mode word is TX, Mode=3, HF band (0x03)")
+        check(num("OPSTANDBY_433") == 0x09,
+              "STANDBY (Mode=1) is written before TX, so SLEEP never jumps straight to TX")
+        check(num("NOP_433") is not None and num("NOP_433") >= 3,
+              "RegOpMode is written at least three times: SLEEP, STANDBY, TX")
         check(num("PA_433") is not None and (num("PA_433") & 0x80) == 0x80,
               "the PA is configured for PA_BOOST")
         check(num("SLEEP_FIRST") == 0x01,
