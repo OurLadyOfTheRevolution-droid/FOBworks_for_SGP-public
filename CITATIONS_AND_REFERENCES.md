@@ -1,12 +1,12 @@
 # Citations and references
 
-This list covers the sources used for FOBworks for SGP v3.83, which targets the May 2026 SGP Card Mini. It includes the KeeLoq references, radio and board datasheets, the board's own vendor documentation and firmware, documentation for the WebSocket transport, and the repositories this project drew protocol work from.
+This list covers the sources used for FOBworks for SGP v4.01, which targets the May 2026 SGP Card Mini. It includes the KeeLoq references, radio and board datasheets, the board's own vendor documentation and firmware, documentation for the WebSocket transport, and the repositories this project drew protocol work from.
 
 ## KeeLoq
 
 Three note numbers in the source do not identify a published Microchip KeeLoq document. The table maps each source label to the document relevant to that code path.
 
-**Status (v3.71):** the comments the v3.71 KeeLoq work touched now cite the real notes directly. The three wrong labels below still appear in dated changelog entries and in comments not yet revisited; that cleanup is item F3 in the worklog. This table stays until F3 is finished.
+**Status (v4.01):** the comments the v3.71 KeeLoq work touched now cite the real notes directly, and the fix that replaced the wrong labels in the live encryption and decryption comments landed in v3.61 (the `AN1064` algorithm description, the decrypt path, the mode list). The three wrong labels below still appear in dated changelog entries, which are a record of what past releases said and are kept as written. No live code path cites them.
 
 The firmware's 73-entry manufacturer-key table comes from the public list at `github.com/HiennNek/non-flipper-rolling-code-support` (`keeloq_mfcodes_user`). The source file is not included here because it contains the same keys already present in the firmware. Each entry's learning type (see `enum KLLearn` in the sketch) determines which derivation is used.
 
@@ -70,5 +70,8 @@ Each of these contributed protocol detail that is actually in the firmware; the 
 21. Eisenbarth, Kasper, Moradi, Paar, Salmasizadeh, Manzuri Shalmani, *Physical Cryptanalysis of KeeLoq Code Hopping Applications*, IACR ePrint 2008/058; CRYPTO 2008, LNCS 5157, pp. 203–220. See item 7 above.
 22. Bianchi, Brighente, Conti, Pavan, *SoK: Stealing Cars Since Remote Keyless Entry Introduction and How to Defend From It*, USENIX VehicleSec 2025. Surveys more than 35 attacks and 13 defenses.
 23. *Attacking Automotive RKE Security: How Smart are your 'Smart' Keys?* IACR ePrint 2024/1816. Surveys RollJam and RollBack attacks on Honda, Toyota, Maruti-Suzuki, and Mahindra vehicles.
-24. RfidResearchGroup, *proxmark3*, `tools/hitag2crack/`. `ht2crack4` and `ht2crack5` implement fast-correlation key recovery for Hitag2 and inform the estimate of 4–8 captured pairs.
+24. RfidResearchGroup, *proxmark3*, `tools/hitag2crack/`. `ht2crack4` and `ht2crack5` implement fast-correlation key recovery for Hitag2, and `tools/renault_hitag2_rke_crack.py` is a faithful port of `ht2crack4`. Informs the estimate of 4–8 captured pairs.
+25. Benadjila, Renard, Lopes-Esteves, Kasper, *One Car, Two Frames: Attacks on Hitag-2 Remote Keyless Entry Systems Revisited*, USENIX WOOT 2017. Proves the equivalent-key property that lets the Renault counter-high half be zeroed, so a key equivalent under the unknown high counter bits reproduces the genuine keystream. `tools/renault_hitag2_rke_crack.py` relies on it rather than guessing `CNTRH`, and it is why the attack runs against the five-frame corpus at all.
+26. *Rolling-PWN* — CVE-2021-46145. Covers a rolling-code replay in which a previously seen code is accepted again after a forward jump. The resync curve's replay leg reproduces this against a receiver I own; the note is.
+27. *RollBack* — CVE-2022-37418, and the RollBack mechanism in item 20. Covers acceptance of a code sent *backward* from the expected counter. The resync curve's backward step is this axis.
 

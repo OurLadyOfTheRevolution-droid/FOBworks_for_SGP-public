@@ -93,7 +93,7 @@ When the dashboard is served over **HTTPS**, browsers block the card's plain `ws
 | `CITATIONS_AND_REFERENCES.md` | Sources for the firmware's protocol, board, and radio details. |
 | `LICENSE` | GNU General Public License v3.0. |
 | `bench_*.py` | Serial-side bench helpers: `bench_serial_log.py` logs and filters the card's JSON stream, `bench_send.py` sends commands, `bench_c2_capture.py` drives a capture. |
-| `test_*.py` | 32 host-side checks. See **Tests** below. |
+| `test_*.py` | 41 host-side checks. See **Tests** below. |
 
 This repository contains neither the React dashboard nor its source archive. The connection steps above apply if you have the dashboard source separately and unpack it into `FOBworks_SGP_Dashboard/`. You can flash and use the firmware over Wi-Fi without it; the card serves its own dashboard.
 
@@ -128,13 +128,13 @@ Libraries: Adafruit NeoPixel 1.12 or newer, ArduinoJson 7.x. SD, SPI, Wire, Pref
 
 Open `FOBworks_for_SGP.ino` from this folder and upload it to the SGP Card Mini. Keep `loop_stack.cpp` beside it; otherwise, the build will not link.
 
-Current build: **57% flash, 49% RAM.**
+Current build: **58% flash, 49% RAM.**
 
 ## First run
 
 Plug the card into USB and open the serial log at 115200 baud to get the Wi-Fi credentials and access code. Then join `SGP Card Mini` and open `http://192.168.4.1`. If you have the separate React dashboard, you can connect it to the card instead.
 
-The home screen offers four modes: FOBscan, FOBclone, FOBcatch, and FOBback. FOBscan contains the Capture, Scan, Decode, Predict, Keys, Library, and Bluetooth tabs. See `PROMO.md` for an overview of each mode.
+The home screen offers four modes: FOBscan, FOBclone, FOBcatch, and FOBback. FOBscan's tabs are Capture, Scan, Decode, Predict, Keys, and Library. Bluetooth scanning and pairing are reached over the HTTP API rather than through the card dashboard: `GET /api/ble_scan`, `GET /api/ble_results`, and the `/api/ble_pair_start`, `/api/ble_pair_status`, `/api/ble_pair_stop`, and `/api/ble_paired_devices` routes. See `PROMO.md` for an overview of each mode.
 
 Serial commands are JSON and carry the same access code:
 
@@ -158,11 +158,13 @@ The mode commands include `capture`, `decode`, `replay`, `replay_predicted`, `re
 
 **Diagnostics:** `rssi_path_check`, `rx_floor_check`, `tx_fifo_test`, `pa_check`, `jam_status`, `gdo0_probe`, `gdo0_isolate`, `gdo0_rail_test`, and `gdo0_signal`. The GDO0 set exists because this board does **not** route the CC1101's GDO0 to a readable GPIO. `gdo0_signal` is the decisive one: it cuts the LoRa's power so the SX1278's DIO0 is gone, then asks the CC1101 to emit its crystal clock on GDO0 and counts edges on pin 48 — the only test that can tell "unrouted" apart from "the LoRa was masking it". It is documented in **Hardware limits** below.
 
+**Instrumentation:** `claim_trace` (with `clear`) reports the last eight decodes — timing, gate, spread, and the protocol each claimed — and `GET /api/claim_trace` serves the same. `resync_curve`, `resync_curve_status`, `resync_mark`, and `resync_curve_clear` drive the resync-window profiler (`GET /api/resync_curve`). `p5_ids` arms, clears, or reports the parked RollJam watchdog (`GET /api/p5_ids`). `lora_cw_probe` keys the SX1278 as a continuous-wave carrier and measures the rise at the CC1101. The hop-XOR strip appears on each KeeLoq decode as `hop_xor`.
+
 **Maintenance:** `hs_list`, `hs_clear`, `headless`, `freq_preset`, and `fobclone_scan`. `GET /api/reinit` reinitializes the radio; it does not regenerate credentials.
 
 ## Tests
 
-The 34 Python test suites run on the host; they do not require the card or a network connection. Depending on the test, they inspect or extract code from the firmware, compile state-machine logic against a mock radio, or check recorded captures. `test_serial_fuzz.py` additionally drives the card over USB when one is attached; `python3 test_serial_fuzz.py host` runs its source-level half alone.
+The 41 Python test suites run on the host; they do not require the card or a network connection. Depending on the test, they inspect or extract code from the firmware, compile state-machine logic against a mock radio, or check recorded captures. `test_serial_fuzz.py` additionally drives the card over USB when one is attached; `python3 test_serial_fuzz.py host` runs its source-level half alone.
 
 ```bash
 cd FOBworks_for_SGP
@@ -204,6 +206,12 @@ for t in test_*.py; do python3 "$t"; done
 | `test_hop_xor.py` | Hop-XOR telemetry: the XOR of two same-button KeeLoq hops equals `E(ptA)^E(ptB)` and is order-symmetric (the property that makes rollback validation key-independent); ring wrap order stays oldest-first |
 | `test_brute_tick.py` | The brute sequencers: arming bounds, the counter/address sequence built in order, one transmit per tick with the inter-frame delay, single-flight refusal, progress and done events, `ok:false` on a failed transmit — and a source check that neither route blocks any more |
 | `test_ws_fuzz.py` | The WebSocket transport's intake: host-only structural checks (frame cap replies `ws-frame-too-long`, the `{` gate, drop-on-full queue, reply generation+auth guards, handshake/close), plus a stdlib WebSocket client that drives the same adversarial corpus the serial suite uses. Live pass is hardware-gated (`--ap`/`--host`); the client itself is verified against `tools/_ws_echo_server.py`. |
+| `test_claim_trace.py` | Live claim trace: the shipped eight-deep ring against the real ArduinoJson the sketch builds with — wrap order, newest-first render, an unclaimed decode carrying no protocol key, and the spread field being the shipped `ks_teStddev` as a percentage |
+| `test_resync_curve.py` | Resync curve profiler: probe-plan generation (forward, backward, replay), the RF reply threshold (`RC_REPLY_DB` over the idle floor for `RC_REPLY_HITS` samples), hand-mark overrides, and separate accept/reject/unknown accounting that never folds silence into a rejection |
+| `test_p5_ids.py` | Parked RollJam watchdog: the fast-attack, slow-decay floor tracker (a passing spike moves nothing, a sustained lift clears the threshold), the press-pair window and button/counter checks, and the score-to-JSON shape |
+| `test_lora_cw.py` | SX1278 second-radio CW path: the `Frf` register carrier math at 433.92 and 868.0 MHz, the LF/HF mode bit, `PA_BOOST`, and the safe power-down order |
+| `test_renault_rke_crack.py` | The Hitag2 correlation attack: the ported proxmark3 `ht2crack4` recovers synthetic keys, the cipher matches the paper's vectors, and the corpus's five consecutive Trafic frames are scored at the attack's measured floor |
+| `test_publish_transform.py` | The publication transform in `tools/publish_prepare.py`: the key table is masked and every read is unwrapped, no masked value equals its plaintext, the Kia literal is gone from the transformed sketch, the tidy rule preserves zero-argument calls (the regression that once shipped a check which could not fail), every suite asserting on a private worklog is in the gate list, and the final leak gate fires on a planted key |
 
 ## Hardware limits on this revision
 

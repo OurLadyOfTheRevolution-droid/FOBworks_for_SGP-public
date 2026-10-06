@@ -465,7 +465,14 @@ _SEAMS = [
 _TIDY = [
     (re.compile(r"\x01"), ""),                          # marker from the cross-line join
     (re.compile(r"\([ \t]*(?:see|per|from|of|in|at|via)[ \t]*\)"), ""),  # "(see )" -> gone
-    (re.compile(r"\([ \t]*\)"), ""),                # emptied paren, only at a seam
+    # Emptied grouping parens, only at a seam. The negative lookbehind is the point:
+    # an empty paren run directly after an identifier is a zero-argument CALL
+    # ("doc.exists()", "time.time()", "x.sort()"), and deleting those two characters
+    # leaves a valid-looking reference to the function instead of its result. That is
+    # how "check(\"research/86 present\", doc.exists())" became "doc.exists", which is
+    # always truthy, so the check passed on a tree where the file was absent. Empty
+    # grouping parens only ever follow a space, a bracket, or the line start.
+    (re.compile(r"(?<![A-Za-z0-9_)\]])\([ \t]*\)"), ""),
     (re.compile(r"\([ \t]+"), "("),                 # "( §4)" -> "(§4)"
     (re.compile(r"([,;])[ \t]*\)"), r"\1)"),        # "(N14, )" -> "(N14)"
     (re.compile(r"[ \t]*[—–][ \t]*\)"), ")"),      # "no GDO0 — )" -> "no GDO0)"
@@ -646,13 +653,19 @@ def main():
                          encoding="utf-8")
         print(f"wrote {hdest}")
 
-    # Two suites assert a private worklog exists and read findings out of it. The
-    # worklogs are not published, so their note checks must skip rather than fail
-    # a fresh clone -- the same treatment test_keeloq_key_table.py already gives
-    # the private key corpus.
+    # Suites that assert a private worklog exists and then read findings out of it.
+    # The worklogs are not published, so their note checks must skip rather than
+    # fail a fresh clone -- the same treatment test_keeloq_key_table.py already
+    # gives the private key corpus. This list is not optional: a suite with a
+    # "research/NN present" check that is NOT listed here has its check line
+    # scrubbed as prose, and the empty-paren tidy then eats the "()" in the
+    # assertion beside it, leaving a call that passes no matter what. That is how
+    # test_renault_rke_crack.py first shipped green on the public tree while
+    # checking nothing.
     for name, num, name_var in [
         ("test_gdo0_audit.py", 79, "NOTE"),
         ("test_renault_layer2.py", 78, "doc"),
+        ("test_renault_rke_crack.py", 86, "doc"),
     ]:
         wdest = Path(args.out) / name
         if wdest.is_file():
@@ -732,6 +745,40 @@ def main():
             print(f"  {l}")
         return 1
     print("final gate: no plaintext key anywhere in the published tree")
+
+    # ── final gate: no scrub mangled a live expression ──────────────────────
+    # A check that asserts a private worklog exists is prose to a reader, so the
+    # scrub removes the reference -- and if the line also carried a zero-argument
+    # call, an over-eager tidy could take the "()" with it. The result compiles,
+    # runs, and passes while checking nothing, which is the worst failure mode a
+    # publication step has. Scan the published Python for the shape that produces it:
+    # a value-passing call whose argument is a bare function reference rather than a
+    # call or a comparison. Cheap to run, and it fails loudly instead of publishing a
+    # test that cannot fail.
+    mangled = []
+    for p in Path(args.out).rglob("*.py"):
+        if p.name == "publish_prepare.py":
+            continue
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for i, line in enumerate(text.splitlines(), 1):
+            # A value-passing call whose last argument is a bare DOTTED name with no
+            # call and no operator: "check(\"present\", doc.exists)". A literal
+            # ("... , False") or a comparison ("check(needle in src, why)") is normal
+            # and must not be flagged, so the argument has to carry a dot and no paren.
+            m = re.search(r",\s*([A-Za-z_]\w*\.[A-Za-z_]\w*)\s*\)\s*$", line)
+            if m and "check(" in line:
+                mangled.append(f"{p.relative_to(args.out)}:{i}: {line.strip()[:70]}")
+    if mangled:
+        print("\nFINAL GATE FAILED -- a scrub looks to have eaten a call's parentheses:")
+        for l in mangled:
+            print(f"  {l}")
+        print("  Refusing to publish a check that would always pass. Add the affected "
+              "file to the worklog-gate list in main() if it asserts on a worklog.")
+        return 1
+    print("final gate: no scrub-mangled call sites in the published tree")
     return 0
 
 
