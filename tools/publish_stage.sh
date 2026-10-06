@@ -24,4 +24,12 @@ find "$OUT/research" -maxdepth 1 -name '*.md' -delete 2>/dev/null || true
 rm -f "$OUT/research/sources/keeloq_mfcodes_public.txt"
 rm -f "$OUT/research/sources/corpus_regression_result.json"
 
+# tools/mask_mfrkeys.py and the published .gitignore live only on the publish and
+# public branches, so they are not in a main archive. Carry them over when that
+# ref is available; the published .gitignore also documents what is not shipped.
+if git -C "$HERE" rev-parse --verify --quiet publish >/dev/null; then
+    git -C "$HERE" show publish:tools/mask_mfrkeys.py > "$OUT/tools/mask_mfrkeys.py"
+    git -C "$HERE" show publish:.gitignore > "$OUT/.gitignore"
+fi
+
 python3 "$HERE/tools/publish_prepare.py" --out "$OUT"
