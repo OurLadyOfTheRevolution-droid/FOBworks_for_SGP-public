@@ -42,8 +42,9 @@ FUNCS = [
     "static bool ks_kiaV34Validate(KiaV34Frame& f){",
     "static inline uint32_t ks_kiaV34BuildPlain(uint8_t btn,uint32_t serial,uint16_t ctr){",
     "static inline bool ks_kiaV34IsPulse(uint32_t v,uint32_t ref){",
-    "static uint16_t ks_kiaV34PwmAt(const uint32_t* buf,int n,int off,char* bits){",
-    "static uint16_t ks_kiaV34Pwm(const uint32_t* buf,int n,char* bits){",
+    "static bool ks_kiaV34IsSync(uint32_t v){",
+    "static uint16_t ks_kiaV34PwmAt(const uint32_t* buf,int n,int off,int parityHigh,",
+    "static uint16_t ks_kiaV34Pwm(const uint32_t* buf,int n,char* bits,bool* outV3){",
     "static void ks_kiaV34BitsToBytes(const char* bits,int nb,uint8_t out[9]){",
     "static bool ks_decodeKiaV34(const uint32_t* buf,int cnt,KiaV34Frame& out){",
 ]
@@ -174,7 +175,7 @@ static int writeSub(const char* path, uint32_t serial, uint8_t btn, uint16_t ctr
   pay[8] = 0;   // CRC nibble; the reference never validates it
 
   char bits[80]; int k=0;
-  for(int i=0;i<72;i++) bits[k++] = ((pay[i/8] >> (7-(i%8))) & 1) ? '1':'0';
+  for(int i=0;i<68;i++) bits[k++] = ((pay[i>>3] >> (7-(i&7))) & 1) ? '1':'0';
   bits[k]=0;
 
   // PWM levels: V4 leads low, V3 leads high. Flipper RAW stores a signed
@@ -187,16 +188,20 @@ static int writeSub(const char* path, uint32_t serial, uint8_t btn, uint16_t ctr
   fprintf(f,"Preset: FuriHalSubGhzPresetOok650Async\n");
   fprintf(f,"Protocol: RAW\n");
 
-  long vals[4096]; int m=0;
+  long vals[8192]; int m=0;
   for(int r=0;r<repeats;r++){
-    // 12 preamble pairs of short+short.
+    // Preamble: 12 short+short pairs, HIGH then LOW.
     for(int i=0;i<12;i++){ vals[m++]=(long)KIA_V34_TE_SHORT; vals[m++]=-(long)KIA_V34_TE_SHORT; }
-    for(int i=0;i<72;i++){
-      long a = (bits[i]=='1') ? (long)KIA_V34_TE_SHORT : (long)KIA_V34_TE_LONG;
-      long b = (bits[i]=='1') ? (long)KIA_V34_TE_LONG  : (long)KIA_V34_TE_SHORT;
-      // V4: low first (negative then positive). V3: high first.
-      if(!v3){ vals[m++]= -a; vals[m++]=  b; }
-      else   { vals[m++]=  a; vals[m++]= -b; }
+    // Sync. Its level encodes the version and must land on an even (HIGH) index,
+    // so V3 (LOW sync) needs a HIGH filler pulse ahead of it. 1188us sits inside
+    // ks_kiaV34IsSync's 1000-1500 window.
+    if(v3){ vals[m++]=(long)KIA_V34_TE_SHORT; vals[m++]=-1188; }
+    else  { vals[m++]=1188; vals[m++]=-(long)KIA_V34_TE_SHORT; }
+    // Data: one bit per HIGH pulse (short -> 0, long -> 1), each followed by a
+    // LOW that carries nothing. 68 bits = 64 payload + 4 CRC.
+    for(int i=0;i<68;i++){
+      uint32_t hi = (bits[i]=='1') ? KIA_V34_TE_LONG : KIA_V34_TE_SHORT;
+      vals[m++]=(long)hi; vals[m++]=-(long)KIA_V34_TE_SHORT;
     }
   }
   for(int i=0;i<m;i++){
@@ -234,7 +239,8 @@ static int scanDir(const char* dir){
     if(n<10){ continue; }
     parsed++;
     static char bits[CAP_SZ/2+1];
-    uint16_t nb=ks_kiaV34Pwm(pw,n,bits);
+    bool v3hint=false;
+    uint16_t nb=ks_kiaV34Pwm(pw,n,bits,&v3hint);
     if(nb>=KIA_V34_MIN_BITS) reached68++;
     KiaV34Frame o;
     if(ks_decodeKiaV34(pw,n,o)){

@@ -212,6 +212,7 @@ for t in test_*.py; do python3 "$t"; done
 | `test_lora_cw.py` | SX1278 second-radio CW path: the `Frf` register carrier math at 433.92 and 868.0 MHz, the LF/HF mode bit, `PA_BOOST`, the safe power-down order, and the corrected state-machine sequence — STANDBY is written before TX so SLEEP never jumps straight to TX, and the mode word is TX (Mode=3) rather than FSTX |
 | `test_renault_rke_crack.py` | The Hitag2 correlation attack: the ported proxmark3 `ht2crack4` recovers synthetic keys, the cipher matches the paper's vectors, and the corpus's five consecutive Trafic frames are scored at the attack's measured floor |
 | `test_publish_transform.py` | The publication transform in `tools/publish_prepare.py`: the key table is masked and every read is unwrapped, no masked value equals its plaintext, the Kia literal is gone from the transformed sketch, the tidy rule preserves zero-argument calls (the regression that once shipped a check which could not fail), every suite asserting on a private worklog is in the gate list, and the final leak gate fires on a planted key |
+| `test_flipper_pull.py` | The Flipper SD puller (`tools/flipper_pull.py`): the listing parser reads `[D]`/`[F] name <n>b` entries without mistaking the echoed command for a directory, `storage read` framing is stripped back to the exact payload, a short read is rejected rather than kept, and the payload is clipped to the size the listing reported. The live half walks the attached card and skips cleanly when none is present |
 
 ## Hardware limits on this revision
 
