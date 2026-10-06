@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v4.01
+// Version  : FOBworks for SGP v4.02
 // Board    : May 2026 stock, ESP32-S3-MINI-1-N8, 8 MB flash, no PSRAM
 // Radio    : CC1101, OOK and 2FSK, 300–928 MHz
 // Dashboard: http://192.168.4.1; per-device Wi-Fi credentials are printed over USB
@@ -195,6 +195,39 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
   // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+  // v4.02 (2026-10-06) — The SX1278 second-radio bench run. The P2 CW
+  //   probe had never produced a trustworthy number; the reason was four defects in
+  //   the probe itself, not the radio, and each was caught by a readback rather than
+  //   by the measurement looking wrong.
+  //
+  //   [FIX] lora_cw_probe raised the sensor rail but never released PIN_LORA_RST,
+  //   which loraParkReset() holds LOW since v3.82 — and a chip held in reset does
+  //   not answer SPI, so every register write went nowhere and RegOpMode read back
+  //   0x08. lora_sleep_check had already solved this by releasing reset before its
+  //   reads; the CW path now does the same, with a RegVersion (0x42) control so
+  //   "no chip answering" cannot be read as "the write failed".
+  //
+  //   [FIX] The CW mode word was 0x02, which is FSTX (Mode bits 0x07: SLEEP 0,
+  //   STANDBY 1, FSTX 2, TX 3) — synthesiser on, PA off. And it wrote SLEEP -> TX
+  //   directly, which the state machine rejects; the datasheet order is
+  //   SLEEP -> STANDBY -> TX. Both are corrected, and RegOpMode is read back after
+  //   the STANDBY write and after the TX write so a future failure says which step
+  //   failed. A 2 ms settle before each readback matters: reading on the next SPI
+  //   word returns the mode being left, not the one entered.
+  //
+  //   [FIX] The probe's floor helper applied the capture path's clamp,
+  //   `if(v>-60) v=-75`, which pinned every jammed reading to -75 and made the
+  //   isolation sweep look flat across offset and power. The clamp is right when a
+  //   floor only sets a threshold and wrong when the floor is the measurement; the
+  //   probe now reports the raw level and flags when the meter is pegged.
+  //
+  //   [RESULT] With the instrument honest: listen 433.92, SX1278 CW at 433.92+off,
+  //   the CC1101 floor rises +63 dB at 0 offset, +66 at 300 kHz, +53 at 1 MHz, and
+  //   is still +18 at 8 MHz; it reaches noise at 12 MHz. Power is irrelevant (2 and
+  //   15 behave the same), and lora_power_floor shows the rise is the PA, not the
+  //   chip: awake-but-idle moves the floor 1 dB. A two-radio RollJam on this PCB is
+  // not marginal, it does not work. See for the table and the control.
+  //
   // v4.01 (2026-10-06) — Kia V1 was silent on hardware even though it decoded in the
   //   host harness. The import path proved the frame reaches the card unchanged
   //   (te_us=807, ratio 1.99 — the exact 800/1600 the reference specifies), yet the
@@ -1863,7 +1896,7 @@ struct RcProbe { int16_t off; uint8_t kind, reply; int8_t mark; };
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v4.01"
+#define FW_VER        "FOBworks for SGP v4.02"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
@@ -3403,7 +3436,20 @@ static void loraParkReset(){
 // module is re-parked on every exit path. Continuous jamming is a legal problem
 // and stays behind the same explicit arming the jam path uses.
 #define LORA_CW_MAX_MS 5000
-static void loraCwSetup(float mhz, uint8_t pwr){
+// CW setup, and the two things the first bench run got wrong.
+//
+// `loraCwSetup` is also called with a readback hook: `opStandby`/`opTx` are filled with
+// RegOpMode after the STANDBY write and after the TX write, so a bench run can see WHICH
+// transition failed instead of only that the final readback was not TX.
+//
+// Bug 1 — the mode word was 0x02. Mask 0x07 (Mode) means SLEEP 0, STANDBY 1, FSTX 2, TX 3,
+// so 0x02 was FSTX: the synthesiser runs, the PA stays off, and nothing is emitted. TX is 3,
+// so with the LF band bit that is 0x0B below 525 MHz and 0x03 above.
+// Bug 2 — it went SLEEP -> TX in one write. The datasheet state machine only allows
+// SLEEP -> STANDBY -> TX (or SLEEP -> STANDBY -> FSTX -> TX), so the direct write was
+// ignored: RegOpMode read back 0x08, the LF bit set with Mode still SLEEP. Going through
+// STANDBY first is the sequence the datasheet section 4.1.4 describes.
+static void loraCwSetup(float mhz, uint8_t pwr, uint8_t* opStandby=nullptr, uint8_t* opTx=nullptr){
   // Frf = f_Hz / 61.03515625 (32 MHz / 2^19), datasheet §4.1.2.
   uint32_t frf=(uint32_t)(((double)mhz * 1.0e6) / 61.03515625);
   loraWriteReg(0x01, 0x00);                       // SLEEP (must be first)
@@ -3413,9 +3459,20 @@ static void loraCwSetup(float mhz, uint8_t pwr){
   loraWriteReg(0x09, (uint8_t)(0x80|0x70|(pwr&0x0F))); // PA_BOOST, MaxPower=7
   loraWriteReg(0x0A, 0x09);                       // RegPaRamp: 40 us
   loraWriteReg(0x0B, 0x2B);                       // RegOcp: on, 100 mA
-  // FSK/OOK (LongRangeMode=0, ModType=00), LF band bit for <525 MHz, Mode=TX.
-  uint8_t op = (uint8_t)(0x02 | ((mhz < 525.0f) ? 0x08 : 0x00));
-  loraWriteReg(0x01, op);
+  // FSK/OOK (LongRangeMode=0, ModType=00), LF band bit for <525 MHz. STANDBY first: the
+  // state machine does not go SLEEP -> TX.
+  uint8_t band = (uint8_t)((mhz < 525.0f) ? 0x08 : 0x00);
+  loraWriteReg(0x01, (uint8_t)(0x01 | band));     // STANDBY
+  // A mode transition is not instantaneous, and reading RegOpMode on the next SPI word
+  // catches the state the chip is leaving, not the one it is entering: the first bench run
+  // of this sequence read back 0x08 after a STANDBY write and 0x0A after a TX write, one
+  // mode behind in both cases, while the floor rise showed the PA was in fact on. Settle
+  // before each readback so the value reported is the state, not the tail of the previous one.
+  delayMicroseconds(2000);
+  if(opStandby) *opStandby = loraReadReg(0x01);
+  loraWriteReg(0x01, (uint8_t)(0x03 | band));     // TX (Mode=3); empty FIFO, so it is a carrier
+  delayMicroseconds(2000);
+  if(opTx) *opTx = loraReadReg(0x01);
 }
 // Park after a CW burst: SLEEP first so the PA powers down, then RST low.
 static void loraCwStop(){
@@ -14037,18 +14094,48 @@ static void processCommandLine(const String& ln){
       cc_setFreq(f); cc_strobe(0x36); delay(1); cc_strobe(0x34); delay(10);
       long s=0; for(int i=0;i<24;i++){ s+=cc_fastRSSI(); delayMicroseconds(500); }
       SPI.endTransaction();
-      int v=(int)(s/24); if(v>-60) v=-75;
-      return v;
+      // NO clamp here, deliberately. The capture path substitutes -75 when the average
+      // exceeds -60 "because a fob was transmitting", which is fine when you want a floor to
+      // set a threshold from, and wrong when the floor IS the measurement: it pinned every
+      // jammed reading to exactly -75 regardless of offset or power, so the sweep looked flat
+      // and the true rise was hidden. Report the raw mapped average instead; cc_fastRSSI tops
+      // out near -74 dBm (r=255 -> (255-256)/2-74), so a reading at or above that is the meter
+      // saturating, not a measured level, and is reported as such.
+      return (int)(s/24);
     };
     // rail up (it powers both radios), SX1278 out of reset
     pinMode(PIN_SENSOR_CE,OUTPUT); digitalWrite(PIN_SENSOR_CE,HIGH); delay(60);
+    // Release reset before any register write. Since v3.82 the module is PARKED with RST
+    // held LOW (loraParkReset), and a chip held in reset does not answer SPI at all —
+    // lora_rst_check reads RegVersion 0x12 with RST high and 0x00 with it low. The first
+    // bench run of this probe omitted this line and read RegOpMode back as 0x08 (SLEEP with
+    // the LF bit) on every trial: the writes had nowhere to land because the part was in
+    // reset, not because the sequence was wrong. lora_sleep_check() already releases reset
+    // for exactly this reason; this is the same fix in the CW path.
+    pinMode(PIN_LORA_RST,OUTPUT); digitalWrite(PIN_LORA_RST,HIGH); delay(12);
     int fQuiet=ccFloorAt();
     // Hold CW on the SX1278 and re-read the CC1101 beside it.
     SPI.beginTransaction(SPISettings(1000000,MSBFIRST,SPI_MODE0));
-    loraCwSetup(fj,pwr);
-    uint8_t opmode=loraReadReg(0x01);      // confirm the mode write landed
+    // CONTROL: RegVersion (0x42) is 0x12 on a live SX1278. Without it a 0x00 RegOpMode
+    // readback is ambiguous — an unpowered, unclocked, or absent chip returns 0x00 too — so
+    // the mode check below could not tell "the write failed" from "there is no chip here".
+    // Same validate-the-instrument habit that caught the earlier probe faults.
+    uint8_t loraVer=loraReadReg(0x42);
+    uint8_t opStandby=0, opTx=0;
+    loraCwSetup(fj,pwr,&opStandby,&opTx);
+    uint8_t opmode=opTx;                   // the TX readback is the one that matters
     SPI.endTransaction();
     delay(ms);
+    // Read the mode AGAIN at the end of the window. An FSK transmitter with an EMPTY FIFO has
+    // no payload to clock out, so the chip can underrun and leave TX on its own after a few
+    // milliseconds. If that happens, `rise_db` depends on whether the floor average lands
+    // inside that brief window or after it — which is exactly the run-to-run spread seen on
+    // the bench (the same sequence read +16 dB once and -1 dB on later runs with TX confirmed
+    // at the start both times). This readback separates "the PA never came on" from "the PA
+    // came on and then dropped out", which the start-only readback could not.
+    SPI.beginTransaction(SPISettings(1000000,MSBFIRST,SPI_MODE0));
+    uint8_t opEnd=loraReadReg(0x01);
+    SPI.endTransaction();
     int fJam=ccFloorAt();
     // Stop and re-park; captureSignal expects the module parked.
     SPI.beginTransaction(SPISettings(1000000,MSBFIRST,SPI_MODE0));
@@ -14060,17 +14147,28 @@ static void processCommandLine(const String& ln){
     int rise = fJam - fQuiet;
     serialEmit(String("{\"cmd\":\"lora_cw_probe\",\"listen_mhz\":")+String(f,3)+
       ",\"jam_mhz\":"+String(fj,3)+",\"off_khz\":"+String(off,1)+
-      ",\"pwr\":"+String((int)pwr)+",\"ms\":"+String(ms)+
+      ",\"pwr\":"+String((int)pwr)+      ",\"ms\":"+String(ms)+
+      ",\"lora_version_reg\":"+String((int)loraVer)+
+      ",\"opmode_standby\":"+String((int)opStandby)+
       ",\"opmode_readback\":"+String((int)opmode)+
+      ",\"opmode_end\":"+String((int)opEnd)+
       ",\"floor_quiet_dbm\":"+String(fQuiet)+
       ",\"floor_jam_dbm\":"+String(fJam)+
       ",\"rise_db\":"+String(rise)+
-      ",\"verdict\":\""+String(rise>=15?"SELF_JAM_HIGH":(rise<=6?"ISOLATED":"PARTIAL"))+"\""+
-      ",\"note\":\""+String(opmode!=0x02&&opmode!=0x0A&&opmode!=0x12
-        ? "RegOpMode did not read back in TX (bit1 clear): the mode write did not land, so rise_db is not a jammer measurement"
-        : (rise>=15 ? "the CC1101 floor rose hard while the SX1278 transmitted: it cannot listen while the second radio is on, so a two-radio RollJam on this PCB means the jammer must be off-band enough or time-sliced"
+      ",\"meter_pegged\":"+String((fJam>=-12)?"true":"false")+
+      ",\"verdict\":\""+String(loraVer!=0x12?"NO_CHIP"
+        :((opmode&0x07)!=0x03?"NOT_TX":(rise>=15?"SELF_JAM_HIGH":(rise<=6?"ISOLATED":"PARTIAL"))))+"\""+
+      ",\"note\":\""+String(loraVer!=0x12
+        ? "RegVersion did not read 0x12, so the SX1278 is not answering SPI: check the sensor rail and the reset line before reading anything into rise_db"
+        : ((opmode&0x07)!=0x03
+        ? ((opStandby&0x07)!=0x01
+          ? "RegOpMode read back in neither STANDBY nor TX, so the SLEEP->STANDBY step did not land and rise_db is not a jammer measurement"
+          : "RegOpMode reached STANDBY but not TX (Mode bits are not 3), so the PA is off and rise_db is not a jammer measurement")
+        : ((opEnd&0x07)!=0x03
+          ? "RegOpMode was TX at the start of the window and no longer TX at the end: with an empty FIFO the chip underran and left TX on its own, so the carrier lasted only part of the window and rise_db understates the transmitted rise"
+          : (rise>=15 ? "the CC1101 floor rose hard while the SX1278 transmitted: it cannot listen while the second radio is on, so a two-radio RollJam on this PCB means the jammer must be off-band enough or time-sliced"
           : (rise<=6 ? "the CC1101 still hears its own band while the SX1278 transmits: the two-radio RollJam pairing looks viable here; confirm against a real fob at 1 m with an external receiver hearing only the jammer"
-           : "the rise is between: workable but marginal, and a real-fob SNR measurement is needed to call it")))+"\"}");
+           : "the rise is between: workable but marginal, and a real-fob SNR measurement is needed to call it")))))+"\"}");
     scanActive=wasScanC;
   }
   // {"cmd":"agc_tilt"} — which register makes the noise floor tilt with frequency?

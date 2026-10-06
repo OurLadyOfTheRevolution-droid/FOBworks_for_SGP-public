@@ -85,6 +85,8 @@ Four read-outs run alongside the modes. They are serial and HTTP first; the card
 
 **Second-radio CW probe.** `{"cmd":"lora_cw_probe"}` keys the SX1278 as a continuous-wave carrier and reads the rise back at the CC1101, measuring how much the second radio lifts the CC1101's own floor. It is a bench measurement, not a mode.
 
+**What the bench measured.** Run against the card with the two radios side by side, the second radio is not usable as an off-band jammer. Keyed at 433.92 MHz it lifts the CC1101's floor by more than 60 dB on-channel and is still 18 dB up at 8 MHz away; the two radios share a rail and a ground plane, so the coupling is the PA operating into the neighbouring front end, not a distant signal. The probe and the control (`lora_power_floor`) are what establish that, and
+
 ## A basic capture workflow
 
 1. Connect the SGP Card Mini over USB and read the access code from the serial log at 115200 baud.
