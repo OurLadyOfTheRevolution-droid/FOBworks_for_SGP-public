@@ -43,6 +43,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SKETCH = ROOT / "FOBworks_for_SGP.ino"
 TEST_KEELOQ = ROOT / "test_keeloq_key_table.py"
+TEST_HOP_XOR = ROOT / "test_hop_xor.py"
 
 # Must match tools/mask_mfrkeys.py.
 A = 0x5A5A5A5A5A5A5A5A
@@ -363,6 +364,170 @@ PUBLIC_KIA = unmask(_kia_stored)'''
     return src
 
 
+def transform_hop_xor(src):
+    """Adapt test_hop_xor.py for the published variant.
+
+    The live-crypto harness inside it defines the Kia OEM key in plaintext (the
+    fob it builds is a real Kia frame, so the cipher it drives the firmware's
+    XOR telemetry with has to use the real key). A published tree must not carry
+    the literal, so the literal is removed from the file and the value is derived
+    at run time from the sketch's masked constant and injected into the C source
+    just before it is compiled. The literal then exists only in the temporary
+    build file, never in the repository.
+    """
+    if "A8F5DFFC8DAA5CDB" not in src:
+        return src  # already masked or never had it
+
+    # 1. neutralise the literal in the emitted C, leaving a token to substitute.
+    src = src.replace("#define KIA_V34_MF_KEY 0xA8F5DFFC8DAA5CDBULL",
+                      "#define KIA_V34_MF_KEY __KIA_ULL__", 1)
+
+    # 2. a run-time deriver, dropped in after the imports so Path is available.
+    prelude = '''# The Kia OEM key is public, but a published tree does not write it out. Derive it
+# from the masked constant the sketch ships and inject it into the C harness at compile
+# time, so the literal lives only in the temporary build file, never in this repo.
+def _kia_literal():
+    import re as _re
+    _s = (Path(__file__).resolve().parent / "FOBworks_for_SGP.ino").read_text(encoding="utf-8")
+    assert "static inline uint64_t ks_unmaskMfrKey(uint64_t v){" in _s, \\
+        "the unmask helper is missing from the sketch"
+    _k = int(_re.search(r"#define KIA_V34_MF_KEY\\s+0x([0-9A-Fa-f]{16})ULL", _s).group(1), 16)
+    _x = (_k ^ 0x3C3C3C3C3C3C3C3C) & 0xFFFFFFFFFFFFFFFF
+    _k = ((((_x >> 13) | (_x << (64 - 13))) & 0xFFFFFFFFFFFFFFFF) ^ 0x5A5A5A5A5A5A5A5A)
+    return f"0x{_k:016X}ULL"
+
+'''
+    marker = "from pathlib import Path\n"
+    if marker in src:
+        src = src.replace(marker, marker + "\n" + prelude, 1)
+    else:
+        src = prelude + src
+
+    # 3. substitute at the one write site that builds the encryption harness.
+    src = src.replace(
+        "tp.write_text(harness + body)",
+        'tp.write_text((harness + body).replace("__KIA_ULL__", _kia_literal()))', 1)
+    return src
+
+
+# A worklog reference is an id after "research/" that is NOT a real path.
+# "research/79_GDO0_HARDWARE_AUDIT.md" names a file a reader can open and stays;
+# a bare "research/79" points into a file that is not published and goes. The
+# lookahead blocks the path form (an id directly followed by ".<ext>").
+_REF   = re.compile(r"research/(?:\d+)(?!\d*[0-9A-Za-z_]*\.\w)")
+_WORKLOG_NUM = re.compile(r"\bworklog[ \t]*`?\d+")
+
+# Ordered, most-specific first. Each pattern consumes a reference together with the
+# connective tissue that would otherwise be left dangling. Nothing here matches bare
+# code, so no edit can land in the wrong place: a reference only ever appears in a
+# comment or a string literal.
+_VERB = r"(?:see|per|from|in|at|via|as|of|to|and|recorded in|noted in|documented in|" \
+        r"described in|detailed in|captured in|measured in|analysed in|analyzed in)"
+_SEAMS = [
+    # a whole sentence that points at a worklog entry ("research/79 is the full audit.")
+    re.compile(r"`?research/\d+`?[ \t]+is\b[^.]*\.[ \t]?"),
+    # a whole parenthetical built around a reference, verb prefix or not:
+    # "(research/58 §7.2)", "(see research/01, section 1)", "(research/61 N14, research/69)"
+    re.compile(r"\([ \t]*(?:" + _VERB + r"[ \t]+)?research/\d+[^()]*\)[ \t]?"),
+    # "worklog `36`" / "worklog 36" -- an id under a different label
+    re.compile(r"\bworklog[ \t]*`?\d+`?[ \t]*[.,]?"),
+    # `research/24` -- the backticks go with it
+    re.compile(r"`[ \t]*research/\d+(?:_[A-Za-z0-9_]*\.\w+)?[ \t]*`[ \t]?"),
+    # research/46 and 52 / research/48 and /49 / research/60, research/61
+    re.compile(r"research/\d+[ \t]*(?:,|and|/|&)[ \t]*/?[ \t]*(?:research/)?\d+[ \t]*[.,]?"),
+    # "recorded in research/78." / "per research/04" -- verb and connector included
+    re.compile(r"\b" + _VERB + r"[ \t]+research/\d+[ \t]*[.,]?"),
+    # a bare token, swallowing a trailing period or comma
+    re.compile(r"research/\d+[ \t]*[.,]?"),
+]
+
+# Cleanup that is safe ONLY on a line an edit actually touched, and that can never
+# move indentation: the run collapse demands a non-space on both sides, so leading
+# whitespace survives and a Python continuation line cannot be reflowed.
+_TIDY = [
+    (re.compile(r"\([ \t]*\)"), ""),                # emptied paren, only at a seam
+    (re.compile(r"\([ \t]+"), "("),                 # "( §4)" -> "(§4)"
+    (re.compile(r"([,;])[ \t]*\)"), r"\1)"),        # "(N14, )" -> "(N14)"
+    (re.compile(r"^//[ \t]*[.,;][ \t]*"), "// "),   # "// . Measured" -> "// Measured"
+    (re.compile(r"^[ \t]*[:;][ \t]+"), ""),           # ": text" at a line start -> "text"
+    (re.compile(r"^//[ \t]{2,}"), "// "),           # normalise a comment-only line
+    (re.compile(r"[ \t]+\.(?=\s|$)"), "."),      # "telemetry ." -> "telemetry."
+    (re.compile(r"([,;])[ \t]*(?=[,;])"), r"\1"),   # ", ," -> ","
+    (re.compile(r",[ \t]*\)"), ")"),              # "(v3.95,)" -> "(v3.95)"
+    (re.compile(r"[ \t]+([:;])"), r"\1"),         # "closure :" -> "closure:"
+    (re.compile(r"(?<=\S)[ \t]{2,}(?=\S)"), " "),   # internal double space only
+]
+
+
+def _tidy(span):
+    for pat, rep in _TIDY:
+        span = pat.sub(rep, span)
+    return span.rstrip()
+
+
+def strip_worklog_refs(src):
+    """Remove references to the private worklog from a published file.
+
+    The worklog holds this project's design notes; it is not published. Source
+    comments, test docstrings, and a few user-facing runtime strings cite entries by
+    number. Those pointers dangle for a public reader, so they come out uniformly
+    rather than only in the README. "research/sources/..." paths are shipped fixtures
+    and are left alone, as are real worklog filenames ("research/79_....md").
+
+    Every edit is anchored to an actual reference, then tidied only within that line.
+    An earlier draft collapsed parens and spacing across the whole file, which deleted
+    the "()" in a "[](){" lambda and broke the build. Scoping each edit to a line that
+    actually contained a reference removes that whole class of bug; unchanged lines
+    are returned byte for byte.
+    """
+    out = []
+    for line in src.split("\n"):
+        if "research/" not in line and "worklog" not in line:
+            out.append(line)
+            continue
+        if not (_REF.search(line) or _WORKLOG_NUM.search(line)):
+            out.append(line)
+            continue
+        new = line
+        for pat in _SEAMS:
+            new = pat.sub("", new)
+        if new == line:
+            out.append(line)      # only path-shaped refs; leave untouched
+            continue
+        cut = new.find("//")
+        if cut >= 0:              # code line: tidy the comment only, keep the code
+            out.append(new[:cut] + _tidy(new[cut:]))
+        else:                     # prose, docstring, or a string-literal line
+            out.append(_tidy(new))
+    s = "\n".join(out)
+    m = _REF.search(s)
+    if m:
+        raise SystemExit("worklog reference survived the strip: "
+                         + s[max(0, m.start() - 40):m.end() + 20])
+    return s
+
+
+def transform_worklog_gate(src, path, num, name_var):
+    """Make a test's worklog-presence checks skip cleanly on the published tree.
+
+    Two suites assert a private worklog file exists and then read findings out of
+    it. The worklogs are deliberately not published, so on the public tree those
+    checks would fail a fresh clone for the wrong reason. This mirrors what
+    test_keeloq_key_table.py already does for the private key corpus: skip the
+    check when the fixture is absent, and say so, rather than fail.
+    """
+    present = f'    check("research/{num} present", {name_var}.exists())\n'
+    guard = f'    if {name_var}.exists():\n'
+    if present + guard not in src:
+        raise SystemExit(f"worklog gate block not found in {path}")
+    skip = (f'    # research/{num} is a private worklog and is not published; skip its note checks\n'
+            f'    # when it is absent so a fresh clone still gets a green suite.\n'
+            f'    if not {name_var}.exists():\n'
+            f'        print("  research/{num} note: skipped (worklog not published)")\n'
+            f'    else:\n')
+    return src.replace(present + guard, skip, 1)
+
+
 def transform_a2(src_sketch_b64):
     """Adapt research/sources/a2_kia_v34.py: it carries the Kia key in plaintext.
 
@@ -446,6 +611,28 @@ def main():
         tdest.write_text(tsrc, encoding="utf-8")
         print(f"wrote {tdest}")
 
+    # test_hop_xor.py carries the Kia key in its live-crypto harness
+    hdest = Path(args.out) / "test_hop_xor.py"
+    if hdest.is_file():
+        hdest.write_text(transform_hop_xor(TEST_HOP_XOR.read_text(encoding="utf-8")),
+                         encoding="utf-8")
+        print(f"wrote {hdest}")
+
+    # Two suites assert a private worklog exists and read findings out of it. The
+    # worklogs are not published, so their note checks must skip rather than fail
+    # a fresh clone -- the same treatment test_keeloq_key_table.py already gives
+    # the private key corpus.
+    for name, num, name_var in [
+        ("test_gdo0_audit.py", 79, "NOTE"),
+        ("test_renault_layer2.py", 78, "doc"),
+    ]:
+        wdest = Path(args.out) / name
+        if wdest.is_file():
+            wdest.write_text(
+                transform_worklog_gate(wdest.read_text(encoding="utf-8"), name, num, name_var),
+                encoding="utf-8")
+            print(f"wrote {wdest} (worklog note checks skip when absent)")
+
     # the a2 helper carries the key in plaintext too
     adest = Path(args.out) / "research" / "sources" / "a2_kia_v34.py"
     if adest.is_file():
@@ -460,6 +647,42 @@ def main():
         if after != before:
             cdest.write_text(after, encoding="utf-8")
             print(f"wrote {cdest} (literal removed)")
+
+    # README prose must not point at the private worklog either
+    rdest = Path(args.out) / "README.md"
+    if rdest.is_file():
+        before = rdest.read_text(encoding="utf-8")
+        after = strip_worklog_refs(before)
+        if after != before:
+            rdest.write_text(after, encoding="utf-8")
+            n = before.count("research/") - after.count("research/")
+            print(f"wrote {rdest} ({n} worklog pointer(s) removed)")
+
+    # ...nor may any other published text file. The tests cite entries in their
+    # docstrings, the tools in their comments, and a couple of firmware runtime
+    # strings carry one into the dashboard. Strip them uniformly so the public
+    # tree has no dangling pointer anywhere, not just at the front door.
+    stripped = []
+    for p in sorted(Path(args.out).rglob("*")):
+        if not p.is_file() or p.name == "publish_prepare.py":
+            continue
+        if p.suffix not in (".py", ".md", ".ino", ".h", ".cpp", ".txt", ".json"):
+            continue
+        try:
+            before = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "research/" not in before and "worklog" not in before:
+            continue
+        if not (_REF.search(before) or _WORKLOG_NUM.search(before)):
+            continue
+        after = strip_worklog_refs(before)
+        if after != before:
+            p.write_text(after, encoding="utf-8")
+            stripped.append(str(p.relative_to(args.out)))
+    if stripped:
+        print(f"stripped worklog refs from {len(stripped)} file(s) "
+              f"(e.g. {', '.join(stripped[:3])}{'…' if len(stripped) > 3 else ''})")
 
     # ── final gate: no plaintext key anywhere in the output tree ────────────
     # Excludes publish_prepare.py itself: the transform tool necessarily names the literal it

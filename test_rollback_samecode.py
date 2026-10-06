@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""C2 same-code rejection — the fix for research/10 §2.5.
+"""C2 same-code rejection — the fix for §2.5.
 
 `rbArm` required two *entries* but not two different *codes*. One fob press can
 append two entries (the capture loop fills 512 pulses over several seconds, and a
@@ -42,9 +42,17 @@ src = SKETCH.read_text(encoding="utf-8")
 
 
 def block(marker: str) -> str:
-    i = src.index(marker)
-    i = src.rindex("\n", 0, i) + 1
-    j = src.index("{", i)
+    # Skips forward declarations (marker lines ending in ';' before the '{'),
+    # which sit above the definitions since the N10 consensus work.
+    pos = 0
+    while True:
+        i = src.index(marker, pos)
+        i = src.rindex("\n", 0, i) + 1
+        j = src.index("{", i)
+        semi = src.find(";", i, j)
+        if semi < 0:
+            break
+        pos = semi + 1
     depth, k = 0, j
     while k < len(src):
         if src[k] == "{":
@@ -59,7 +67,7 @@ def block(marker: str) -> str:
 
 # ── Static: the pieces exist and are wired ──────────────────────────────────
 assert "uint32_t ctr; bool hasCtr;" in src, "FbkEntry does not carry a counter"
-# FbkEntry also carries `trimmed`, which rbArm gates on (research/12 §3 P1).
+# FbkEntry also carries `trimmed`, which rbArm gates on.
 assert "bool trimmed; };" in src, "FbkEntry does not carry the trimmed flag"
 assert "static int fbkCtrOrder()" in src, "fbkCtrOrder missing"
 assert "static bool fbkParseCtr(" in src, "fbkParseCtr missing"
@@ -115,7 +123,7 @@ static int fbkCount=0;
 // is irrelevant here).
 static bool armWouldAccept(){
   if(fbkCount<2) return false;
-  if(!fbkBuf[0].trimmed||!fbkBuf[1].trimmed) return false;   // the research/12 gate
+  if(!fbkBuf[0].trimmed||!fbkBuf[1].trimmed) return false;   // the gate
   int ord=fbkCtrOrder();
   if(ord<0) return false;
   if(ord==0){

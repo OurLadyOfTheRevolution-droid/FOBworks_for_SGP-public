@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression test for the Toyota reachability defect (research/40).
+"""Regression test for the Toyota reachability defect.
 
 `ks_decodeToyota` fired on 12 foreign captures -- Ford, Tesla, Kia, VW -- while decoding
 NONE of its own 62 Toyota/Lexus captures. Two causes, both measured:
@@ -39,10 +39,21 @@ src = SKETCH.read_text(encoding="utf-8")
 
 
 def block(marker: str) -> str:
-    """Definition starting at `marker`, brace-matched."""
-    i = src.index(marker)
-    i = src.rindex("\n", 0, i) + 1
-    j = src.index("{", i)
+    """Definition starting at `marker`, brace-matched.
+
+    Skips forward declarations (marker lines ending in ';' before the '{'),
+    which sit above the definitions since the N10 consensus work — otherwise a
+    decl would make the brace scan start inside the NEXT declaration.
+    """
+    pos = 0
+    while True:
+        i = src.index(marker, pos)
+        i = src.rindex("\n", 0, i) + 1
+        j = src.index("{", i)
+        semi = src.find(";", i, j)
+        if semi < 0:
+            break                     # a real definition: '{' before any ';'
+        pos = semi + 1                # was a declaration; take the next match
     depth, k = 0, j
     while k < len(src):
         if src[k] == "{":

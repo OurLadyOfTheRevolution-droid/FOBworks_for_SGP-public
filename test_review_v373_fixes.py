@@ -138,7 +138,7 @@ assert '+",\\"id\\":\\""+idStr' not in src, \
 
 # ── no published doc may point at something this tree does not contain ──────────────────────
 # Two stale pointers survived earlier rounds: CITATIONS named the key corpus (deliberately not
-# published) and `research/04` (the worklog, not published). A reader cannot open either.
+# published) and (the worklog, not published). A reader cannot open either.
 # This checks the PUBLISHED docs against the PUBLISHED file list.
 #
 # Scope notes, learned from the first version of this check: only the files this branch actually

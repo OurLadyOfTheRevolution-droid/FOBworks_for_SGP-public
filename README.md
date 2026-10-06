@@ -1,6 +1,6 @@
 # FOBworks for SGP
 
-FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 3.82.
+FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 4.01.
 
 This build targets the SGP Card Mini stock acquired in May 2026: an ESP32-S3-MINI-1-N8 with a dual-core LX7 at 240 MHz, 8 MB quad flash, no PSRAM, Wi-Fi 802.11 b/g/n, and BLE 5. The sub-GHz radio is the onboard CC1101, using OOK and 2FSK across the 39 channels listed in the sketch between 300–348, 387–464, and 779–928 MHz. The board also has a Ra-02 SX1278 LoRa module. GPIO 48 is connected to the SX1278's DIO0; the CC1101's GDO0 is not routed to a readable GPIO. Resetting or sleeping the SX1278 does not provide a CC1101 data connection. GPIO 26 is reserved on the PCB for a future SX1262 and is unused. The MAX17048 fuel gauge is at I2C address `0x36`. Kept decodes are written to the microSD card as FOBworks RAW files, which the dashboard can read back. The firmware accepts CC1101 version-register values `0x04` and `0x14`; the detected value appears in the status chip.
 
@@ -93,7 +93,7 @@ When the dashboard is served over **HTTPS**, browsers block the card's plain `ws
 | `CITATIONS_AND_REFERENCES.md` | Sources for the firmware's protocol, board, and radio details. |
 | `LICENSE` | GNU General Public License v3.0. |
 | `bench_*.py` | Serial-side bench helpers: `bench_serial_log.py` logs and filters the card's JSON stream, `bench_send.py` sends commands, `bench_c2_capture.py` drives a capture. |
-| `test_*.py` | 16 host-side checks. See **Tests** below. |
+| `test_*.py` | 32 host-side checks. See **Tests** below. |
 
 This repository contains neither the React dashboard nor its source archive. The connection steps above apply if you have the dashboard source separately and unpack it into `FOBworks_SGP_Dashboard/`. You can flash and use the firmware over Wi-Fi without it; the card serves its own dashboard.
 
@@ -128,7 +128,7 @@ Libraries: Adafruit NeoPixel 1.12 or newer, ArduinoJson 7.x. SD, SPI, Wire, Pref
 
 Open `FOBworks_for_SGP.ino` from this folder and upload it to the SGP Card Mini. Keep `loop_stack.cpp` beside it; otherwise, the build will not link.
 
-Current build: **56% flash, 45% RAM.**
+Current build: **57% flash, 49% RAM.**
 
 ## First run
 
@@ -150,19 +150,19 @@ The mode commands include `capture`, `decode`, `replay`, `replay_predicted`, `re
 
 **Key recovery:** `key_recover_start`, `key_recover_cancel`, `key_probe`, and `key_recover_offline`. The last command takes a comma-separated hop list and runs recovery without the radio.
 
-**FOBback / RollBack:** `fbk_arm`, `fbk_disarm`, `fbk_status`, `fbk_replay`, and `fbk_import`. The import command accepts a FOBworks RAW file or `.sub` capture body and loads a stored frame into the replay buffer for testing without a live capture. It searches the full body and returns `no-frame-in-body` if it finds no frame.
+**FOBback / RollBack:** `fbk_arm`, `fbk_disarm`, `fbk_status`, `fbk_replay`, and `fbk_import`. The import command accepts a FOBworks RAW file or `.sub` capture body and loads a stored frame into the replay buffer for testing without a live capture. It searches the full body and returns `no-frame-in-body` if it finds no frame. Over serial, a large body should arrive in chunks: `fbk_pulses_begin` (with `freq`), then `fbk_pulses_add` with `pulses` slices of up to 48 values (each line stays ~240 bytes, half the measured heap boundary), then `fbk_pulses_end` to run the import over the assembled body. The one-shot `fbk_import` form is heap-bound near ~130 pulses. An add that carries a `pulses` field but stages none replies `ok:false` with `reason:"empty-pulses"` rather than passing silently.
 
 **C2 RollBack:** `rollback_arm`, `rollback_fire`, and `rollback_status`. Sends two held codes in order, with a configurable gap.
 
 **C1 RollJam:** `rolljam_arm`, `rolljam_start`, `rolljam_abort`, `rolljam_status`, and `rolljam_replay`.
 
-**Diagnostics:** `rssi_path_check`, `rx_floor_check`, `tx_fifo_test`, `pa_check`, `jam_status`, and `gdo0_probe`. The GDO0 probe is useful because this board does **not** route the CC1101's GDO0 to a readable GPIO. See **Hardware limits** below.
+**Diagnostics:** `rssi_path_check`, `rx_floor_check`, `tx_fifo_test`, `pa_check`, `jam_status`, `gdo0_probe`, `gdo0_isolate`, `gdo0_rail_test`, and `gdo0_signal`. The GDO0 set exists because this board does **not** route the CC1101's GDO0 to a readable GPIO. `gdo0_signal` is the decisive one: it cuts the LoRa's power so the SX1278's DIO0 is gone, then asks the CC1101 to emit its crystal clock on GDO0 and counts edges on pin 48 — the only test that can tell "unrouted" apart from "the LoRa was masking it". It is documented in **Hardware limits** below.
 
 **Maintenance:** `hs_list`, `hs_clear`, `headless`, `freq_preset`, and `fobclone_scan`. `GET /api/reinit` reinitializes the radio; it does not regenerate credentials.
 
 ## Tests
 
-The 16 Python test suites run on the host; they do not require the card or a network connection. Depending on the test, they inspect or extract code from the firmware, compile state-machine logic against a mock radio, or check recorded captures.
+The 34 Python test suites run on the host; they do not require the card or a network connection. Depending on the test, they inspect or extract code from the firmware, compile state-machine logic against a mock radio, or check recorded captures. `test_serial_fuzz.py` additionally drives the card over USB when one is attached; `python3 test_serial_fuzz.py host` runs its source-level half alone.
 
 ```bash
 cd FOBworks_for_SGP
@@ -183,22 +183,42 @@ for t in test_*.py; do python3 "$t"; done
 | `test_limit_strings.py` | Every `max_bytes` string equals its constant; one buffer per purpose |
 | `test_raw_polarity.py` | Capture polarity survives export and replay |
 | `test_a2_reporting.py` | The Kia V3/V4 verdict is not overstated; duplicates collapse |
+| `test_decoder_false_positives.py` | Decoder guards against cross-brand false positives on the corpus |
+| `test_toyota_reachability.py` | The Toyota decoder fires on its own captures, not only foreign ones |
 | `test_review_v373_fixes.py` | Source-level checks for review fixes; hardware behavior is not proved by these checks |
 | `test_hexstr_bounds.py`, `test_sub_replay_body_limit.py` | Buffer bounds |
+| `test_consensus_guard.py` | Intra-capture repeat consensus: slice splitting on a real Kia window, alias demotion, adapter wiring |
+| `test_psa_decoder.py` | PSA FM0 decoder on the corpus: five clean captures decode (same-fob prefix check), VW/FIAT/Renault/Skoda rejected |
+| `test_fiat_decoder.py` | FIAT V1 decoder on the corpus: 8/12 FIAT captures decode (Grande Punto uid B6AB9928 btn 1/2, Panda uid A4A02529, sequential counters), VW/Renault/Skoda/other-FIAT-variant rejected; gate, dispatch and consensus adapter wired |
+| `test_renault_hitag2.py` | Renault V1 (Hitag2) Layer-1 decoder on the corpus: the one genuine Hitag2 recording decodes (Trafic 2011 sn 3270FD2B btn 2 ctr 0x15C), the near-miss Renault families and VW/Skoda reject, a synthetic known frame round-trips, and the gate/dispatch/ordering are wired |
+| `test_renault_layer2.py` | Renault V1 Layer-2 closure: hopseq extracts all five frames (counter walks 0x15C..0x160), the exhaustive 2^32 IV searcher is self-consistent (recovers a known IV), the FIAT known-key dictionary yields zero hits on the real frames, and the chance fixed-point IVs share no seed byte — so the epoch/seed model is falsified rather than merely unsearched |
+| `test_renault_family_accounting.py` | Renault corpus accounting and family split: the 26 Renault-named files are 10 unique captures (16 duplicates), the file filter tokenises so "captur" does not match "Captured", Ren3 is FSK and out of scope for OOK width work, Ren2 is a clean 105 µs family distinct from the 33 µs PWM group, and degraded captures are flagged rather than classified |
+| `test_renault_pwm_model.py` | Renault fixed-slot PWM model falsification: every Megane/Captur/`Ren2` capture has zero repeated ≥16-symbol runs and pair sums that do not cluster at 5T, while the FIAT controls from the same corpus show 357 and 600 repeated symbols — so the metric works and the fixed-slot decoder target does not exist in the files |
+| `test_kia_v1_decoder.py` | KIA/HYU V1 decoder: the three on-brand 315 MHz V1 captures decode (Kia_V1_N1_RAW and Kia_V1_5cl_5op both sn B444706E btn 1 ctr 091, Hyundai_V1_N1_RAW sn 555B4447 btn 6 ctr 1E0), the Toyota Estima 2000 near-miss family rejects, and the gate/preamble/dispatch are wired — the fixes being a `te_kv1` window widened to the reference 800/1600 µs TE, a 140-pulse `te_long` preamble gate, and (v4.01) excluding a Kia V1 frame from the loose KeeLoq gate that claimed it before its own branch could run |
+| `test_frame_structure_scan.py` | Corpus frame-structure triage: the scanner reports 323 captures (117 STRONG / 39 WEAK / 167 NONE), the Renault Trafic Hitag2 and FIAT Grande Punto captures score STRONG, and the frame-less Megane/Captur/`Ren2` captures score NONE — a reliable positive for repeated-frame protocols with an explicit caveat that NONE is not a verdict |
+| `test_gdo0_audit.py` | GDO0 hardware audit: the control-hardened `gdo0_signal` probe is wired and observes only (no TX strobe), reads VERSION/MARCSTATE as status registers, and the note/README record the V1/V2 document contradiction, the SX1278 board identity, and the shared-rail `RAIL_SHARED_CANNOT_ISOLATE` finding |
+| `test_renault_66us.py` | Renault ~66 us family reconnaissance: Captur 2017 and Megane/Scenic 2005 are OOK at a ~33 us base with 66/100/132/166 us PWM symbols (not Manchester), and the Kadjar Ren files are a distinct base unit |
+| `test_n11_n12_n13.py` | The research arc: press-correlation scoring thresholds, rolljam-detector echo guard / event ring / 60 s drain, timing-fingerprint quantizer (same fob sticks, different fobs separate) |
+| `test_gap_arm.py` | Frame-gap arming: the state machine extracted from the capture path, compiled and driven against synthetic RSSI traces — plateau arms on quiet, fob press falls back, oscillation never arms, wait bounded |
+| `test_serial_fuzz.py` | Serial dispatcher fuzz: adversarial lines (truncated JSON, wrong types, deep nesting, oversize, 24 random mutations) must each produce exactly one JSON reply or one named error — never silence, never a crash. Source half pins the intake/dispatch guarantees; live half runs them through the card |
+| `test_hop_xor.py` | Hop-XOR telemetry: the XOR of two same-button KeeLoq hops equals `E(ptA)^E(ptB)` and is order-symmetric (the property that makes rollback validation key-independent); ring wrap order stays oldest-first |
+| `test_brute_tick.py` | The brute sequencers: arming bounds, the counter/address sequence built in order, one transmit per tick with the inter-frame delay, single-flight refusal, progress and done events, `ok:false` on a failed transmit — and a source check that neither route blocks any more |
+| `test_ws_fuzz.py` | The WebSocket transport's intake: host-only structural checks (frame cap replies `ws-frame-too-long`, the `{` gate, drop-on-full queue, reply generation+auth guards, handshake/close), plus a stdlib WebSocket client that drives the same adversarial corpus the serial suite uses. Live pass is hardware-gated (`--ap`/`--host`); the client itself is verified against `tools/_ws_echo_server.py`. |
 
 ## Hardware limits on this revision
 
-The CC1101's GDO0 output is not connected to a readable GPIO on this board. GPIO 48 is wired to the SX1278's DIO0 instead; resetting or sleeping the SX1278 does not reconnect the CC1101. The vendor's own firmware also notes that GDO0 is not wired (`"GDO0 NO está cableado al ESP32 en este PCB"`). In practice:
+The CC1101's GDO0 output is not connected to a readable GPIO on this board. GPIO 48 is wired to the LoRa module's IRQ — the SX1278's DIO0 on this board (it reports LoRa `RegVersion 0x12`), or DIO1 on the later SX1262 revision — and resetting or sleeping the LoRa does not reconnect the CC1101. The vendor's own corrected header states it (`"GDO0 NO está cableado al ESP32 en este PCB"`, and its 2026-05-25 file sets `PIN_CC1101_GDO0` to `-1` with the note "Antes era 48, pero 48 es DIO0 del LoRa"); the older sketches that declare `GDO0 48` also declare the LoRa IRQ on 48 and simply copied one into the other. In practice:
 
 - **Capture falls back to polling RSSI**, which samples at roughly 1600 µs. That is slower than a Kia V3/V4 short pulse of 400 µs, so a capture can come back as uniform pulses with no bit edges in it. The firmware refuses those with `no-bit-edges` rather than feeding them to the decoders.
 - **Transmit does not depend on GDO0.** Packet mode drives the CC1101's own PA from the TX FIFO, so replay, jamming and the sequencers work. This was verified by an external receiver decoding a transmitted frame.
-- Routing GDO0 (chip pin 6) or GDO2 (pin 3) to a free GPIO fixes capture quality. GDO2 is easier to reach but is output-only, so it gives capture without transmit.
+- **Firmware cannot fully separate "unrouted" from "masked".** `gdo0_signal` is the attempt: it cuts the sensor rail so the LoRa is gone and asks the CC1101 to put its XOSC clock on GDO0. On this board the verdict is `RAIL_SHARED_CANNOT_ISOLATE` — the rail also powers the CC1101 (`VERSION` goes from `0x14` to `0x00` with the rail down), so the two outputs cannot be isolated without a wire. The conclusion therefore rests on the vendor's schematic note and on the LoRa's un-releasable DIO0 contention, not on a direct measurement.
+- Routing GDO0 (chip pin 6) or GDO2 (pin 3) to a free GPIO fixes capture quality and makes `gdo0_signal` a direct test: if the clock appears on the bridged pin, GDO0 was routed; if not, the bridge is bad. GDO2 is easier to reach but is output-only, so it gives capture without transmit.
 
 **There is no 125 kHz LF front end.** The CC1101 covers 300–928 MHz, so 125 kHz passive-entry wake-up and the below-300 MHz immobilisers (Hitag2, Megamos, DST40) are out of reach on this board.
 
 **The board does have a 13.56 MHz HF front end, and this firmware does not use it.** A PN532 sits on the shared I2C bus at address 0x24, alongside the MAX17048 gauge at 0x36. The stock tool for it drives ISO14443A passive-target reads; nothing in FOBworks touches it, and no command, decode or replay path depends on it. If NFC is wanted here, it is a separate feature rather than an extension of the sub-GHz work.
 
-The current build uses **45% of RAM**. The decode path and WebSocket inbound queue are the largest consumers. Check `stack_hwm` and `heap_free` in the `status` response before extending the decode path.
+The current build uses **49% of RAM** for statics. The decode path and WebSocket inbound queue are the largest consumers. Runtime idle heap was 62,188 B after BLE was made lazy (v3.95) — before that, the BLE stack alone took ~71 KB and left ~1 KB, so no command could be parsed. Check `stack_hwm` and `heap_free` in the `status` response before extending the decode path.
 
 ## Development notes
 

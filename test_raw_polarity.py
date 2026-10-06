@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static + behavioural checks for capture polarity (research/06 §3.4a).
+"""Static + behavioural checks for capture polarity.
 
 The bug: rfBuf stores pulse WIDTHS only, so the level of each pulse is not in the
 buffer. Both export sites and replayRaw() hard-asserted that rfBuf[0] is HIGH
@@ -74,7 +74,7 @@ for want in ("replayRaw(mhz, rfBuf, rfLen, 3, rfStartHigh)",
     assert want in source, f"call site not passing polarity: {want}"
 
 # Stored buffers carry it.
-# The append moved into fbkAppend() (research/10 §2.6 made it testable), so the
+# The append moved into fbkAppend , so the
 # polarity is now recorded as e.sh from the startHigh argument. The capture path
 # must pass rfStartHigh into it.
 app = re.search(r"static bool fbkAppend\((?P<body>.*?)\n\}", source, re.DOTALL)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Corpus regression harness: run every real decoder against every real capture.
 
-research/35 §5 step 1. Forty of this firmware's 41 decoders had never been pointed at a real
+§5 step 1. Forty of this firmware's 41 decoders had never been pointed at a real
 capture; the corpus has 306 RAW files across ~19 brands on disk. This runs the REAL C++
 functions -- extracted from the sketch and compiled -- rather than Python reimplementations,
 because an earlier round's Python model of the encoder disagreed with the running code and cost
@@ -15,7 +15,7 @@ part of the decoder behaviour:
 Skipping the gates would fire decoders the firmware itself would refuse, so the harness would
 report false positives that cannot occur on hardware.
 
-Outputs the triage research/35 §5 step 2 asks for:
+Outputs the triage §5 step 2 asks for:
   · per decoder: files fired on, distinct serials, and whether any non-brand file fires
   · decoders that never fire
   · files matched by none
@@ -73,6 +73,7 @@ DECODER_BRAND = {
     "ks_decodeSubaru": "subaru", "ks_decodeSubaruV2": "subaru",
     "ks_decodeMazda": "mazda", "ks_decodeFordV0": "ford",
     "ks_decodeChrysler": "gm", "ks_decodeVAG": "vag", "ks_decodeBMWCAS4": "bmw",
+    "ks_decodeFiatV1": "fiat", "ks_decodeRenaultHitag2": "renault",
 }
 
 
@@ -245,6 +246,9 @@ def main():
                 if h not in need:
                     queue.append(h)
     need |= {"ks_km2", "ks_mkBits", "ks_manchester", "ks_inR", "rjTrimKiaV34", "klTrimToFrame"}
+    # Helper referenced ONLY from a te_ gate, not from any decoder body, so the
+    # body-driven closure above cannot reach it: te_kv1p -> ks_kia_v1_preamble.
+    need |= set(re.findall(r"\b(ks_[A-Za-z0-9_]+)\s*\(", gate_block(src)))
     # Sort by the DEFINITION's offset, not the first mention. `src.find(" name(")` finds a
     # CALL SITE -- ks_bit is called inside ks_klDecrypt ~127 KB before its own definition --
     # so sorting that way emitted the caller first and the generated file referenced ks_bit
@@ -296,7 +300,7 @@ def main():
 
     # Structs the decoders take by reference.
     structs = []
-    for name in ("KiaV34Frame",):
+    for name in ("KiaV34Frame", "KsH2Dec"):
         m = re.search(r"struct\s+" + name + r"\s*\{[^}]*\};", src, re.S)
         if m:
             structs.append(m.group(0))
@@ -309,7 +313,7 @@ def main():
         f"#define {n} {v}" for n, v in
         # Accept decimal AND hex (with u/U/l/L suffixes). KIA_V34_MF_KEY is a 64-bit hex
         # literal; a decimal-only pattern silently dropped it and left ks_klDecrypt keyless.
-        re.findall(r"^#define\s+((?:KIA_V34|TE|KL)_[A-Z0-9_]+)\s+"
+        re.findall(r"^#define\s+((?:KIA_V34|TE|KL|KS_H2)_[A-Z0-9_]+)\s+"
                    r"(0[xX][0-9A-Fa-f]+[uUlL]*|[0-9]+[uUlL]*)", src, re.M))
 
     # One call site per decoder, with zeroed out-params sized from its own signature.
@@ -327,6 +331,11 @@ def main():
         first = params[0]
         if "uint32_t" in first and "*" in first:
             srcbuf, nvar, skip = "BUF32", "CNT", 2
+        elif "uint16_t" in first and "*" in first:
+            # raw-pulse decoders (ks_decodePSA): feed the trimmed u16 frame
+            # the firmware's rfBuf holds, and let a trailing `int te` take
+            # the k-means short cluster as on hardware.
+            srcbuf, nvar, skip = "TRIM16", "tl_g", 2
         elif "char" in first and "*" in first:
             # Manchester-fed decoders take the DECODED buffer (MB/ml), not the raw bit string.
             # Getting this wrong fed them noise and produced false matches.
@@ -348,6 +357,10 @@ def main():
                 arglist.append("(uint32_t&)z32")
             elif "uint16" in p:
                 arglist.append("(uint16_t&)z16")
+            elif re.match(r"^int\b", p):
+                # positional: first plain-int param is an IN (te), later ones
+                # are int& OUT (payLen) — both take lvalues; cA for IN.
+                arglist.append("cA_g" if "te" in p else "zi")
             elif "uint8" in p:
                 arglist.append("(uint8_t&)z8")
             elif "bool" in p:
@@ -399,6 +412,7 @@ static uint32_t BUF32[HARDCAP];
 static char BITS[CAP_SZ*4+16];
 static int CNT=0, BLEN=0;
 static uint64_t z64; static uint32_t z32; static uint16_t z16; static uint8_t z8; static bool zb;
+static int zi;   /* scratch for int& out-params (ks_decodePSA payLen) */
 static uint8_t rawout[16];
 static KiaV34Frame kv34;
 
@@ -413,6 +427,10 @@ static int      cnt_g;
 static bool     fskCapMode = false;   /* the corpus is OOK; FSK is a separate capture mode */
 static char     MB[CAP_SZ/2+1];
 static int      ml_g;
+/* Trimmed u16 frame + its length: the raw-pulse decoders (ks_decodePSA) take
+   the firmware's rfBuf view, not the bit-sliced BUF32. Filled in main(). */
+static uint16_t TRIM16[HARDCAP];
+static int      tl_g;
 
 static int run_all(int multi){{
   int n=cnt_g;
@@ -421,9 +439,13 @@ static int run_all(int multi){{
   uint16_t bLen=(uint16_t)BLEN;
   int ml=ml_g;
   float mhz=(float)mhz_g;
+  /* decodeSignal() names its raw-pulse view (buf,cnt); some te_ gates inspect the
+     raw pulses directly (te_kv1p -> ks_kia_v1_preamble), so bind the same names to
+     the trimmed raw buffer the firmware's rfBuf stands in for. */
+  uint32_t* buf=BUF32; int cnt=n;
 {gate_defs}
   /* multi=1: evaluate EVERY decoder whose gate passes, and print each hit, so a file matched
-     by two decoders is visible (research/04 §I4's predicted false-positive class).
+     by two decoders is visible.
      multi=0: the firmware's own first-match behaviour. */
   if(multi){{
 {chr(10).join(multi_calls)}
@@ -457,6 +479,8 @@ int main(int argc,char**argv){{
   else {{ for(int i=0;i<rn && i<HARDCAP;i++) BUF32[n++]=(uint32_t)RAWIN[i]; }}
 
   CNT=n; cnt_g=n;
+  if(tl>0){{ for(int i=0;i<tl&&i<HARDCAP;i++) TRIM16[i]=trimmed[i]; tl_g=tl; }}
+  else {{ for(int i=0;i<n&&i<HARDCAP;i++) TRIM16[i]=(uint16_t)BUF32[i]; tl_g=n; }}
   /* decodeSignal preprocessing, reproduced exactly:
      cluster the pulse-clipped copy, then gate on te/ratio, then build the bit string. */
   static uint32_t kbuf[HARDCAP]; int kn=0;
@@ -593,7 +617,7 @@ int main(int argc,char**argv){{
 
         print()
         print("=" * 78)
-        print("PER-DECODER (research/35 §5 step 1)")
+        print("PER-DECODER ")
         print("=" * 78)
         # Report from multi_hits when available: it holds every decoder that fired, whereas
         # `hits` only the first. Two columns matter and they are different things:
@@ -630,7 +654,7 @@ int main(int argc,char**argv){{
 
         print()
         print("=" * 78)
-        print("TRIAGE (research/35 §5 step 2)")
+        print("TRIAGE ")
         print("=" * 78)
         # Derive "never fires" from whichever pass actually ran. In multi mode `hits` is empty
         # (the branch continues early), so reading it alone reported all 41 as never firing.

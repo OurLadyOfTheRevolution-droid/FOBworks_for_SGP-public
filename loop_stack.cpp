@@ -31,7 +31,7 @@
 //   no-decode baseline : 29860 B free of a 32768-byte stack -> ~2908 B used
 //                        (taken BEFORE the import could reach the decoder, so it excludes it)
 //   after a decode     :  7664 B free of the 12288-byte stack -> 4624 B used
-//                        (research/31: stack_hwm == stack_hwm_after_decode == 7664)
+//
 //
 // The decode adds ~1716 B beyond the no-decode baseline. So the baseline must NOT be used to
 // size the decode path -- an earlier version of this comment did exactly that

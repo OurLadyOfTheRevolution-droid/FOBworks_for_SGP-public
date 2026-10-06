@@ -45,3 +45,4 @@ build/
 bench_token.txt
 bench_*.log
 *.bak
+__pycache__/

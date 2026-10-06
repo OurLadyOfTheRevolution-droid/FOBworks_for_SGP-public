@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression test for the two decoder false positives the corpus found (research/36 §3.3).
+"""Regression test for the two decoder false positives the corpus found.
 
 Both bugs have the same *shape* but different causes, and both are fixed at the gate
 rather than by narrowing a threshold, so the fix does not depend on how a captured
@@ -53,10 +53,20 @@ src = SKETCH.read_text(encoding="utf-8")
 
 
 def block(marker: str) -> str:
-    """Definition starting at `marker`, brace-matched."""
-    i = src.index(marker)
-    i = src.rindex("\n", 0, i) + 1
-    j = src.index("{", i)
+    """Definition starting at `marker`, brace-matched.
+
+    Skips forward declarations (marker lines ending in ';' before the '{'),
+    which sit above the definitions since the N10 consensus work.
+    """
+    pos = 0
+    while True:
+        i = src.index(marker, pos)
+        i = src.rindex("\n", 0, i) + 1
+        j = src.index("{", i)
+        semi = src.find(";", i, j)
+        if semi < 0:
+            break
+        pos = semi + 1
     depth, k = 0, j
     while k < len(src):
         if src[k] == "{":

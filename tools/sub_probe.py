@@ -2,7 +2,7 @@
 """Diagnose one .sub capture: gate values, pulse resolution, and Toyota candidates.
 
 Written because the corpus is the only input this project has had, and its scaling is
-unreliable (research/38). A capture taken on real hardware -- the Flipper's CC1101, whose
+unreliable. A capture taken on real hardware -- the Flipper's CC1101, whose
 GDO0 is actually routed, unlike the SGP board's -- is the first input with trustworthy
 pulse resolution, so having the diagnostic ready matters more than the analysis script
 being pretty.

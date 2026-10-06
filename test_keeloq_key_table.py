@@ -153,7 +153,7 @@ for line in _corpus.splitlines():
         corpus.append((m.group(3).strip(), m.group(1).upper(), int(m.group(2))))
 
 # The Kia entry is not in the corpus file (it comes from the open-source Kia
-# decoders, see research/01). Everything else must match the corpus exactly —
+# decoders). Everything else must match the corpus exactly —
 # name, key, and learning type — so a transcription slip cannot slip through.
 corpus_set = {(n, k, l) for n, k, l in corpus}
 table_set = {(n.strip(), k.upper(), l) for n, k, l, _ in entries}
@@ -201,6 +201,14 @@ assert "N_KL_DERIV_MODES 14" in source, "mode count is not fixed at 14"
 # analyzer and the decoder drift apart.
 assert 'bestMode="xor-type1"' not in source, "duplicated derivation macro still present"
 assert 'bestMode="magic-serial-3"' not in source, "duplicated derivation macro still present"
+
+# Header comments must describe the table that actually ships. The 40-key/10-mode
+# text predates v3.63 and understates the search budget by 2.5x; anyone auditing
+# from the header alone would compute the wrong candidate count.
+for stale in ("40-key", "40 keys", "10-mode", "10 key-derivation modes", "400 total"):
+    assert stale not in source, f"stale pre-v3.63 key-table wording still present: {stale!r}"
+assert "73-key × 14-mode" in source, "header does not state the current search budget"
+assert "1022" in source, "header does not state the current candidate count"
 
 print("keeloq self-test and key-table checks passed")
 
