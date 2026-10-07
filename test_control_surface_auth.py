@@ -118,4 +118,17 @@ assert can_handler.index("unsafe_can_pins") < can_handler.index("twai_stop()")
 assert can_handler.index("unsupported_baud") < can_handler.index("twai_stop()")
 assert "already_initialized" in can_handler
 
+# The instrument read-outs (P3 resync curve, P4 claim trace, P5 RollJam IDS) are only
+# shipped if the card can show them. The firmware half is covered by test_resync_curve,
+# test_claim_trace and test_p5_ids; this pins the dashboard half against the same
+# endpoints, so a tab rename or a dropped fetch fails loudly instead of going quiet.
+assert 'showTab(6)' in embedded_ui and 'Instruments</div>' in embedded_ui, "Instruments tab is not registered"
+for panel_id in ("id=p6", "id=ctRows", "id=rcChart", "id=p5Rows"):
+    assert panel_id in embedded_ui, f"instrument panel missing: {panel_id}"
+for endpoint in ("/api/claim_trace", "/api/resync_curve_status", "/api/resync_curve", "/api/p5_ids"):
+    assert endpoint in embedded_ui, f"instrument panel does not reach {endpoint}"
+assert "function loadInstruments()" in embedded_ui, "Instruments tab has no loader"
+assert "if(n===6) loadInstruments();" in firmware or "if(n===6) loadInstruments();" in embedded_ui, \
+    "Instruments tab is not wired into showTab()"
+
 print(f"control-surface auth checks passed ({len(protected_routes)} protected routes)")
