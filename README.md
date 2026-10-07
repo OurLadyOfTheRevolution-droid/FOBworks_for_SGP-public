@@ -2,6 +2,8 @@
 
 FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 4.05.
 
+The published tree is a disclosure variant of the development tree: manufacturer-key literals are masked, the private engineering worklog stays private, and a measured-limits subset of research notes plus the corpus scorecard ship so the claims in `PROMO.md` and the hardware-limits section are checkable. See `docs/PUBLISHING.md` and `docs/LIMITATIONS.md`.
+
 This build targets the SGP Card Mini stock acquired in May 2026: an ESP32-S3-MINI-1-N8 with a dual-core LX7 at 240 MHz, 8 MB quad flash, no PSRAM, Wi-Fi 802.11 b/g/n, and BLE 5. The sub-GHz radio is the onboard CC1101, using OOK and 2FSK across the 39 channels listed in the sketch between 300–348, 387–464, and 779–928 MHz. The board also has a Ra-02 SX1278 LoRa module. GPIO 48 is connected to the SX1278's DIO0; the CC1101's GDO0 is not routed to a readable GPIO. Resetting or sleeping the SX1278 does not provide a CC1101 data connection. GPIO 26 is reserved on the PCB for a future SX1262 and is unused. The MAX17048 fuel gauge is at I2C address `0x36`. Kept decodes are written to the microSD card as FOBworks RAW files, which the dashboard can read back. The firmware accepts CC1101 version-register values `0x04` and `0x14`; the detected value appears in the status chip.
 
 The card serves its own dashboard. A separate React dashboard can run on a computer. Both connect to the same firmware and require the same access code.
@@ -215,11 +217,12 @@ for t in test_*.py; do python3 "$t"; done
 | `test_lora_cw.py` | SX1278 second-radio CW path: the `Frf` register carrier math at 433.92 and 868.0 MHz, the LF/HF mode bit, `PA_BOOST`, the safe power-down order, and the corrected state-machine sequence — STANDBY is written before TX so SLEEP never jumps straight to TX, and the mode word is TX (Mode=3) rather than FSTX |
 | `test_renault_rke_crack.py` | The Hitag2 correlation attack: the ported proxmark3 `ht2crack4` recovers synthetic keys, the cipher matches the paper's vectors, and the corpus's five consecutive Trafic frames are scored at the attack's measured floor |
 | `test_publish_transform.py` | The publication transform in `tools/publish_prepare.py`: the key table is masked and every read is unwrapped, no masked value equals its plaintext, the Kia literal is gone from the transformed sketch, the tidy rule preserves zero-argument calls (the regression that once shipped a check which could not fail), every suite asserting on a private worklog is in the gate list, and the final leak gate fires on a planted key |
+| `tools/publish_check.py` | Gate on a staged public tree: whitelist notes present, no plaintext key corpus, PROMO corpus counts match `docs/CORPUS_SCORECARD.md`, FW/README/CITATIONS versions agree, no bare worklog pointers on the honesty surfaces |
 | `test_flipper_pull.py` | The Flipper SD puller (`tools/flipper_pull.py`): the listing parser reads `[D]`/`[F] name <n>b` entries without mistaking the echoed command for a directory, `storage read` framing is stripped back to the exact payload, a short read is rejected rather than kept, and the payload is clipped to the size the listing reported. The live half walks the attached card and skips cleanly when none is present |
 
 ## Hardware limits on this revision
 
-The CC1101's GDO0 output is not connected to a readable GPIO on this board. GPIO 48 is wired to the LoRa module's IRQ — the SX1278's DIO0 on this board (it reports LoRa `RegVersion 0x12`), or DIO1 on the later SX1262 revision — and resetting or sleeping the LoRa does not reconnect the CC1101. The vendor's own corrected header states it (`"GDO0 NO está cableado al ESP32 en este PCB"`, and its 2026-05-25 file sets `PIN_CC1101_GDO0` to `-1` with the note "Antes era 48, pero 48 es DIO0 del LoRa"); the older sketches that declare `GDO0 48` also declare the LoRa IRQ on 48 and simply copied one into the other. In practice:
+The CC1101's GDO0 output is not connected to a readable GPIO on this board. GPIO 48 is wired to the LoRa module's IRQ — the SX1278's DIO0 on this board (it reports LoRa `RegVersion 0x12`), or DIO1 on the later SX1262 revision — and resetting or sleeping the LoRa does not reconnect the CC1101. The vendor's own corrected header states it (`"GDO0 NO está cableado al ESP32 en este PCB"`, and its 2026-05-25 file sets `PIN_CC1101_GDO0` to `-1` with the note "Antes era 48, pero 48 es DIO0 del LoRa"); the older sketches that declare `GDO0 48` also declare the LoRa IRQ on 48 and simply copied one into the other. The full audit is `research/79_GDO0_HARDWARE_AUDIT.md`. In practice:
 
 - **Capture falls back to polling RSSI**, which samples at roughly 1600 µs. That is slower than a Kia V3/V4 short pulse of 400 µs, so a capture can come back as uniform pulses with no bit edges in it. The firmware refuses those with `no-bit-edges` rather than feeding them to the decoders.
 - **Transmit does not depend on GDO0.** Packet mode drives the CC1101's own PA from the TX FIFO, so replay, jamming and the sequencers work. This was verified by an external receiver decoding a transmitted frame.
@@ -234,7 +237,7 @@ The current build uses **49% of RAM** for statics. The decode path and WebSocket
 
 ## Development notes
 
-`research/sources/` holds the capture corpus the decoder regression runs against, and the tooling that reads it. The working notes themselves are kept separately and are not part of this repository.
+`research/sources/` holds the capture corpus the decoder regression runs against, and the tooling that reads it. A measured-limits subset of the research notes ships with the published tree (see `docs/PUBLISHING.md`); the rest of the engineering worklog stays private. The decoder-coverage ledger is `docs/CORPUS_SCORECARD.md`.
 
 The `test_*.py` suites check parser boundaries, safety guards, and JSON formatting. `tools/corpus_regression.py` extracts and compiles the firmware's decoders, then runs them against a corpus of real captures:
 

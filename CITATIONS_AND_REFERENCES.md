@@ -1,12 +1,12 @@
 # Citations and references
 
-This list covers the sources used for FOBworks for SGP v4.02, which targets the May 2026 SGP Card Mini. It includes the KeeLoq references, radio and board datasheets, the board's own vendor documentation and firmware, documentation for the WebSocket transport, and the repositories this project drew protocol work from.
+This list covers the sources used for FOBworks for SGP v4.05, which targets the May 2026 SGP Card Mini. It includes the KeeLoq references, radio and board datasheets, the board's own vendor documentation and firmware, documentation for the WebSocket transport, and the repositories this project drew protocol work from.
 
 ## KeeLoq
 
 Three note numbers in the source do not identify a published Microchip KeeLoq document. The table maps each source label to the document relevant to that code path.
 
-**Status (v4.02):** the comments the v3.71 KeeLoq work touched now cite the real notes directly, and the fix that replaced the wrong labels in the live encryption and decryption comments landed in v3.61 (the `AN1064` algorithm description, the decrypt path, the mode list). The three wrong labels below still appear in dated changelog entries, which are a record of what past releases said and are kept as written. No live code path cites them.
+**Status (v4.05):** the comments the v3.71 KeeLoq work touched now cite the real notes directly, and the fix that replaced the wrong labels in the live encryption and decryption comments landed in v3.61 (the `AN1064` algorithm description, the decrypt path, the mode list). The three wrong labels below still appear in dated changelog entries, which are a record of what past releases said and are kept as written. No live code path cites them.
 
 The firmware's 73-entry manufacturer-key table comes from the public list at `github.com/HiennNek/non-flipper-rolling-code-support` (`keeloq_mfcodes_user`). The source file is not included here because it contains the same keys already present in the firmware. Each entry's learning type (see `enum KLLearn` in the sketch) determines which derivation is used.
 

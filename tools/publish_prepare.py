@@ -457,6 +457,9 @@ _XPAREN_LINE = re.compile(r"\([ \t]*(?:" + _XVERB + r")[ \t]*\r?\n[ \t]*(?:`?res
 _XLINE = re.compile(r"([ \t]+)" + _XVERB + r"[ \t]*\r?\n[ \t]*(?:`?research/\d+`?|worklog[ \t]*`?\d+`?)[ \t]*(:?)")
 
 _SEAMS = [
+    # ", and research/88 is the record." -- conjunction + whole clause, so the
+    # preceding sentence does not end on a stranded "and".
+    re.compile(r",?[ \t]+and[ \t]+`?research/\d+`?[ \t]+is\b[^.]*\.[ \t]?"),
     # a whole sentence that points at a worklog entry ("research/79 is the full audit.")
     re.compile(r"`?research/\d+`?[ \t]+is\b[^.]*\.[ \t]?"),
     # a whole parenthetical built around a reference, verb prefix or not:
@@ -464,14 +467,17 @@ _SEAMS = [
     re.compile(r"\([ \t]*(?:" + _VERB + r"[ \t]+)?(?:research/\d+|worklog[ \t]*`?\d+`?)[^()]*\)[ \t]?"),
     # "worklog `36`" / "worklog 36" -- an id under a different label
     re.compile(r"\bworklog[ \t]*`?\d+`?[ \t]*[.,]?"),
-    # `research/24` -- the backticks go with it
-    re.compile(r"`[ \t]*research/\d+(?:_[A-Za-z0-9_]*\.\w+)?[ \t]*`[ \t]?"),
+    # `research/24` -- the backticks go with it. Path-shaped refs with a real
+    # filename (`research/79_GDO0_....md`) are left alone by the (?!...\.ext)
+    # form of _REF; this pattern still has to avoid eating those, so it only
+    # matches a bare numeric id inside backticks.
+    re.compile(r"`[ \t]*research/\d+[ \t]*`[ \t]?"),
     # research/46 and 52 / research/48 and /49 / research/60, research/61
     re.compile(r"research/\d+[ \t]*(?:,|and|/|&)[ \t]*/?[ \t]*(?:research/)?\d+[ \t]*[.,]?"),
     # "recorded in research/78." / "per research/04" -- verb and connector included
     re.compile(r"\b" + _VERB + r"[ \t]+research/\d+[ \t]*[.,]?"),
-    # a bare token, swallowing a trailing period or comma
-    re.compile(r"research/\d+[ \t]*[.,]?"),
+    # a bare token, swallowing a trailing period or comma (not path-shaped)
+    re.compile(r"research/\d+(?!_[A-Za-z0-9])[ \t]*[.,]?"),
 ]
 
 # Cleanup that is safe ONLY on a line an edit actually touched, and that can never
@@ -498,6 +504,10 @@ _TIDY = [
     (re.compile(r"([,;])[ \t]*(?=[,;])"), r"\1"),   # ", ," -> ","
     (re.compile(r",[ \t]*\)"), ")"),              # "(v3.95,)" -> "(v3.95)"
     (re.compile(r"[ \t]+([:;])"), r"\1"),         # "closure :" -> "closure:"
+    # Stranded connective after a clause was removed: "...establish that, and"
+    (re.compile(r",[ \t]+and[ \t]*$"), "."),
+    (re.compile(r"[ \t]+and[ \t]*$"), ""),
+    (re.compile(r",[ \t]+(?:see|per|from|of)[ \t]*$"), "."),
     (re.compile(r"(?<=\S)[ \t]{2,}(?=\S)"), " "),   # internal double space only
 ]
 

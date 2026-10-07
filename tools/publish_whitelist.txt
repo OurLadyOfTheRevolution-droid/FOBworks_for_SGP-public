@@ -1,0 +1,16 @@
+# Research notes that ship with the published tree.
+# These back a public claim (hardware limit, falsified model, or corpus ledger).
+# Everything else under research/*.md stays private.
+# One basename per line; comments and blanks ignored.
+
+36_CORPUS_REGRESSION_TRIAGE.md
+56_315_FALSE_ELEVATED_FLOOR.md
+58_LATCHED_FRONTEND_STATE.md
+59_BAND_TILT_IS_CONFIGURATION.md
+79_GDO0_HARDWARE_AUDIT.md
+80_RA02_DIO0_LIFT_REVERSIBLE.md
+82_RENAULT_33US_MODEL_FALSIFIED.md
+86_RENAULT_RKE_CORRELATION_ATTACK.md
+88_SX1278_SELFJAM_MEASURED.md
+93_GATE_DECODER_FALSE_POSITIVES.md
+94_SECPLUS2_GATE_IS_NOT_THE_BLOCKER.md
