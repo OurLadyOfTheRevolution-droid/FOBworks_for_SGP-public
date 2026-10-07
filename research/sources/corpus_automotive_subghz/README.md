@@ -108,9 +108,9 @@ Special thanks to the **ARF (Automotive Research Firmware) Discord community** a
 ## 📝 Contributing
 
 1. Fork this repository
-2. Add your files with proper naming convention
+2. Add files with the proper naming convention
 3. Submit a pull request
-4. Credit the original source in your commit message
+4. Credit the original source in the commit message
 
 ---
 

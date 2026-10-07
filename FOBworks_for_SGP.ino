@@ -14414,8 +14414,8 @@ static void processCommandLine(const String& ln){
       long s=0; for(int i=0;i<24;i++){ s+=cc_fastRSSI(); delayMicroseconds(500); }
       SPI.endTransaction();
       // NO clamp here, deliberately. The capture path substitutes -75 when the average
-      // exceeds -60 "because a fob was transmitting", which is fine when you want a floor to
-      // set a threshold from, and wrong when the floor IS the measurement: it pinned every
+      // exceeds -60 "because a fob was transmitting", which is fine when setting a
+      // floor threshold from, and wrong when the floor IS the measurement: it pinned every
       // jammed reading to exactly -75 regardless of offset or power, so the sweep looked flat
       // and the true rise was hidden. Report the raw mapped average instead; cc_fastRSSI tops
       // out near -74 dBm (r=255 -> (255-256)/2-74), so a reading at or above that is the meter

@@ -12,7 +12,7 @@ FOBcatch and FOBback are guided transmit sequences. C1 and C2 are their respecti
 
 FOBscan is the workbench for capture, sweep, decode, prediction, key management, and the signal library. These tools are arranged across six tabs.
 
-**Capture** starts and stops listening, selects OOK or 2FSK, and shows the latest burst. **Scan** cycles through the card's channels or stays on one channel. **Decode** reports the protocol, serial, button, counter, and frame-check result. **Predict** shows the next counter inferred from frames in memory. **Keys** lets you add, test, or clear a saved manufacturer key. **Library** lists captures stored on the card, grouped by protocol and serial.
+**Capture** starts and stops listening, selects OOK or 2FSK, and shows the latest burst. **Scan** cycles through the card's channels or stays on one channel. **Decode** reports the protocol, serial, button, counter, and frame-check result. **Predict** shows the next counter inferred from frames in memory. **Keys** is where a saved manufacturer key is added, tested, or cleared. **Library** lists captures stored on the card, grouped by protocol and serial.
 
 From idle, one button tap starts FOBscan without the screen. The LED pulses orange; a kept decode flashes the pixel white before orange pulsing resumes. Tap again to stop.
 
@@ -24,7 +24,7 @@ From idle, two taps start this scan without the dashboard. The LED pulses blue w
 
 ## FOBcatch
 
-FOBcatch listens using a selected vehicle profile. Choose the make, model, and year, then press the fob. The screen keeps the capture and lets you name it; **Replay** sends the saved frame.
+FOBcatch listens using a selected vehicle profile. Choose the make, model, and year, then press the fob. The screen keeps the capture and allows naming it; **Replay** sends the saved frame.
 
 ## FOBback
 
@@ -37,17 +37,17 @@ FOBback uses the C2 RollBack sequencer. It sends exactly two codes, older first,
 
 Before storage, each capture is trimmed to one frame. A physical press usually repeats the frame; replaying a three-repeat block could appear to the receiver as three presses, advancing its counter by three and breaking the sequence.
 
-You can also load a stored frame through `fbk_import`, using a FOBworks RAW file or a `.sub` capture. This lets you test a transmit without making a live capture.
+A stored frame can also be loaded through `fbk_import`, using a FOBworks RAW file or a `.sub` capture. That path tests a transmit without making a live capture.
 
 ## Signal library
 
-Kept decodes appear here, grouped by protocol and serial. The card writes each to the microSD as a FOBworks RAW file and reads the library back for display. You can merge groups that contain readings from the same fob, hide captures that no decoder matched, and export the library as JSON. Exported filenames begin with `fobworks_library_`.
+Kept decodes appear here, grouped by protocol and serial. The card writes each to the microSD as a FOBworks RAW file and reads the library back for display. Groups that contain readings from the same fob can be merged, captures that no decoder matched can be hidden, and the library can be exported as JSON. Exported filenames begin with `fobworks_library_`.
 
 A standalone FOBworks RAW file contains a short header, frequency, and pulse list. Send the file back to the card to transmit those pulses at the frequency recorded in it.
 
 ## Key recovery
 
-Key recovery is intended for a KeeLoq fob you own. Press the same button two to five times while the card listens. Recovery checks the built-in table and any keys saved on the card. It keeps a candidate only if every press decrypts to the same serial and button with a counter that advances. A match to a filler pattern in the built-in table is labeled **pattern match**; a saved key is reported separately. If no key matches, recovery reports no match. It does not derive a manufacturer key from a transmission.
+Key recovery is intended for an owned KeeLoq fob. Press the same button two to five times while the card listens. Recovery checks the built-in table and any keys saved on the card. It keeps a candidate only if every press decrypts to the same serial and button with a counter that advances. A match to a filler pattern in the built-in table is labeled **pattern match**; a saved key is reported separately. If no key matches, recovery reports no match. It does not derive a manufacturer key from a transmission.
 
 The built-in table contains 73 entries. Of this firmware's 44 decoders, 33 have never fired on the corpus, and 258 of 301 captures are matched by none — mostly because the corpus is car fobs while the never-firing set is largely gate and garage protocols (Came, Nice, FAAC, Hörmann, Sommer, and the like). Kia is the exception worth naming: both V1 and V34 match, and after the claim-bug fix the V1 decoder runs on the card as well as in the host harness; the four Kia decoders that still find nothing are V0, V2, V7, and SantaFe. `tools/corpus_regression.py` reproduces these counts and its header comment records the results.
 
@@ -77,7 +77,7 @@ Four read-outs run alongside the modes. They are serial and HTTP first; the card
 
 **Claim trace.** The last eight decodes, newest first, each with the timing it decoded at, the pulse count, the timing spread, which gate ran, and the protocol label it produced. The gate reads `loose` for a bare claim, `gate` for a candidate, `known` for a confirmed decode. This is the view that shows a mis-gated frame next to the timing that produced it. `{"cmd":"claim_trace"}`, `{"cmd":"claim_trace","clear":true}`, or `GET /api/claim_trace`.
 
-**Resync curve.** A receiver's resynchronization window drawn as a curve rather than a single ramp: forward offsets, a backward step, and a replay of an already-seen code. Each probe transmits, then listens after a settle gap; a reply is marked only when the band rises 8 dB over idle for three samples. A body controller that does not acknowledge over RF yields `unknown`, not `reject`, and you can mark a probe by hand after watching the car. `{"cmd":"resync_curve"}`, `{"cmd":"resync_curve_status"}`, `{"cmd":"resync_mark","r":"accept"}`, `GET /api/resync_curve`.
+**Resync curve.** A receiver's resynchronization window drawn as a curve rather than a single ramp: forward offsets, a backward step, and a replay of an already-seen code. Each probe transmits, then listens after a settle gap; a reply is marked only when the band rises 8 dB over idle for three samples. A body controller that does not acknowledge over RF yields `unknown`, not `reject`, and a probe can be marked by hand after watching the car. `{"cmd":"resync_curve"}`, `{"cmd":"resync_curve_status"}`, `{"cmd":"resync_mark","r":"accept"}`, `GET /api/resync_curve`.
 
 **Parked RollJam watchdog.** With the card parked and listening, this watches the idle noise floor against a fast-attack, slow-decay baseline and looks for the RollJam shape: the floor lifted by a jammer, then two KeeLoq frames from the same fob and button with consecutive counters inside 1.2 s. A passing car keying up is a spike and moves nothing; a jammer held on is a plateau. The score rides along on the next KeeLoq decode as `rolljam_ids`, `rolljam_jam` and `rolljam_floor_db`, and `{"cmd":"p5_ids"}` or `GET /api/p5_ids` reports it directly.
 
@@ -90,11 +90,11 @@ Four read-outs run alongside the modes. They are serial and HTTP first; the card
 ## A basic capture workflow
 
 1. Connect the SGP Card Mini over USB and read the access code from the serial log at 115200 baud.
-2. Join `SGP Card Mini` and open `http://192.168.4.1`. If the separate React dashboard is available, you can connect over USB or Wi-Fi instead; `README.md` has the instructions.
+2. Join `SGP Card Mini` and open `http://192.168.4.1`. If the separate React dashboard is available, connect over USB or Wi-Fi instead; `README.md` has the instructions.
 3. Enter the access code to reach the mode picker.
-4. Open FOBscan, leave the sweep running, and press a button on a fob you own near the card.
+4. Open FOBscan, leave the sweep running, and press a button on an owned fob near the card.
 5. Check the decoded protocol family, serial, button, and counter.
-6. Save the capture to the library. Export the library if you need a copy off the card.
+6. Save the capture to the library. Export the library when a copy off the card is needed.
 
 The basic workflow is to capture a transmission, inspect the decode, and save it.
 
