@@ -93,7 +93,7 @@ When the dashboard is served over **HTTPS**, browsers block the card's plain `ws
 | `CITATIONS_AND_REFERENCES.md` | Sources for the firmware's protocol, board, and radio details. |
 | `LICENSE` | GNU General Public License v3.0. |
 | `bench_*.py` | Serial-side bench helpers: `bench_serial_log.py` logs and filters the card's JSON stream, `bench_send.py` sends commands, `bench_c2_capture.py` drives a capture. |
-| `test_*.py` | 45 host-side checks. See **Tests** below. |
+| `test_*.py` | 46 host-side checks. See **Tests** below. |
 
 This repository contains neither the React dashboard nor its source archive. The connection steps above apply if you have the dashboard source separately and unpack it into `FOBworks_SGP_Dashboard/`. You can flash and use the firmware over Wi-Fi without it; the card serves its own dashboard.
 
@@ -164,7 +164,7 @@ The mode commands include `capture`, `decode`, `replay`, `replay_predicted`, `re
 
 ## Tests
 
-The 43 Python test suites run on the host; they do not require the card or a network connection. Depending on the test, they inspect or extract code from the firmware, compile state-machine logic against a mock radio, or check recorded captures. `test_serial_fuzz.py` additionally drives the card over USB when one is attached; `python3 test_serial_fuzz.py host` runs its source-level half alone.
+The 46 Python test suites run on the host; they do not require the card or a network connection. Depending on the test, they inspect or extract code from the firmware, compile state-machine logic against a mock radio, or check recorded captures. `test_serial_fuzz.py` additionally drives the card over USB when one is attached; `python3 test_serial_fuzz.py host` runs its source-level half alone.
 
 ```bash
 cd FOBworks_for_SGP
