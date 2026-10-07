@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v4.03
+// Version  : FOBworks for SGP v4.04
 // Board    : May 2026 stock, ESP32-S3-MINI-1-N8, 8 MB flash, no PSRAM
 // Radio    : CC1101, OOK and 2FSK, 300–928 MHz
 // Dashboard: http://192.168.4.1; per-device Wi-Fi credentials are printed over USB
@@ -195,6 +195,34 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
   // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+  // v4.04 (2026-10-07) — N28, the clone-chip classifier. The consensus vote already
+  //   demoted a serial that only one slice of a burst agrees with; this generalises
+  //   the idea to a key-free judgement of whether a transmitter's hop field behaves
+  //   like a cipher. Three legs, exposed as {"cmd":"clone_class"} and /api/clone_class
+  //   and riding along with every KeeLoq decode as doc["clone_class"]:
+  //
+  //   [CORE] Counter-linearity is exact. Every KeeLoq field but the hop is plaintext
+  //   and two presses of one button differ only in the counter, so hop_xor equals
+  //   ctr_xor for a clone whose hop is the counter under XOR — on every pair, the
+  //   constant cancelling — while a real cipher reaches that equality with
+  //   probability 2^-32. Equality is a proof, not a statistic.
+  //
+  //   [CORE] Sparsity is the statistical leg. A clone that adds an arithmetic
+  //   constant still moves the hop with the counter, so popcount(hop_xor) stays
+  //   near two; real KeeLoq's one-step difference is Binomial(32, 1/2), median 16,
+  //   with P(median <= 8) under 1% over the same-button pairs. The measured gap
+  //   (host: real 15.9–16.0 against counter-linear 2.0) is what the bands 8 and 12
+  //   encode; a median between them falls back to the pair majority.
+  //
+  //   [CORE] Discrimination bookkeeping catches a sloppy clone the ciphers cannot:
+  //   a zero field, or a field that drifts across one consecutive counter run.
+  //   Two independent fobs in the ring are told apart by the counter run, so the
+  //   modal-discrimination scoping does not read a second fob as a drift.
+  //
+  //   [HONEST] A clone running the real cipher is NOT distinguishable by any of
+  //   this; the verdict is "cipher-consistent" and routes at the hop-XOR harvest
+  //   (tools/keeloq_slide_lab.py), which tests the constrained clone keyspace.
+  //
   // v4.03 (2026-10-06) — The instrument layer gets its read-out. P3, P4 and P5 were
   //   shipped firmware-only: the claim trace (P4/N22), the resync-curve profiler
   //   (P3) and the parked RollJam IDS (P5/N24) were all reachable over serial, HTTP
@@ -1708,6 +1736,7 @@
 //   {"cmd":"squelch","dbm":-60}     — set auto-capture threshold (dBm)
 //   {"cmd":"key_recover"}           — attempt full MFR-key search (needs 2+ frames)
 //   {"cmd":"hop_xor"}               — key-independent hop-XOR telemetry over held frames
+//   {"cmd":"clone_class"}           — clone-chip verdict over held frames (N28)
 //   {"cmd":"claim_trace"}           — last decode outcomes: gate, TE, spread, claim
 //   {"cmd":"p5_ids"}                — parked RollJam IDS: floor baseline + suspects
 //   {"cmd":"resync_probe","sn":N}   — replay a counter ramp to profile resync acceptance
@@ -1893,6 +1922,14 @@ struct ClaimRec { uint16_t te, edges; uint32_t hash; uint8_t gate, ratio, proto;
 #define P5_FLOOR_RISE_STEP 1
 #define P5_FLOOR_DECAY_MS  30000UL
 
+// ─── Clone-chip classifier bands (N28) ──────────────────────────────────────
+// Hoisted with the constants above for the same reason. Real KeeLoq's one-step
+// output difference is Binomial(32, 1/2) — median 16, P(<=8) under 1% — while a
+// clone whose hop tracks the counter leaves a median near 2. See ks_cloneClassify().
+#define CC_SPARSE_MAX 8
+#define CC_OEM_MIN    12
+#define CC_MIN_PAIRS  3
+
 // ─── Resync-curve probe record (P3) ─────────────────────────────────────────
 // Hoisted for the same reason as HopXor and ClaimRec. One row per probe in the
 // curve: the counter offset tried, which axis it belongs to, whether the radio
@@ -1919,7 +1956,7 @@ struct RcProbe { int16_t off; uint8_t kind, reply; int8_t mark; };
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v4.03"
+#define FW_VER        "FOBworks for SGP v4.04"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
@@ -4375,6 +4412,144 @@ static void ks_hopXorEmit(JsonDocument& doc){
       o["same_btn"]=hx.sameBtn; o["repeat"]=(prev.hop==f.hop);
     }
   }
+}
+
+// ─── Clone-chip classifier (N28) ────────────────────────────────────────────
+// The key-free question a receiver can ask of a handful of frames: does this
+// transmitter's hop field behave like a block cipher output, or like the counter
+// wearing a costume? The second case is how cheap clone chips ship.
+//
+// Leg 1 — counter-linearity, exact. Every KeeLoq field except the hop is
+// plaintext and two presses of one button differ only in the counter, so
+// hop_xor = E(ptA)^E(ptB) and ctr_xor = ctrA^ctrB. These are equal only by a
+// 2^-32 accident for a real cipher, but equal on EVERY pair for a clone with
+// hop = counter ^ constant, because the constant cancels. An equality here is a
+// structural proof, not a statistic.
+//
+// Leg 2 — sparsity. A clone that adds an arithmetic constant or a weak mixer
+// still moves the hop in step with the counter, so popcount(hop_xor) stays tiny.
+// Real KeeLoq's one-step difference is uniform: median 16, and P(median <= 8) is
+// under 1%. The median over same-button pairs separates the bands.
+//
+// Leg 3 — bookkeeping. A real HCS encoder keeps a non-zero, fixed 12-bit
+// discrimination value (AN661); a sloppy clone drops it or lets it drift.
+//
+// Honest limit: a clone that runs the real cipher under a clone key is NOT
+// distinguishable by any of this — its hop_xor is dense exactly like an OEM
+// part. The classifier says so and routes that verdict at the hop-XOR harvest
+// (tools/keeloq_slide_lab.py) rather than calling it "genuine".
+static const char* ks_cloneClassify(const char** note,int* medFlip,uint8_t* pairs,
+                                    bool* ctrLinear,uint8_t* discBad){
+  *note=""; *medFlip=0; *pairs=0; *ctrLinear=false; *discBad=0;
+  if(KL_RECENT_CNT<2) return "unknown";
+
+  // Modal discrimination value scopes the pair analysis: the ring may hold two
+  // fobs, and pairs across different discriminators are not hop-XOR observations.
+  uint16_t modal=0; uint8_t modalN=0;
+  for(uint8_t i=0;i<KL_RECENT_CNT;i++){
+    uint16_t d=(uint16_t)((ks_hopRingAt(i).sn>>4)&0xFFF);
+    uint8_t c=0;
+    for(uint8_t j=0;j<KL_RECENT_CNT;j++)
+      if(((ks_hopRingAt(j).sn>>4)&0xFFF)==d) c++;
+    if(c>modalN){ modalN=c; modal=d; }
+  }
+  *discBad = (modal==0)?1:0;
+
+  // Discrimination drift: sort the counters and walk consecutive pairs. A single
+  // device pressing one button advances by one, so a run of steps of 1 that
+  // carries more than one discrimination value is one device drifting its disc.
+  // Comparing sorted neighbours this way is what makes unique (non-repeated)
+  // drift detectable — there is no pair of equal discs to compare.
+  if(!*discBad && KL_RECENT_CNT>=2){
+    const KLFrame* order[KL_RECENT_MAX];
+    for(uint8_t i=0;i<KL_RECENT_CNT;i++) order[i]=&ks_hopRingAt(i);
+    for(uint8_t i=1;i<KL_RECENT_CNT;i++){        // insertion sort by counter
+      const KLFrame* k=order[i]; int8_t j=(int8_t)i-1;
+      while(j>=0 && order[j]->rawCtr>k->rawCtr){ order[j+1]=order[j]; j--; }
+      order[j+1]=k;
+    }
+    for(uint8_t i=1;i<KL_RECENT_CNT;i++){
+      uint16_t step=(uint16_t)((order[i]->rawCtr-order[i-1]->rawCtr)&0xFFFF);
+      uint16_t da=(uint16_t)((order[i-1]->sn>>4)&0xFFF);
+      uint16_t db=(uint16_t)((order[i]->sn>>4)&0xFFF);
+      if((step==1||step==0xFFFF) && da!=db){ *discBad=1; break; }
+    }
+  }
+
+  // Pair analysis. Only consecutive presses that share button AND discrimination
+  // are a clean counter-delta pair.
+  uint8_t flips[KL_RECENT_MAX]; uint8_t nf=0, sparseN=0;
+  for(uint8_t i=1;i<KL_RECENT_CNT;i++){
+    const KLFrame& a=ks_hopRingAt(i-1), &b=ks_hopRingAt(i);
+    if(((a.sn>>4)&0xFFF)!=modal || ((b.sn>>4)&0xFFF)!=modal) continue;
+    if((a.sn&0xF)!=(b.sn&0xF)) continue;
+    uint32_t hopx=a.hop^b.hop, ctrx=a.rawCtr^b.rawCtr;
+    if(hopx==ctrx) *ctrLinear=true;
+    uint8_t w=(uint8_t)__builtin_popcount(hopx);
+    if(w<=CC_SPARSE_MAX) sparseN++;
+    if(nf<KL_RECENT_MAX) flips[nf++]=w;
+  }
+  *pairs=nf;
+
+  // Median of the flips (insertion sort; the array is tiny). Computed before any
+  // short-circuit so the emitted med_flip is the same number the verdict rests
+  // on, whatever the verdict turns out to be.
+  uint8_t s[KL_RECENT_MAX];
+  for(uint8_t i=0;i<nf;i++){
+    uint8_t k=flips[i]; int8_t j=(int8_t)i-1;
+    while(j>=0 && s[j]>k){ s[j+1]=s[j]; j--; }
+    s[j+1]=k;
+  }
+  uint8_t med=nf?s[nf/2]:0;
+  *medFlip=med;
+
+  // Verdict, most-proven first.
+  if(*ctrLinear){
+    *note="hop_xor equals ctr_xor: the hop is the counter under XOR, not a cipher output";
+    return "non-cipher-clone";
+  }
+  if(*discBad){
+    *note="discrimination field is zero or drifts across presses (a real encoder keeps it fixed)";
+    return "clone-suspect";
+  }
+  if(nf<CC_MIN_PAIRS){
+    *note="not enough same-button pairs for a median";
+    return "unknown";
+  }
+  if(med<=CC_SPARSE_MAX){
+    *note="hop_xor is too sparse for a cipher; the hop tracks the counter";
+    return "non-cipher-clone";
+  }
+  if(med>=CC_OEM_MIN){
+    *note="hop_xor is dense, consistent with real KeeLoq; a cipher-running clone is indistinguishable here";
+    return "cipher-consistent";
+  }
+  // Between the bands: lean on the pair majority rather than the single median,
+  // since with a small pair count one outlier can push an even median up a notch.
+  if((uint16_t)sparseN*2>=nf){
+    *note="median sits between the bands but most pairs are sparse";
+    return "non-cipher-clone";
+  }
+  *note="median sits between the clone and cipher bands; more presses would settle it";
+  return "unknown";
+}
+
+// Shared renderer for the serial "clone_class" command and the /api/clone_class
+// route, so both report the same numbers. `note` is left as a pointer into a
+// string literal or the static below rather than copied.
+static void ks_cloneClassEmit(JsonDocument& doc){
+  const char* note; int med; uint8_t pairs, discBad; bool ctrLin;
+  const char* verdict=ks_cloneClassify(&note,&med,&pairs,&ctrLin,&discBad);
+  doc["ok"]=true;
+  doc["verdict"]=verdict;
+  doc["note"]=note;
+  doc["pairs"]=pairs;
+  doc["med_flip"]=med;
+  doc["counter_linear"]=ctrLin;
+  doc["disc_bad"]=(bool)discBad;
+  doc["frames"]=KL_RECENT_CNT;
+  JsonObject b=doc["bands"].to<JsonObject>();
+  b["sparse_max"]=CC_SPARSE_MAX; b["oem_min"]=CC_OEM_MIN; b["min_pairs"]=CC_MIN_PAIRS;
 }
 
 // ─── Live claim trace (N22) ──────────────────────────────────────────────────
@@ -8742,6 +8917,14 @@ String decodeSignal(){
         hxo["ctr_step1"]=hx.ctrStep1; hxo["same_btn"]=hx.sameBtn;
         hxo["repeat"]=(hx.hop_xor==0);
       }
+      // N28: the clone-chip verdict rides along with every KeeLoq decode, so the
+      // classification is visible at the frame rather than only on demand.
+      if(KL_RECENT_CNT>=2){
+        const char* cnote; int cmed; uint8_t cpairs,cbad; bool cl;
+        const char* cv=ks_cloneClassify(&cnote,&cmed,&cpairs,&cl,&cbad);
+        JsonObject co=doc["clone_class"].to<JsonObject>();
+        co["verdict"]=cv; co["note"]=cnote; co["pairs"]=cpairs; co["med_flip"]=cmed;
+      }
       doc["mfr"]=(pr.found||pr.candidate)?pr.kname:"HCS-series (unknown mfr key)";
       doc["pattern"]=pr.pattern;
       doc["learn"]=ks_klLearnName(pr.learn);
@@ -12061,6 +12244,20 @@ void setupRoutes(){
     String os; serializeJson(hd,os);
     srv.send(200,"application/json",os);
   });
+  // /api/clone_class — the N28 clone-chip classifier over the accumulated KeeLoq
+  // frames. Same numbers as the serial "clone_class" command.
+  protectedRoute("/api/clone_class",[](){
+    JsonDocument cd;
+    if(KL_RECENT_CNT<2){
+      cd["ok"]=false;
+      cd["reason"]="need-2-keeloq-frames";
+      cd["hint"]="Press a KeeLoq fob 2+ times with the scanner active, then retry";
+    } else {
+      ks_cloneClassEmit(cd);
+    }
+    String os; serializeJson(cd,os);
+    srv.send(200,"application/json",os);
+  });
   // /api/claim_trace — the live claim trace (N22): last decodes, gate, TE, spread
   // and claim, newest first. Same numbers as the serial "claim_trace" command.
   protectedRoute("/api/claim_trace",[](){
@@ -13516,6 +13713,25 @@ static void processCommandLine(const String& ln){
     if(KL_RECENT_CNT>=1) ks_hopXorEmit(hd);
     else hd["hint"]="Press a KeeLoq fob 2+ times with the scanner active, then retry";
     String os; serializeJson(hd,os); serialEmit(os);
+  }
+  // ── clone_class ────────────────────────────────────────────────────────
+  // Classify the accumulated KeeLoq frames as a clone chip or a cipher-running
+  // part, key-free. The three legs are counter-linearity (exact), hop-XOR
+  // sparsity (statistical) and discrimination bookkeeping. A cipher-running
+  // clone is honestly reported as indistinguishable — see ks_cloneClassify().
+  //
+  // Usage: {"cmd":"clone_class"}
+  else if(op=="clone_class"){
+    JsonDocument cd;
+    cd["cmd"]="clone_class";
+    if(KL_RECENT_CNT<2){
+      cd["ok"]=false;
+      cd["reason"]="need-2-keeloq-frames";
+      cd["hint"]="Press a KeeLoq fob 2+ times with the scanner active, then retry";
+    } else {
+      ks_cloneClassEmit(cd);
+    }
+    String os; serializeJson(cd,os); serialEmit(os);
   }
   // ── claim_trace ───────────────────────────────────────────────────────
   // The last few decode outcomes as a ring, newest first: which gate ran, the

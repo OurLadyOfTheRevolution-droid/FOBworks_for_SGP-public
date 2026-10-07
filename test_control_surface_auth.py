@@ -123,11 +123,14 @@ assert "already_initialized" in can_handler
 # test_claim_trace and test_p5_ids; this pins the dashboard half against the same
 # endpoints, so a tab rename or a dropped fetch fails loudly instead of going quiet.
 assert 'showTab(6)' in embedded_ui and 'Instruments</div>' in embedded_ui, "Instruments tab is not registered"
-for panel_id in ("id=p6", "id=ctRows", "id=rcChart", "id=p5Rows"):
+for panel_id in ("id=p6", "id=ctRows", "id=rcChart", "id=p5Rows", "id=ccRows"):
     assert panel_id in embedded_ui, f"instrument panel missing: {panel_id}"
-for endpoint in ("/api/claim_trace", "/api/resync_curve_status", "/api/resync_curve", "/api/p5_ids"):
+for endpoint in ("/api/claim_trace", "/api/resync_curve_status", "/api/resync_curve",
+                 "/api/p5_ids", "/api/clone_class"):
     assert endpoint in embedded_ui, f"instrument panel does not reach {endpoint}"
 assert "function loadInstruments()" in embedded_ui, "Instruments tab has no loader"
+assert "loadCloneClass()" in embedded_ui and "function renderCloneClass(" in embedded_ui, \
+    "clone-chip panel is not wired into the Instruments tab"
 assert "if(n===6) loadInstruments();" in firmware or "if(n===6) loadInstruments();" in embedded_ui, \
     "Instruments tab is not wired into showTab()"
 

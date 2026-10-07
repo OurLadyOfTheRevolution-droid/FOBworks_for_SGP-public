@@ -1,6 +1,6 @@
 # FOBworks for SGP
 
-FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 4.03.
+FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 4.04.
 
 This build targets the SGP Card Mini stock acquired in May 2026: an ESP32-S3-MINI-1-N8 with a dual-core LX7 at 240 MHz, 8 MB quad flash, no PSRAM, Wi-Fi 802.11 b/g/n, and BLE 5. The sub-GHz radio is the onboard CC1101, using OOK and 2FSK across the 39 channels listed in the sketch between 300–348, 387–464, and 779–928 MHz. The board also has a Ra-02 SX1278 LoRa module. GPIO 48 is connected to the SX1278's DIO0; the CC1101's GDO0 is not routed to a readable GPIO. Resetting or sleeping the SX1278 does not provide a CC1101 data connection. GPIO 26 is reserved on the PCB for a future SX1262 and is unused. The MAX17048 fuel gauge is at I2C address `0x36`. Kept decodes are written to the microSD card as FOBworks RAW files, which the dashboard can read back. The firmware accepts CC1101 version-register values `0x04` and `0x14`; the detected value appears in the status chip.
 
@@ -93,7 +93,7 @@ When the dashboard is served over **HTTPS**, browsers block the card's plain `ws
 | `CITATIONS_AND_REFERENCES.md` | Sources for the firmware's protocol, board, and radio details. |
 | `LICENSE` | GNU General Public License v3.0. |
 | `bench_*.py` | Serial-side bench helpers: `bench_serial_log.py` logs and filters the card's JSON stream, `bench_send.py` sends commands, `bench_c2_capture.py` drives a capture. |
-| `test_*.py` | 42 host-side checks. See **Tests** below. |
+| `test_*.py` | 43 host-side checks. See **Tests** below. |
 
 This repository contains neither the React dashboard nor its source archive. The connection steps above apply if you have the dashboard source separately and unpack it into `FOBworks_SGP_Dashboard/`. You can flash and use the firmware over Wi-Fi without it; the card serves its own dashboard.
 
@@ -158,13 +158,13 @@ The mode commands include `capture`, `decode`, `replay`, `replay_predicted`, `re
 
 **Diagnostics:** `rssi_path_check`, `rx_floor_check`, `tx_fifo_test`, `pa_check`, `jam_status`, `gdo0_probe`, `gdo0_isolate`, `gdo0_rail_test`, and `gdo0_signal`. The GDO0 set exists because this board does **not** route the CC1101's GDO0 to a readable GPIO. `gdo0_signal` is the decisive one: it cuts the LoRa's power so the SX1278's DIO0 is gone, then asks the CC1101 to emit its crystal clock on GDO0 and counts edges on pin 48 — the only test that can tell "unrouted" apart from "the LoRa was masking it". It is documented in **Hardware limits** below.
 
-**Instrumentation:** `claim_trace` (with `clear`) reports the last eight decodes — timing, gate, spread, and the protocol each claimed — and `GET /api/claim_trace` serves the same. `resync_curve`, `resync_curve_status`, `resync_mark`, and `resync_curve_clear` drive the resync-window profiler (`GET /api/resync_curve`). `p5_ids` arms, clears, or reports the parked RollJam watchdog (`GET /api/p5_ids`). `lora_cw_probe` keys the SX1278 as a continuous-wave carrier and measures the rise at the CC1101; release of the reset line is required first, the mode writes are read back one step each (STANDBY then TX), and a `meter_pegged` flag marks a reading at the RSSI rail. The hop-XOR strip appears on each KeeLoq decode as `hop_xor`. The Instruments tab draws the claim trace, the resync curve and the RollJam IDS read-out directly from those three endpoints.
+**Instrumentation:** `claim_trace` (with `clear`) reports the last eight decodes — timing, gate, spread, and the protocol each claimed — and `GET /api/claim_trace` serves the same. `resync_curve`, `resync_curve_status`, `resync_mark`, and `resync_curve_clear` drive the resync-window profiler (`GET /api/resync_curve`). `p5_ids` arms, clears, or reports the parked RollJam watchdog (`GET /api/p5_ids`). `lora_cw_probe` keys the SX1278 as a continuous-wave carrier and measures the rise at the CC1101; release of the reset line is required first, the mode writes are read back one step each (STANDBY then TX), and a `meter_pegged` flag marks a reading at the RSSI rail. `clone_class` classifies the held KeeLoq frames as a clone chip or a cipher-running part without the key, key-free — counter-linearity is a proof, hop-XOR sparsity a statistic (`GET /api/clone_class`). The hop-XOR strip appears on each KeeLoq decode as `hop_xor`, and the same decode carries `clone_class`. The Instruments tab draws the claim trace, the resync curve, the RollJam IDS read-out, and the clone-chip classifier directly from those endpoints.
 
 **Maintenance:** `hs_list`, `hs_clear`, `headless`, `freq_preset`, and `fobclone_scan`. `GET /api/reinit` reinitializes the radio; it does not regenerate credentials.
 
 ## Tests
 
-The 42 Python test suites run on the host; they do not require the card or a network connection. Depending on the test, they inspect or extract code from the firmware, compile state-machine logic against a mock radio, or check recorded captures. `test_serial_fuzz.py` additionally drives the card over USB when one is attached; `python3 test_serial_fuzz.py host` runs its source-level half alone.
+The 43 Python test suites run on the host; they do not require the card or a network connection. Depending on the test, they inspect or extract code from the firmware, compile state-machine logic against a mock radio, or check recorded captures. `test_serial_fuzz.py` additionally drives the card over USB when one is attached; `python3 test_serial_fuzz.py host` runs its source-level half alone.
 
 ```bash
 cd FOBworks_for_SGP
@@ -205,6 +205,7 @@ for t in test_*.py; do python3 "$t"; done
 | `test_serial_fuzz.py` | Serial dispatcher fuzz: adversarial lines (truncated JSON, wrong types, deep nesting, oversize, 24 random mutations) must each produce exactly one JSON reply or one named error — never silence, never a crash. Source half pins the intake/dispatch guarantees; live half runs them through the card |
 | `test_hop_xor.py` | Hop-XOR telemetry: the XOR of two same-button KeeLoq hops equals `E(ptA)^E(ptB)` and is order-symmetric (the property that makes rollback validation key-independent); ring wrap order stays oldest-first |
 | `test_keeloq_slide_lab.py` | KeeLoq related-key / clone-key lab: the host cipher is pinned to the card's published vectors and to the extracted `ks_klEncrypt`/`ks_klDecrypt` compiled with clang++; hop-XOR acts as a per-candidate filter; a clone-batch key (repeated byte / small alphabet / tiled pattern) is recovered and a random 64-bit key is shown unreachable |
+| `test_clone_classifier.py` | Clone-chip classifier: the real `ks_cloneClassify()` extracted from the sketch and the host tool `tools/clone_classifier.py` agree on all 26 synthetic cases (verdict, median, pair count, counter-linearity, discrimination flag); counter-linearity (`hop_xor == ctr_xor`) proves a non-cipher clone, the hop-XOR sparsity bands separate a counter-tracking clone (median 2) from real KeeLoq (median 16), twenty random OEM keys are never called a clone, and a drifting discrimination field across one counter run is caught while two fobs in the ring are not |
 | `test_brute_tick.py` | The brute sequencers: arming bounds, the counter/address sequence built in order, one transmit per tick with the inter-frame delay, single-flight refusal, progress and done events, `ok:false` on a failed transmit — and a source check that neither route blocks any more |
 | `test_ws_fuzz.py` | The WebSocket transport's intake: host-only structural checks (frame cap replies `ws-frame-too-long`, the `{` gate, drop-on-full queue, reply generation+auth guards, handshake/close), plus a stdlib WebSocket client that drives the same adversarial corpus the serial suite uses. Live pass is hardware-gated (`--ap`/`--host`); the client itself is verified against `tools/_ws_echo_server.py`. |
 | `test_claim_trace.py` | Live claim trace: the shipped eight-deep ring against the real ArduinoJson the sketch builds with — wrap order, newest-first render, an unclaimed decode carrying no protocol key, and the spread field being the shipped `ks_teStddev` as a percentage |
