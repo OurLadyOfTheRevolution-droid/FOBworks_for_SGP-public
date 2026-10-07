@@ -36,7 +36,7 @@ not the same as a paired vehicle receiver accepting a sequence.
 | Simultaneous jam + listen on one CC1101 | Single radio; C1 drops the carrier during capture windows |
 | 125 kHz passive-entry / Hitag2 / Megamos / DST40 | No LF front end; CC1101 starts at 300 MHz |
 | Off-band jamming from the SX1278 | Shared rail and ground; self-interference dominates |
-| PN532 / 13.56 MHz NFC | Present on I2C, unused by this firmware |
+| PN532 / 13.56 MHz NFC | Present on I2C at 0x24, unused by this firmware; HF, not the 125 kHz LF the immobilisers need |
 
 ## Falsified (do not re-derive)
 
