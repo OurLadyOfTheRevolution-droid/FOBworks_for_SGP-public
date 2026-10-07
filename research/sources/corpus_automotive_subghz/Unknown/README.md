@@ -13,6 +13,6 @@ These files could not be automatically categorized.
 
 ## Notes
 
-If you can identify these vehicles, please move them to the correct folder.
+Identified vehicles belong in the correct folder.
 
 *Added: 2026-08-17 18:49:30*

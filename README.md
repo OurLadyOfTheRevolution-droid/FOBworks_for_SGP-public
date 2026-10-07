@@ -8,8 +8,8 @@ The card serves its own dashboard. A separate React dashboard can run on a compu
 
 | | Card's own dashboard | React dashboard |
 | --- | --- | --- |
-| Where it runs | on the card | on your computer |
-| How you reach it | `http://192.168.4.1` | `http://localhost:5173` |
+| Where it runs | on the card | on a computer |
+| How to reach it | `http://192.168.4.1` | `http://localhost:5173` |
 | Transport | HTTP, port 80 | **USB Serial** (Chrome/Edge) or **WebSocket, port 81** |
 | Source | `FOBworks_for_SGP.ino` | Separate project; not included here |
 | Needs a computer | no — any phone works | yes |
@@ -36,15 +36,15 @@ Without this code, commands over serial, WebSocket, and HTTP are rejected with `
 ### Card's own dashboard
 
 1. Plug the card into USB.
-2. On your phone or computer, join the `SGP Card Mini` network with the WiFi password from the boot log.
+2. On a phone or computer, join the `SGP Card Mini` network with the WiFi password from the boot log.
 3. Open `http://192.168.4.1`.
 4. Enter the access code.
 
-The card provides a captive portal. On most phones, its dashboard opens after you join the network.
+The card provides a captive portal. On most phones, its dashboard opens after joining the network.
 
 ### React dashboard over USB
 
-The computer dashboard communicates with the card through the browser's **Web Serial** API. The card does not serve the React app; you must have its separate source available locally. It is not included in this firmware repository.
+The computer dashboard communicates with the card through the browser's **Web Serial** API. The card does not serve the React app; its separate source has to be available locally. It is not included in this firmware repository.
 
 1. Plug the card into USB.
 2. Close any other program using its serial port; this is the most common reason the connection fails.
@@ -95,7 +95,7 @@ When the dashboard is served over **HTTPS**, browsers block the card's plain `ws
 | `bench_*.py` | Serial-side bench helpers: `bench_serial_log.py` logs and filters the card's JSON stream, `bench_send.py` sends commands, `bench_c2_capture.py` drives a capture. |
 | `test_*.py` | 46 host-side checks. See **Tests** below. |
 
-This repository contains neither the React dashboard nor its source archive. The connection steps above apply if you have the dashboard source separately and unpack it into `FOBworks_SGP_Dashboard/`. You can flash and use the firmware over Wi-Fi without it; the card serves its own dashboard.
+This repository contains neither the React dashboard nor its source archive. The connection steps above apply when the dashboard source is available separately and unpacked into `FOBworks_SGP_Dashboard/`. The firmware can be flashed and used over Wi-Fi without it; the card serves its own dashboard.
 
 ## Flash it
 
@@ -132,7 +132,7 @@ Current build: **58% flash, 49% RAM.**
 
 ## First run
 
-Plug the card into USB and open the serial log at 115200 baud to get the Wi-Fi credentials and access code. Then join `SGP Card Mini` and open `http://192.168.4.1`. If you have the separate React dashboard, you can connect it to the card instead.
+Plug the card into USB and open the serial log at 115200 baud to get the Wi-Fi credentials and access code. Then join `SGP Card Mini` and open `http://192.168.4.1`. The separate React dashboard, when available, can connect to the card instead.
 
 The home screen offers four modes: FOBscan, FOBclone, FOBcatch, and FOBback. FOBscan's tabs are Capture, Scan, Decode, Predict, Keys, Library, and Instruments — the last drawing the claim trace, resync curve and parked RollJam IDS. Bluetooth scanning and pairing are reached over the HTTP API rather than through the card dashboard: `GET /api/ble_scan`, `GET /api/ble_results`, and the `/api/ble_pair_start`, `/api/ble_pair_status`, `/api/ble_pair_stop`, and `/api/ble_paired_devices` routes. See `PROMO.md` for an overview of each mode.
 
