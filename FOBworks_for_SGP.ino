@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v4.04
+// Version  : FOBworks for SGP v4.05
 // Board    : May 2026 stock, ESP32-S3-MINI-1-N8, 8 MB flash, no PSRAM
 // Radio    : CC1101, OOK and 2FSK, 300–928 MHz
 // Dashboard: http://192.168.4.1; per-device Wi-Fi credentials are printed over USB
@@ -195,6 +195,31 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
   // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+  // v4.05 (2026-10-07) — The gate decoders stop claiming noise. The corpus regression
+  //   found ks_decodeSomfy, ks_decodeNice and ks_decodeFAAC64 committing on captures of
+  //   other brands — including the same Tesla files, where Somfy and Nice then reported
+  //   mutually exclusive identities for one waveform (Somfy 9 files / 6 brands, Nice 6
+  //   files / 4 brands, FAAC64 2 Chrysler files). Two content discriminators were
+  //   measured and falsified before any change: maxAltRun and transition density both
+  //   overlap, because a genuine PWM frame decodes to an alternating bit stream too
+  //   (a Somfy frame built by buildSomfyRTS: 87 bits, maxAltRun 82). What works:
+  //
+  //   [CORE] A ratio window on te_somf and te_nice. Every sibling PWM gate carried one
+  //   and these two did not. The seven Somfy false commits measured ratio 1.95–2.01 and
+  //   4.45–6.48 against genuine 3.15–3.52, so [2.4, 4.0] drops all seven and keeps every
+  //   genuine frame; [1.6, 2.4] drops the Renault Nice commit and keeps genuine Nice.
+  //
+  // [CORE] Per-slice consensus (the vote) on all three. It is the only
+  //   control for FAAC64, whose decoder accepts 99.997% of random 64-bit windows, and
+  //   for the Nice commits at ratio 2.0 that sit exactly where genuine Nice lives.
+  //   Measured accept rates: Somfy 6.2%, Nice 99.99%, FAAC64 99.997%.
+  //
+  //   [HONEST] After the change the regression reports Somfy and Nice firing on ZERO
+  //   corpus files. FAAC64 still commits on the two Chrysler files — expected, since
+  //   gating it would also reject genuine frames; those are demoted to candidate at
+  //   runtime by the vote, not removed by geometry. test_gate_decoder_false_positives.py
+  //   pins all of it.
+  //
   // v4.04 (2026-10-07) — N28, the clone-chip classifier. The consensus vote already
   //   demoted a serial that only one slice of a burst agrees with; this generalises
   //   the idea to a key-free judgement of whether a transmitter's hop field behaves
@@ -1956,7 +1981,7 @@ struct RcProbe { int16_t off; uint8_t kind, reply; int8_t mark; };
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v4.04"
+#define FW_VER        "FOBworks for SGP v4.05"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
@@ -2237,6 +2262,13 @@ static bool ks_decodePSA(const uint16_t* w,int n,int te,
                         uint32_t& serial,uint16_t& roll,uint8_t& btn,
                         int& payLen,uint8_t pay[26]);
 static bool ks_consFiatV1(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr);
+static bool ks_consSomfy(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr);
+static bool ks_consNice(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr);
+static bool ks_consFAAC64(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr);
+static bool ks_decodeSomfy(const char* bits,int n,uint64_t& raw,uint8_t& ctrl,
+                           uint16_t& roll,uint32_t& addr);
+static bool ks_decodeNice(const char* bits,int n,uint32_t& sn,uint32_t& roll);
+static bool ks_decodeFAAC64(const char* bits,int n,uint64_t& fr);
 static bool ks_decodeFiatV1(const uint16_t* w,int n,uint32_t& serial,uint8_t& btn,
                             uint16_t& ctr,uint32_t& hop,uint8_t& variant);
 static bool ks_decodeRenaultHitag2(const uint16_t* w,int n,uint32_t& serial,uint8_t& btn,
@@ -5941,6 +5973,42 @@ static bool ks_consFiatV1(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint
   uint32_t hop=0; uint8_t var=0;
   return ks_decodeFiatV1(w16,n,sn,btn,ctr,hop,var);
 }
+// Somfy RTS is a de-obfuscated bit-stream decoder, so the vote hands it the slice as
+// raw widths and rebuilds the bit string the same way decodeSignal does. Identity is the
+// address; the command nibble is the "button". This is what demotes the residual Somfy
+// commits whose geometry is inseparable from a real frame.
+static bool ks_consSomfy(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr){
+  static char sb[CAP_SZ*4+16];
+  if(n>CAP_SZ) return false;
+  uint32_t a=0,bb=0; ks_km2(b,n,a,bb);
+  int m=ks_mkBits(b,n,sb,(a+bb)/2);
+  uint64_t raw=0; uint8_t ctrl=0; uint16_t roll=0; uint32_t addr=0;
+  if(!ks_decodeSomfy(sb,m,raw,ctrl,roll,addr)) return false;
+  sn=addr; btn=ctrl; ctr=roll; return true;
+}
+// Nice FLOR likewise decodes from the bit stream; identity is the 28-bit serial and the
+// decoder has no button field, so the vote compares the serial alone.
+static bool ks_consNice(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr){
+  static char sb[CAP_SZ*4+16];
+  if(n>CAP_SZ) return false;
+  uint32_t a=0,bb=0; ks_km2(b,n,a,bb);
+  int m=ks_mkBits(b,n,sb,(a+bb)/2);
+  uint32_t nsn=0,nroll=0;
+  if(!ks_decodeNice(sb,m,nsn,nroll)) return false;
+  sn=nsn; btn=0; ctr=(uint16_t)(nroll&0xFFFF); return true;
+}
+// FAAC-64's identity is the upper 32 bits (the serial). Like Nice, it decodes from the bit
+// stream. This decoder accepts ~99.997% of random 64-bit windows, so geometry and content
+// cannot separate a real frame from noise; the vote is the only available control.
+static bool ks_consFAAC64(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint16_t& ctr){
+  static char sb[CAP_SZ*4+16];
+  if(n>CAP_SZ) return false;
+  uint32_t a=0,bb=0; ks_km2(b,n,a,bb);
+  int m=ks_mkBits(b,n,sb,(a+bb)/2);
+  uint64_t fr=0;
+  if(!ks_decodeFAAC64(sb,m,fr)) return false;
+  sn=(uint32_t)(fr>>32); btn=0; ctr=(uint16_t)(fr&0xFFFF); return true;
+}
 
 //
 // The counter recorded here is what lets rbArm refuse a pair that is really the same
@@ -8583,13 +8651,25 @@ String decodeSignal(){
   // Somfy RTS spec TE ≈604µs; tightened from 300-700 to cut overlap with KeeLoq/PWM noise.
   // Somfy-RTS is 433.42 MHz ± ~0.5 MHz only. Gate on frequency to eliminate
   // false positives at 315 MHz where the nibble-XOR checksum still passes by chance.
-  bool te_somf=(mhz>=432.0f&&mhz<=434.8f&&cA>=440&&cA<=750&&bLen>=56);
+  // Ratio window, measured: every sibling PWM gate here carries one and this one did not.
+  // Sweeping the corpus, the captures this decoder wrongly committed on presented ratio
+  // 1.95–2.01 (Audi A3, VW Golf4, Skoda) and 4.45–6.48 (Tesla, Subaru, three left-blink
+  // van files); genuine Somfy frames built by buildSomfyRTS present 3.15–3.52. A window
+  // of 2.4–4.0 drops all seven false commits and keeps every genuine frame. The window is
+  // wide on purpose: the 1T:2T symbols cluster at 3.1–3.5 through the de-obfuscation
+  // grouping, not at 2.0.
+  bool te_somf=(mhz>=432.0f&&mhz<=434.8f&&cA>=440&&cA<=750&&ratio>=2.4f&&ratio<=4.0f&&bLen>=56);
   // Nice FLOR spec TE ≈500µs; window ±16% (420–580µs) to reject car-fob pulse trains
   // that previously caused false Nice-FLOR decodes at 433 MHz (was 340–660µs).
   // !te_kl guard added: KeeLoq fobs at 433 MHz have TE 400–500µs which overlaps the
   // Nice-FLOR TE window; without this guard partial KeeLoq captures fall through to
   // Nice-FLOR after ks_parseKL fails on insufficient bits.
-  bool te_nice=(eu433&&!te_kl&&cA>=420&&cA<=580&&bLen>=52);
+  // Ratio window, measured the same way as te_somf: genuine Nice frames present ratio
+  // 2.0; captures wrongly committed here (Ren2 at 3.66) and the Audi/VW cluster (1.95–2.01)
+  // are separated by a 1.6–2.4 window. Three of the six residual commits sit at ratio 2.0
+  // where genuine Nice lives, so geometry alone cannot separate them — those are demoted
+  // by the per-slice consensus guard instead (see the Nice commit block).
+  bool te_nice=(eu433&&!te_kl&&cA>=420&&cA<=580&&ratio>=1.6f&&ratio<=2.4f&&bLen>=52);
   // Marantec operates at 433 MHz. Adding eu433 guard removes false positives at 315 MHz.
   bool te_mar =(eu433&&cA>=800&&cA<=1200&&bLen>=16);
   // PT2262 fires when ratio≈3 (1T:3T Princeton tri-state encoding).  Guard out the
@@ -9137,11 +9217,11 @@ String decodeSignal(){
   // 2. CAME-12
   if(!decoded&&te_came&&bLen>=24){uint16_t code=0;if(ks_decodeCame12(bits,bLen,code)){decoded=true;doc["proto"]="CAME-12";doc["code"]=code;char ch[6];snprintf(ch,6,"0x%03X",code);doc["code_hex"]=ch;doc["mfr"]="CAME";doc["ctr"]=code;HistEntry he={code,0,(uint32_t)code,1,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(code,1,(uint32_t)code);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_1"]=(code+d)&0xFFF;p["next_2"]=(code+2*d)&0xFFF;p["next_3"]=(code+3*d)&0xFFF;p["window"]=256;p["note"]="CAME counter wraps at 4096";}}
   // 3. FAAC-64
-  if(!decoded&&te_faac&&bLen>=64){uint64_t fr=0;if(ks_decodeFAAC64(bits,bLen,fr)){decoded=true;doc["proto"]="FAAC-64";char fh[20];snprintf(fh,20,"%08lX%08lX",(unsigned long)(fr>>32),(unsigned long)(fr&0xFFFFFFFF));doc["frame"]=fh;uint32_t fsn=(uint32_t)(fr>>32);uint16_t ctr=(uint16_t)(fr&0xFFFF);doc["sn"]=fsn;doc["ctr"]=ctr;doc["mfr"]="FAAC";HistEntry he={fsn,(uint32_t)(fr&0xFFFFFFFF),(uint32_t)ctr,2,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(fsn,2,(uint32_t)ctr);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((ctr+d)&0xFFFF);p["window"]=1024;p["note"]="FAAC cipher key required for hop prediction";}}
+  if(!decoded&&te_faac&&bLen>=64){uint64_t fr=0;if(ks_decodeFAAC64(bits,bLen,fr)){decoded=true;doc["proto"]="FAAC-64";char fh[20];snprintf(fh,20,"%08lX%08lX",(unsigned long)(fr>>32),(unsigned long)(fr&0xFFFFFFFF));doc["frame"]=fh;uint32_t fsn=(uint32_t)(fr>>32);uint16_t ctr=(uint16_t)(fr&0xFFFF);doc["sn"]=fsn;doc["ctr"]=ctr;doc["mfr"]="FAAC";{int cAgree=0,cTot=0;ks_consensusVote(rfBuf,rfLen,ks_consFAAC64,fsn,0,&cAgree,&cTot);char cs[8];snprintf(cs,8,"%d/%d",cAgree,cTot);doc["consensus"]=cs;if(cTot>=2&&cAgree<2&&cAgree<cTot){doc["confirmed"]=false;doc["candidate"]=true;}}HistEntry he={fsn,(uint32_t)(fr&0xFFFFFFFF),(uint32_t)ctr,2,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(fsn,2,(uint32_t)ctr);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_ctr"]=(uint32_t)((ctr+d)&0xFFFF);p["window"]=1024;p["note"]="FAAC cipher key required for hop prediction";}}
   // 4. Somfy RTS
-  if(!decoded&&te_somf&&bLen>=56){uint64_t raw=0;uint8_t ctrl=0;uint16_t roll=0;uint32_t addr=0;if(ks_decodeSomfy(bits,bLen,raw,ctrl,roll,addr)){decoded=true;doc["proto"]="Somfy-RTS";char rh[18];snprintf(rh,18,"%014llX",(unsigned long long)raw);doc["raw"]=rh;doc["ctrl"]=ctrl;doc["roll"]=roll;doc["addr"]=addr;doc["mfr"]="Somfy";HistEntry he={addr,0,(uint32_t)roll,3,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(addr,3,(uint32_t)roll);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_roll"]=(uint32_t)((roll+d)&0xFFFF);p["window"]=16;p["note"]="Somfy RTS: replay_predicted rebuilds full frame with checksum";}}
+  if(!decoded&&te_somf&&bLen>=56){uint64_t raw=0;uint8_t ctrl=0;uint16_t roll=0;uint32_t addr=0;if(ks_decodeSomfy(bits,bLen,raw,ctrl,roll,addr)){decoded=true;doc["proto"]="Somfy-RTS";char rh[18];snprintf(rh,18,"%014llX",(unsigned long long)raw);doc["raw"]=rh;doc["ctrl"]=ctrl;doc["roll"]=roll;doc["addr"]=addr;doc["mfr"]="Somfy";{int cAgree=0,cTot=0;ks_consensusVote(rfBuf,rfLen,ks_consSomfy,addr,ctrl,&cAgree,&cTot);char cs[8];snprintf(cs,8,"%d/%d",cAgree,cTot);doc["consensus"]=cs;if(cTot>=2&&cAgree<2&&cAgree<cTot){doc["confirmed"]=false;doc["candidate"]=true;}}HistEntry he={addr,0,(uint32_t)roll,3,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(addr,3,(uint32_t)roll);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_roll"]=(uint32_t)((roll+d)&0xFFFF);p["window"]=16;p["note"]="Somfy RTS: replay_predicted rebuilds full frame with checksum";}}
   // 5. Nice FLOR
-  if(!decoded&&te_nice&&bLen>=52){uint32_t nsn=0,nroll=0;if(ks_decodeNice(bits,bLen,nsn,nroll)){decoded=true;doc["proto"]="Nice-FLOR";doc["sn"]=nsn;doc["roll"]=nroll;doc["mfr"]="Nice";HistEntry he={nsn,0,nroll,4,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(nsn,4,nroll);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_roll"]=(nroll+d)&0xFFFFFF;p["window"]=1024;p["note"]="Nice cipher not public — structural only";}}
+  if(!decoded&&te_nice&&bLen>=52){uint32_t nsn=0,nroll=0;if(ks_decodeNice(bits,bLen,nsn,nroll)){decoded=true;doc["proto"]="Nice-FLOR";doc["sn"]=nsn;doc["roll"]=nroll;doc["mfr"]="Nice";{int cAgree=0,cTot=0;ks_consensusVote(rfBuf,rfLen,ks_consNice,nsn,0,&cAgree,&cTot);char cs[8];snprintf(cs,8,"%d/%d",cAgree,cTot);doc["consensus"]=cs;if(cTot>=2&&cAgree<2&&cAgree<cTot){doc["confirmed"]=false;doc["candidate"]=true;}}HistEntry he={nsn,0,nroll,4,mhz,nowMs};ks_hPush(he);int32_t d=ks_estDelta(nsn,4,nroll);JsonObject p=doc["predict"].to<JsonObject>();p["delta"]=d;p["next_roll"]=(nroll+d)&0xFFFFFF;p["window"]=1024;p["note"]="Nice cipher not public — structural only";}}
   // 6. Marantec
   if(!decoded&&te_mar&&bLen>=32){uint16_t ma=0;uint8_t mc=0;if(ks_decodeMarantec(bits,bLen,ma,mc)){decoded=true;doc["proto"]="Marantec-D";doc["addr"]=ma;doc["cmd"]=mc;doc["mfr"]="Marantec";HistEntry he={ma,0,(uint32_t)ma,5,mhz,nowMs};ks_hPush(he);JsonObject p=doc["predict"].to<JsonObject>();p["window"]=256;p["note"]="Marantec rolling cipher not public";}}
   // 7. PT2262

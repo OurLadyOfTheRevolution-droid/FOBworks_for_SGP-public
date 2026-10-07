@@ -1,6 +1,6 @@
 # FOBworks for SGP
 
-FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 4.04.
+FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 4.05.
 
 This build targets the SGP Card Mini stock acquired in May 2026: an ESP32-S3-MINI-1-N8 with a dual-core LX7 at 240 MHz, 8 MB quad flash, no PSRAM, Wi-Fi 802.11 b/g/n, and BLE 5. The sub-GHz radio is the onboard CC1101, using OOK and 2FSK across the 39 channels listed in the sketch between 300–348, 387–464, and 779–928 MHz. The board also has a Ra-02 SX1278 LoRa module. GPIO 48 is connected to the SX1278's DIO0; the CC1101's GDO0 is not routed to a readable GPIO. Resetting or sleeping the SX1278 does not provide a CC1101 data connection. GPIO 26 is reserved on the PCB for a future SX1262 and is unused. The MAX17048 fuel gauge is at I2C address `0x36`. Kept decodes are written to the microSD card as FOBworks RAW files, which the dashboard can read back. The firmware accepts CC1101 version-register values `0x04` and `0x14`; the detected value appears in the status chip.
 
@@ -93,7 +93,7 @@ When the dashboard is served over **HTTPS**, browsers block the card's plain `ws
 | `CITATIONS_AND_REFERENCES.md` | Sources for the firmware's protocol, board, and radio details. |
 | `LICENSE` | GNU General Public License v3.0. |
 | `bench_*.py` | Serial-side bench helpers: `bench_serial_log.py` logs and filters the card's JSON stream, `bench_send.py` sends commands, `bench_c2_capture.py` drives a capture. |
-| `test_*.py` | 43 host-side checks. See **Tests** below. |
+| `test_*.py` | 45 host-side checks. See **Tests** below. |
 
 This repository contains neither the React dashboard nor its source archive. The connection steps above apply if you have the dashboard source separately and unpack it into `FOBworks_SGP_Dashboard/`. You can flash and use the firmware over Wi-Fi without it; the card serves its own dashboard.
 
@@ -186,6 +186,7 @@ for t in test_*.py; do python3 "$t"; done
 | `test_raw_polarity.py` | Capture polarity survives export and replay |
 | `test_a2_reporting.py` | The Kia V3/V4 verdict is not overstated; duplicates collapse |
 | `test_decoder_false_positives.py` | Decoder guards against cross-brand false positives on the corpus |
+| `test_gate_decoder_false_positives.py` | Somfy/Nice/FAAC64 gates no longer claim other brands' captures; genuine frames still decode |
 | `test_toyota_reachability.py` | The Toyota decoder fires on its own captures, not only foreign ones |
 | `test_review_v373_fixes.py` | Source-level checks for review fixes; hardware behavior is not proved by these checks |
 | `test_hexstr_bounds.py`, `test_sub_replay_body_limit.py` | Buffer bounds |
