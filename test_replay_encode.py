@@ -217,7 +217,7 @@ int main(void){
                   f"runs ({runs}) are consistent with the pulse count ({len(frame)}), "
                   f"so the frame did not collapse")
             check(maxrun <= 24, f"longest single-level run ({maxrun}) is short")
-        # The fix: te comes from clustering, the chosen symbol is te itself, and
+        # The fix: te comes from clustering, the chosen symbol is te itself.
         # the protocol's short:long ratio survives quantisation.
         mt = re.search(r"te_short=(\d+) te_long=(\d+) cluster_ratio=([\d.]+)", out)
         check(mt is not None, "te derived from clustering is reported")

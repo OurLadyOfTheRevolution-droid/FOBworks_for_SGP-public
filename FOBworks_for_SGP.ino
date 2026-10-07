@@ -1291,7 +1291,7 @@
 //     "serial & 0xFF" would have passed every test. Vector 2 uses
 //     serial=0x0A1B2FE7 (serial[9:8]=11) to pin the mask width. Both computed
 //     from lib/subghz/protocols/kia_v3_v4.c:243 and verified with the shipped
-// cipher. Note: §2 and §3.2 contain two errors, documented and
+// cipher. Note: §2 and §3.2 contain two errors, documented
 //     NOT applied — §2's vectors are ENCRYPT not DECRYPT (ENC matches 3/3), and
 //     §3.2's 0x2E7 is wrong (0x3FF is a 10-bit mask, so serial&0x3FF = 0x0E7).
 //     Applying §3.2 would have made the KAT pass a wrong implementation.
@@ -2172,7 +2172,7 @@ uint32_t capMaxMsOverride = 0;
 // toggles is not evidence the signal came from the CC1101. It governs all three paths that
 // could otherwise be fooled by a toggle -- jam, replay, and capture.
 //
-// Set true only on a board where GDO0 really is wired. records the measurement and
+// Set true only on a board where GDO0 really is wired. records the measurement
 // the vendor firmware says the same; neither is a reason to probe for it at runtime, because a
 // probe cannot tell the two chips' pins apart.
 bool gdo0Routed = false;

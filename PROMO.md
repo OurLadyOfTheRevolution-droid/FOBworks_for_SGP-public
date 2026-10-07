@@ -49,7 +49,7 @@ A standalone FOBworks RAW file contains a short header, frequency, and pulse lis
 
 Key recovery is intended for an owned KeeLoq fob. Press the same button two to five times while the card listens. Recovery checks the built-in table and any keys saved on the card. It keeps a candidate only if every press decrypts to the same serial and button with a counter that advances. A match to a filler pattern in the built-in table is labeled **pattern match**; a saved key is reported separately. If no key matches, recovery reports no match. It does not derive a manufacturer key from a transmission.
 
-The built-in table contains 73 entries. Of this firmware's 44 decoders, 33 have never fired on the corpus, and 258 of 301 captures are matched by none — mostly because the corpus is car fobs while the never-firing set is largely gate and garage protocols (Came, Nice, FAAC, Hörmann, Sommer, and the like). Kia is the exception worth naming: both V1 and V34 match, and after the claim-bug fix the V1 decoder runs on the card as well as in the host harness; the four Kia decoders that still find nothing are V0, V2, V7, and SantaFe. `tools/corpus_regression.py` reproduces these counts and its header comment records the results.
+The built-in table contains 73 entries. Of this firmware's 44 decoders, 35 have never fired on the corpus, and 270 of 301 captures are matched by none — mostly because the corpus is car fobs while the never-fire set is largely gate and garage protocols (Came, Nice, FAAC, Hörmann, Sommer, and the like). Kia is the exception worth naming: both V1 and V34 match, and after the claim-bug fix the V1 decoder runs on the card as well as in the host harness; the four Kia decoders that still find nothing are V0, V2, V7, and SantaFe. The live ledger is `docs/CORPUS_SCORECARD.md`, regenerated from `tools/corpus_regression.py`.
 
 Recovery reports a candidate only when it decrypts two consecutive frames consistently. A single frame is not enough: this check uses 12 bits, so a wrong key may match one frame about once in 4,000 tries. Transmitting a code derived from a wrong key could desynchronize the fob.
 
@@ -85,7 +85,7 @@ Four read-outs run alongside the modes. They are serial and HTTP first; the card
 
 **Second-radio CW probe.** `{"cmd":"lora_cw_probe"}` keys the SX1278 as a continuous-wave carrier and reads the rise back at the CC1101, measuring how much the second radio lifts the CC1101's own floor. It is a bench measurement, not a mode.
 
-**What the bench measured.** Run against the card with the two radios side by side, the second radio is not usable as an off-band jammer. Keyed at 433.92 MHz it lifts the CC1101's floor by more than 60 dB on-channel and is still 18 dB up at 8 MHz away; the two radios share a rail and a ground plane, so the coupling is the PA operating into the neighbouring front end, not a distant signal. The probe and the control (`lora_power_floor`) are what establish that, and
+**What the bench measured.** Run against the card with the two radios side by side, the second radio is not usable as an off-band jammer. Keyed at 433.92 MHz it lifts the CC1101's floor by more than 60 dB on-channel and is still 18 dB up at 8 MHz away; the two radios share a rail and a ground plane, so the coupling is the PA operating into the neighbouring front end, not a distant signal. The probe and the control (`lora_power_floor`) are what establish that; the write-up is `research/88_SX1278_SELFJAM_MEASURED.md`.
 
 ## A basic capture workflow
 
