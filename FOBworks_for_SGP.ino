@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v4.02
+// Version  : FOBworks for SGP v4.03
 // Board    : May 2026 stock, ESP32-S3-MINI-1-N8, 8 MB flash, no PSRAM
 // Radio    : CC1101, OOK and 2FSK, 300–928 MHz
 // Dashboard: http://192.168.4.1; per-device Wi-Fi credentials are printed over USB
@@ -195,6 +195,29 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
   // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+  // v4.03 (2026-10-06) — The instrument layer gets its read-out. P3, P4 and P5 were
+  //   shipped firmware-only: the claim trace (P4/N22), the resync-curve profiler
+  //   (P3) and the parked RollJam IDS (P5/N24) were all reachable over serial, HTTP
+  //   and the WebSocket, but the card's own dashboard had no panel for any of them —
+  //   the numbers existed and nothing drew them. A sixth tab, Instruments, closes
+  // that gap and is the capture UI section 6 asked for.
+  //
+  //   [UI] Claim Trace lists every decodeSignal commit newest-first — protocol, gate,
+  //   TE, edge spread, and frame hash — so a loose-gate claim or the KeeLoq sentinel
+  //   is visible as a line rather than inferred. That is the Kia V1 failure of
+  // made legible in one row.
+  //
+  //   [UI] Resync Curve plots accepted/rejected/unknown against probe offset on a
+  //   canvas, with Run, and hand Mark Accept / Mark Reject for a BCM that does not
+  //   answer on RF. A hand mark overrides the RF guess, matching the firmware.
+  //
+  //   [UI] Parked RollJam IDS shows the idle-floor baseline, the arm toggle, and each
+  //   press-pair suspect scored by floor rise, jam flag and counter step.
+  //
+  //   [TEST] test_control_surface_auth.py pins the tab, the three panels, the four
+  //   endpoints and the showTab(6) wiring, so a rename cannot quietly orphan them.
+  //   Compile: 1,843,980 B flash (58%), 163,668 B RAM (49%). 41 host suites green.
+  //
   // v4.02 (2026-10-06) — The SX1278 second-radio bench run. The P2 CW
   //   probe had never produced a trustworthy number; the reason was four defects in
   //   the probe itself, not the radio, and each was caught by a readback rather than
@@ -1896,7 +1919,7 @@ struct RcProbe { int16_t off; uint8_t kind, reply; int8_t mark; };
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v4.02"
+#define FW_VER        "FOBworks for SGP v4.03"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
