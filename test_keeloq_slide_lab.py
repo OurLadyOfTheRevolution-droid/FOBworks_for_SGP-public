@@ -79,8 +79,8 @@ def main():
             "  uint64_t ks[3] = {0xBEEFDEADBEEFDEADULL, 0x5CEC6701B79FD949ULL, 0x5CEC6701B79FD949ULL};\n"
             "  for(int i=0;i<3;i++) printf(\"%08lX\\n\", (unsigned long)ks_klEncrypt(pts[i],ks[i]));\n"
             "  // and a round-trip on one extra pair\n"
-            "  uint32_t c = ks_klEncrypt(0x12345678UL, 0x0123456789ABCDEFULL);\n"
-            "  printf(\"%08lX\\n\", (unsigned long)ks_klDecrypt(c, 0x0123456789ABCDEFULL));\n"
+            "  uint32_t c = ks_klEncrypt(0x2000C022UL, 0xBEEFDEADBEEFDEADULL);\n"
+            "  printf(\"%08lX\\n\", (unsigned long)ks_klDecrypt(c, 0xBEEFDEADBEEFDEADULL));\n"
             "  return 0;\n}\n"
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -97,11 +97,11 @@ def main():
                         zip((0x2000C022, 0xF741E2DB, 0x0CA69B92),
                             (0xBEEFDEADBEEFDEAD, 0x5CEC6701B79FD949, 0x5CEC6701B79FD949))]
                 check(card == host, "card and host agree on all three encrypted vectors")
-                check(int(out[3], 16) == 0x12345678,
+                check(int(out[3], 16) == 0x2000C022,
                       "card decrypt round-trips the extra pair (sanity on the extracted code)")
 
     print("\n=== the hop-XOR oracle is a real filter ===")
-    synth = 0xDEADBEEF12345678  # synthetic; the lab never needs a real manufacturer key
+    synth = 0xBEEFDEADBEEFDEAD  # synthetic; the lab never needs a real manufacturer key
     hops = lab.synth_hops(0x0A1B2CE7, 3, 0x100, synth, 3)
     check(lab.key_matches_all(hops, synth), "the true key passes the XOR filter")
     check(not lab.key_matches_all(hops, (synth ^ 1) & 0xFFFFFFFFFFFFFFFF),
@@ -127,7 +127,7 @@ def main():
     check(pk in pkh, "the pattern family recovers a tiled-pattern key")
 
     print("\n=== an OEM key stays out of reach (honesty check) ===")
-    oem = 0x123456789ABCDEF0  # a random-looking 64-bit key
+    oem = 0x5CEC6701B79FD949  # a random-looking 64-bit key
     ohops = lab.synth_hops(0x0A1B2CE7, 3, 0x100, oem, 3)
     all_space = set()
     all_space |= lab.keys_from_alphabet(b"AB")
@@ -138,7 +138,7 @@ def main():
           "the clone space yields no key for an OEM-style key — no false claim")
 
     print("\n=== the slide half is documented, and its cost is reported ===")
-    k0 = 0x0123456789ABCDEF
+    k0 = 0xBEEFDEADBEEFDEAD
     k1 = ((k0 >> 8) | (k0 << 56)) & 0xFFFFFFFFFFFFFFFF  # rot_right by 8
     check(lab.rotation_shift(k0, k1) == 8, "a rotation pair is detected at r=8")
     check(lab.rotation_shift(k0, k0 ^ 0xDEAD) is None,

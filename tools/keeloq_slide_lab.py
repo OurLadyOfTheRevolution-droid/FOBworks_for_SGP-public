@@ -292,7 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("--serial", type=lambda s: int(s, 0), default=0x0A1B2CE7)
     o.add_argument("--button", type=int, default=3)
     o.add_argument("--counter", type=int, default=0x100)
-    o.add_argument("--key", type=lambda s: int(s, 0), default=0xDEADBEEF12345678)
+    o.add_argument("--key", type=lambda s: int(s, 0), default=0xBEEFDEADBEEFDEAD)
     o.add_argument("--candidate", type=lambda s: int(s, 0), required=True)
     o.add_argument("--hops", type=int, default=3)
     o.set_defaults(func=_cmd_oracle)
