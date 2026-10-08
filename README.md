@@ -130,7 +130,7 @@ Libraries: Adafruit NeoPixel 1.12 or newer, ArduinoJson 7.x. SD, SPI, Wire, Pref
 
 Open `FOBworks_for_SGP.ino` from this folder and upload it to the SGP Card Mini. Keep `loop_stack.cpp` beside it; otherwise, the build will not link.
 
-Last verified build (v4.07): **59% flash, 53% RAM.**
+Current build: **59% flash, 54% RAM.**
 
 ## First run
 
@@ -236,7 +236,7 @@ The CC1101's GDO0 output is not connected to a readable GPIO on this board. GPIO
 
 **The board's only other radio is a 13.56 MHz HF front end, and it is not an LF path.** A PN532 sits on the shared I2C bus at address 0x24, alongside the MAX17048 gauge at 0x36, and the stock tool for it drives ISO14443A passive-target reads. That is 13.56 MHz, an order of magnitude above the 125 kHz the automotive immobilisers use, so it does not read Hitag2, Megamos or DST40 and does not provide the LF leg of a passive-entry relay — those need a 125 kHz coil, which this revision does not have. Nothing in FOBworks touches the PN532, and no command, decode or replay path depends on it. If 13.56 MHz NFC is wanted here, it is a separate feature rather than an extension of the sub-GHz work.
 
-The current build uses **53% of RAM** for statics (last measured at v4.07). The decode path and WebSocket inbound queue are the largest consumers. Runtime idle heap was 62,188 B after BLE was made lazy (v3.95) — before that, the BLE stack alone took ~71 KB and left ~1 KB, so no command could be parsed. Check `stack_hwm` and `heap_free` in the `status` response before extending the decode path.
+The current build uses **54% of RAM** for statics. The decode path and WebSocket inbound queue are the largest consumers. Runtime idle heap was 62,188 B after BLE was made lazy (v3.95) — before that, the BLE stack alone took ~71 KB and left ~1 KB, so no command could be parsed. Check `stack_hwm` and `heap_free` in the `status` response before extending the decode path.
 
 ## Development notes
 
