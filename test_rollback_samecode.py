@@ -67,7 +67,7 @@ def block(marker: str) -> str:
 
 # ── Static: the pieces exist and are wired ──────────────────────────────────
 assert "uint32_t ctr; bool hasCtr;" in src, "FbkEntry does not carry a counter"
-# FbkEntry also carries `trimmed`, which rbArm gates on , and the
+# FbkEntry also carries `trimmed`, which rbArm gates on, and the
 # identity fields that let a replay be checked against the stored frame.
 assert "bool trimmed;" in src, "FbkEntry does not carry the trimmed flag"
 assert "bool idOk; };" in src, "FbkEntry does not carry the frame-identity fields"

@@ -74,7 +74,7 @@ for want in ("replayRaw(mhz, rfBuf, rfLen, 3, rfStartHigh)",
     assert want in source, f"call site not passing polarity: {want}"
 
 # Stored buffers carry it.
-# The append moved into fbkAppend() , so the
+# The append moved into fbkAppend(), so the
 # polarity is now recorded as e.sh from the startHigh argument. The capture path
 # must pass rfStartHigh into it.
 app = re.search(r"static bool fbkAppend\((?P<body>.*?)\n\}", source, re.DOTALL)

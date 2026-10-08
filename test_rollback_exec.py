@@ -78,7 +78,7 @@ pieces = [
     src[src.index("enum RBPhase"):src.index("\n\n// Gap bounds")],
     block("static void rbReset()"),
     block("static bool fbkParseCtr("),
-    # fbkAppend now trims to one frame before storing , so the trim
+    # fbkAppend now trims to one frame before storing, so the trim
     # helper and its constants must come with it.
     block("static int klTrimToFrame("),
     block("static int rjTrimKiaV34("),
