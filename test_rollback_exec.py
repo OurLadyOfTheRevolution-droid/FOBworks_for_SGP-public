@@ -177,9 +177,17 @@ static String jsonRawField(const String& j,const char* key){
 
 // A captured "code" the sequencer can transmit.
 struct FbkEntry { uint16_t w[CAP_SZ]; int len; float freq; uint32_t ts; bool sh;
-                  uint32_t ctr; bool hasCtr; bool trimmed; };
+                  uint32_t ctr; bool hasCtr; bool trimmed;
+                  uint32_t idHop; uint32_t idSn; uint8_t idBtn; uint32_t idCtr; bool idOk; };
 static FbkEntry fbkBuf[FBK_MAX];
 static int      fbkCount = 0;
+
+// fbkAppend() now derives each entry's identity from its pulses. The identity itself is
+// irrelevant to the RollBack sequencing under test, so stub it out; the real one needs the
+// full KeeLoq parser chain (ks_km2/ks_klPwm/ks_parseKL) that this harness does not extract.
+static bool fbkIdentify(const uint16_t*,int,float,uint32_t&,uint32_t&,uint8_t&,uint32_t&){
+  return false;
+}
 
 // The one mocked transmit. Records the call so the test can assert order and count.
 bool replayRaw(float mhz,uint16_t* data,int len,int reps=3,bool startHigh=true){

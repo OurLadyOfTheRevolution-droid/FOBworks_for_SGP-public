@@ -67,8 +67,10 @@ def block(marker: str) -> str:
 
 # ── Static: the pieces exist and are wired ──────────────────────────────────
 assert "uint32_t ctr; bool hasCtr;" in src, "FbkEntry does not carry a counter"
-# FbkEntry also carries `trimmed`, which rbArm gates on.
-assert "bool trimmed; };" in src, "FbkEntry does not carry the trimmed flag"
+# FbkEntry also carries `trimmed`, which rbArm gates on , and the
+# identity fields that let a replay be checked against the stored frame.
+assert "bool trimmed;" in src, "FbkEntry does not carry the trimmed flag"
+assert "bool idOk; };" in src, "FbkEntry does not carry the frame-identity fields"
 assert "static int fbkCtrOrder()" in src, "fbkCtrOrder missing"
 assert "static bool fbkParseCtr(" in src, "fbkParseCtr missing"
 assert "static uint32_t fbkHash(" in src, "fbkHash missing"
@@ -111,7 +113,8 @@ HARNESS = r'''
 #include <string.h>
 
 struct FbkEntry { uint16_t w[512]; int len; float freq; uint32_t ts; bool sh;
-                  uint32_t ctr; bool hasCtr; bool trimmed; };
+                  uint32_t ctr; bool hasCtr; bool trimmed;
+                  uint32_t idHop; uint32_t idSn; uint8_t idBtn; uint32_t idCtr; bool idOk; };
 #define FBK_MAX 5
 static FbkEntry fbkBuf[FBK_MAX];
 static int fbkCount=0;

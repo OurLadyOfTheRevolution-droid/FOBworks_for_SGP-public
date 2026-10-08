@@ -246,6 +246,12 @@ def main():
                 if h not in need:
                     queue.append(h)
     need |= {"ks_km2", "ks_mkBits", "ks_manchester", "ks_inR", "rjTrimKiaV34", "klTrimToFrame"}
+    # The inline KeeLoq attempt is not an `if(!decoded)` dispatch, so decode_signal_order
+    # never sees it: it is the FIRST thing decodeSignal tries, guarded by its own gate. Pull in
+    # ks_klPwm/ks_parseKL/ks_bitsToU32 only when the model is requested (KEELOQ_MODEL), so the
+    # default closure stays the one the historical numbers were produced with.
+    if os.environ.get("KEELOQ_MODEL"):
+        need |= {"ks_klPwm", "ks_parseKL", "ks_bitsToU32"}
     # Helper referenced ONLY from a te_ gate, not from any decoder body, so the
     # body-driven closure above cannot reach it: te_kv1p -> ks_kia_v1_preamble.
     need |= set(re.findall(r"\b(ks_[A-Za-z0-9_]+)\s*\(", gate_block(src)))
@@ -300,13 +306,52 @@ def main():
 
     # Structs the decoders take by reference.
     structs = []
-    for name in ("KiaV34Frame", "KsH2Dec"):
+    for name in ("KiaV34Frame", "KsH2Dec", "KLFrame"):
         m = re.search(r"struct\s+" + name + r"\s*\{[^}]*\};", src, re.S)
         if m:
             structs.append(m.group(0))
 
     # Gate definitions, computed before the harness f-string that interpolates them.
     gate_defs = gate_block(src)
+
+    # The inline KeeLoq attempt (firmware line ~8920). Modelled as dispatch slot -1 so its
+    # "first hit" index stays negative and distinct from every real decoder index. The
+    # teCand[] candidates and the >=66-bit commit gate are the firmware's own, in its order.
+    #
+    # OPT-IN on purpose. It is faithful on a single-frame input (the Chrysler/Jeep KeeLoq
+    # fixtures decode to their recorded serials to the bit), but a corpus file is a
+    # MULTI-PRESS recording, and on one the inter-frame separators inflate cB/ratio past 3.0,
+    # which trips te_kl_leader and lets KeeLoq claim captures the firmware -- which records
+    # ONE press and never sees that ratio -- never offers it. Enabling it by default would
+    # therefore replace the historical per-decoder table with an artefact. Off by default the
+    # regression reproduces the shipped numbers exactly; on, it answers questions about
+    # single-frame KeeLoq input only.
+    kloq_block = ""
+    if os.environ.get("KEELOQ_MODEL"):
+        kloq_block = '''
+  if(ret<0 && (te_kl||te_kl_loose||te_kl_leader) && !te_kl_skip){
+    KLFrame kf; memset(&kf,0,sizeof(kf)); bool kOK=false;
+    static char klb_h[CAP_SZ/2+1];
+    uint32_t cand[4]; cand[0]=cA;
+    if(cB>0) cand[1]=cB>>1;
+    cand[2]=(mhz<320.f)?200:400;
+    cand[3]=(cA+((mhz<320.f)?200:400))>>1;
+    for(int t=0;t<4&&!kOK;t++){
+      if(cand[t]<60||cand[t]>1000) continue;
+      uint16_t klLen=ks_klPwm(buf,cnt,cand[t],klb_h);
+      if(klLen>=66&&ks_parseKL(klb_h,klLen,kf)){ kOK=true; break; }
+      if(klLen>=66){static char klm_h[CAP_SZ/4+1]; uint16_t mlm=ks_manchester(klb_h,klLen,klm_h);
+        if(mlm>=66&&ks_parseKL(klm_h,mlm,kf)){ kOK=true; break; }}
+    }
+    if(kOK){
+      if(getenv("KLDBG"))
+        fprintf(stderr,"  KeeLoq hit sn=0x%04X hop=0x%08X btn=%u ctr=%u cA=%u cB=%u ratio=%.2f bLen=%u\\n",
+                (unsigned)kf.sn,(unsigned)kf.hop,kf.btn,(unsigned)kf.rawCtr,(unsigned)cA,(unsigned)cB,ratio,(unsigned)bLen);
+      if(multi) printf(" H-1:%u",(unsigned)kf.sn);
+      else ret=-1;
+    }
+  }
+'''
 
     # Constants the gates and decoders use.
     consts = "\n".join(
@@ -444,14 +489,15 @@ static int run_all(int multi){{
      the trimmed raw buffer the firmware's rfBuf stands in for. */
   uint32_t* buf=BUF32; int cnt=n;
 {gate_defs}
+  int ret=-1;
   /* multi=1: evaluate EVERY decoder whose gate passes, and print each hit, so a file matched
      by two decoders is visible.
      multi=0: the firmware's own first-match behaviour. */
+{kloq_block}
   if(multi){{
 {chr(10).join(multi_calls)}
     return -1;
   }}
-  int ret=-1;
 {chr(10).join(calls)}
   return ret;
 }}
@@ -463,7 +509,11 @@ int main(int argc,char**argv){{
   double mhz=0;
   if(fscanf(f,"%lf",&mhz)!=1){{ fclose(f); return 2; }}
   int rn=0;
-  while(rn<4096){{ unsigned long v; if(fscanf(f,"%lu",&v)!=1) break; RAWIN[rn++]=(uint16_t)v; }}
+  {{ const char* _gf=getenv("FWKGAPFAITHFUL");
+     while(rn<4096){{ unsigned long v; if(fscanf(f,"%lu",&v)!=1) break;
+       if(_gf && v>=65535) continue;          /* firmware drops dur>=65535 (line 9910) */
+       RAWIN[rn++]=(uint16_t)v; }}
+  }}
   fclose(f);
   if(rn<18){{ printf("-1 0\\n"); return 0; }}
 
@@ -479,6 +529,29 @@ int main(int argc,char**argv){{
   else {{ for(int i=0;i<rn && i<HARDCAP;i++) BUF32[n++]=(uint32_t)RAWIN[i]; }}
 
   CNT=n; cnt_g=n;
+  /* FWKCAPFILT: apply the capture-path filters that shape rfBuf before decodeSignal on
+     hardware -- the sub-75 us merge and the 309-316 MHz sub-150 us fold. The harness feeds
+     the corpus pulses raw, which is a superset of what the firmware's rfBuf holds; a decoder
+     that only fires on the extra short pulses is a harness artefact, not firmware behaviour. */
+  {{ const char* _cf=getenv("FWKCAPFILT");
+    if(_cf){{
+      static uint32_t f1[HARDCAP]; int m=0;
+      for(int i=0;i<n;i++){{
+        if(BUF32[i]>=75){{ f1[m++]=BUF32[i]; }}
+        else if(m>0&&i+1<n){{ f1[m-1]+=BUF32[i]+BUF32[i+1]; i++; }}
+      }}
+      bool toy=(mhz>=309.0&&mhz<=316.0);
+      if(toy){{
+        static uint32_t f2[HARDCAP]; int r=0;
+        for(int k=0;k<m;k++){{
+          if(f1[k]>=150){{ f2[r++]=f1[k]; }}
+          else if(r>0&&k+1<m){{ f2[r-1]+=f1[k]+f1[k+1]; k++; }}
+        }}
+        for(int k=0;k<r;k++) BUF32[k]=f2[k];
+        n=r;
+      }} else {{ for(int k=0;k<m;k++) BUF32[k]=f1[k]; n=m; }}
+      cnt_g=n;
+    }} }}
   if(tl>0){{ for(int i=0;i<tl&&i<HARDCAP;i++) TRIM16[i]=trimmed[i]; tl_g=tl; }}
   else {{ for(int i=0;i<n&&i<HARDCAP;i++) TRIM16[i]=(uint16_t)BUF32[i]; tl_g=n; }}
   /* decodeSignal preprocessing, reproduced exactly:
@@ -592,7 +665,11 @@ int main(int argc,char**argv){{
                 for tok in toks[2:]:
                     if tok.startswith("H"):
                         parts = tok[1:].split(":")
-                        nm = names[int(parts[0])]
+                        di = int(parts[0])
+                        # di == -1 is the inline KeeLoq attempt, which has no index in
+                        # `names` (it is not an if(!decoded) dispatch). Name it explicitly
+                        # rather than letting names[-1] silently pick the last decoder.
+                        nm = "KeeLoq" if di < 0 else names[di]
                         hits_here.append(nm)
                         if len(parts) > 1:
                             ids_here[nm] = int(parts[1])
@@ -634,7 +711,7 @@ int main(int argc,char**argv){{
             if v["decoder"]:
                 first_hit[v["decoder"]].append((rel, v["brand"]))
 
-        for d in names:
+        for d in (["KeeLoq"] if (first_hit.get("KeeLoq") or all_hit.get("KeeLoq")) else []) + names:
             fst = first_hit.get(d, [])
             al = all_hit.get(d, [])
             brand = DECODER_BRAND.get(d)

@@ -55,7 +55,7 @@ assert "rawAppendPulses(rs,rfBuf,rfLen,512,true)" not in source, \
 assert 'polarity: first pulse is ' in source, "export does not record the polarity"
 
 # ── replayRaw takes and uses the flag ────────────────────────────────────────
-sig = re.search(r"bool replayRaw\(float mhz,uint16_t\* data,int len,int reps=3,bool startHigh=true\)\{",
+sig = re.search(r"bool replayRaw\(float mhz,uint16_t\* data,int len,int reps,bool startHigh,bool snapGrid\)\{",
                 source)
 assert sig, "replayRaw does not accept a start level (or changed signature)"
 # Slice from the DEFINITION. The sequencer adds a forward declaration earlier in
@@ -68,7 +68,7 @@ assert "bool st=startHigh;" in body, "replayRaw still starts at a hard-coded HIG
 for want in ("replayRaw(mhz, rfBuf, rfLen, 3, rfStartHigh)",
              "replayRaw(rfFreq, rfBuf, rfLen, 3, rfStartHigh)",
              "rfStartHighB)",
-             "fbkBuf[n].sh)",
+             "fbkBuf[n].sh,",
              "keys[i].sh)",
              "keys[idx].sh)"):
     assert want in source, f"call site not passing polarity: {want}"

@@ -10,7 +10,7 @@ FOBcatch and FOBback are guided transmit sequences. C1 and C2 are their respecti
 
 ## FOBscan
 
-FOBscan is the workbench for capture, sweep, decode, prediction, key management, and the signal library. These tools are arranged across six tabs.
+FOBscan is the workbench for capture, sweep, decode, prediction, key management, and the signal library. These tools are arranged across seven tabs: Capture, Scan, Decode, Predict, Keys, Library, and Instruments.
 
 **Capture** starts and stops listening, selects OOK or 2FSK, and shows the latest burst. **Scan** cycles through the card's channels or stays on one channel. **Decode** reports the protocol, serial, button, counter, and frame-check result. **Predict** shows the next counter inferred from frames in memory. **Keys** is where a saved manufacturer key is added, tested, or cleared. **Library** lists captures stored on the card, grouped by protocol and serial.
 
@@ -73,13 +73,15 @@ Bluetooth is reachable over the HTTP API, not the card dashboard. `GET /api/ble_
 
 ## Diagnostics
 
-Four read-outs run alongside the modes. They are serial and HTTP first; the card's dashboard does not surface them, so reach them over the `{"cmd":…}` path or the matching route.
+Four read-outs run alongside the modes, and the dashboard's Instruments tab draws all four from their endpoints: the claim trace, the resync curve, the parked RollJam watchdog, and the clone-chip classifier. Each has a serial command and an HTTP route, so the raw JSON is reachable over the `{"cmd":…}` path as well. Two further read-outs — the hop-XOR strip and the second-radio CW probe — are decode-side and bench read-outs rather than tab panels.
 
 **Claim trace.** The last eight decodes, newest first, each with the timing it decoded at, the pulse count, the timing spread, which gate ran, and the protocol label it produced. The gate reads `loose` for a bare claim, `gate` for a candidate, `known` for a confirmed decode. This is the view that shows a mis-gated frame next to the timing that produced it. `{"cmd":"claim_trace"}`, `{"cmd":"claim_trace","clear":true}`, or `GET /api/claim_trace`.
 
 **Resync curve.** A receiver's resynchronization window drawn as a curve rather than a single ramp: forward offsets, a backward step, and a replay of an already-seen code. Each probe transmits, then listens after a settle gap; a reply is marked only when the band rises 8 dB over idle for three samples. A body controller that does not acknowledge over RF yields `unknown`, not `reject`, and a probe can be marked by hand after watching the car. `{"cmd":"resync_curve"}`, `{"cmd":"resync_curve_status"}`, `{"cmd":"resync_mark","r":"accept"}`, `GET /api/resync_curve`.
 
 **Parked RollJam watchdog.** With the card parked and listening, this watches the idle noise floor against a fast-attack, slow-decay baseline and looks for the RollJam shape: the floor lifted by a jammer, then two KeeLoq frames from the same fob and button with consecutive counters inside 1.2 s. A passing car keying up is a spike and moves nothing; a jammer held on is a plateau. The score rides along on the next KeeLoq decode as `rolljam_ids`, `rolljam_jam` and `rolljam_floor_db`, and `{"cmd":"p5_ids"}` or `GET /api/p5_ids` reports it directly.
+
+**Clone-chip classifier.** For the held KeeLoq frames, this judges key-free whether the transmitter's hop field behaves like a cipher or like a counter in disguise. Counter-linearity is a proof — when the hop XOR equals the counter XOR, the part is not running a cipher — while hop-XOR sparsity is a statistic that separates a counter-tracking clone from real KeeLoq. `{"cmd":"clone_class"}` reports it, `GET /api/clone_class` serves the same, and every KeeLoq decode carries `clone_class`.
 
 **Hop-XOR strip.** For two same-button KeeLoq hops the XOR is key-independent — it equals the XOR of the two encoded plaintexts, not of the hopping codes — so the Decode tab shows it as a bit strip without recovering a key first. Read it as a fingerprint of two presses, not as a decode.
 
@@ -100,9 +102,9 @@ The basic workflow is to capture a transmission, inspect the decode, and save it
 
 ## What this revision can and cannot do
 
-Replay, jamming, and both sequencers drive the CC1101's power amplifier from its TX FIFO. A separate receiver decoded one transmitted frame as a Kia unlock and identified its protocol and button.
+Replay, jamming, and both sequencers drive the CC1101's power amplifier from its TX FIFO. A separate receiver decoded one transmitted frame as a Kia unlock and identified its protocol and button. A stored frame's identity can be read back without transmitting (`fbk_ident`), so a replay is checked against the frame actually held rather than the frame the caller asked for.
 
-Capture currently falls back to polling RSSI at roughly 1600 µs because the CC1101's demodulated data output is not connected to a readable GPIO. That is slower than a 400 µs Kia V3/V4 short pulse, so captures may contain uniform pulses without bit edges. The firmware rejects them with `no-bit-edges` rather than passing them to the decoders. Routing GDO0 or GDO2 to an available GPIO would improve capture.
+Capture currently falls back to polling RSSI at roughly 1600 µs because the CC1101's demodulated data output is not connected to a readable GPIO. That is slower than a 400 µs Kia V3/V4 short pulse, so captures may contain uniform pulses without bit edges. The firmware rejects them with `no-bit-edges` rather than passing them to the decoders. If the front end is latched first — every band reading within 2 dB of a flat floor — capture refuses outright with `capture_refused` and names `cc_reinit`, instead of arming on nothing. Routing GDO0 or GDO2 to an available GPIO would improve capture.
 
 The board has no low-frequency front end. The CC1101 cannot handle 125 kHz passive-entry wake-up or Hitag2, Megamos, and DST40 immobilisers below 300 MHz.
 

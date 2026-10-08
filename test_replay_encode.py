@@ -183,6 +183,66 @@ int main(void){
     if(p>=sepMin){ separators++; printf("    separator/sync: idx=%d width=%u\n", i, p); }
   }
   printf("payload_partials=%d payload_separators=%d\n", partials, separators);
+
+  /* ── Packet quantisation fidelity ─────────────────────────
+     The encoder snaps each pulse to the nearest whole symbol, so a JITTERY frame —
+     especially one whose short cluster sits well below the protocol te — loses pulses
+     that land past the midpoint between T and 2T, and the re-decoded frame is a
+     different one (measured on hardware: stored 0x98A26162 came back 0x19232862). A
+     frame already on-grid round-trips exactly. Reproduce the snap on a SYNTHETIC,
+     jitter-free frame so the result does not depend on capture noise: build T/2T
+     pulses from a fixed bit pattern, encode, decode the symbol runs back to widths,
+     and require bit-exact recovery. */
+  {
+    /* 96 alternating payload bits with no jitter: bit -> HI(T) LO(2T) or HI(2T) LO(T),
+       which is the same two-level shape a real PWM frame carries. Prepend the measured
+       te so the cluster/rate search has a clean short centroid. */
+    static uint16_t clean[2 + 96*2];
+    int n = 0;
+    uint32_t T = teShort;
+    clean[n++] = T; clean[n++] = T*2;         /* preamble pair */
+    uint32_t bits = 0xA5A5A5A5u;
+    for(int i=0;i<96;i++){
+      int bit = (bits >> (i & 31)) & 1;
+      if(bit){ clean[n++] = T;   clean[n++] = T*2; }
+      else   { clean[n++] = T*2; clean[n++] = T;   }
+    }
+    static uint16_t cleanCopy[sizeof(clean)/sizeof(clean[0])];
+    memcpy(cleanCopy, clean, sizeof(clean));
+    static uint32_t cleanU32[sizeof(clean)/sizeof(clean[0])];
+    for(int i=0;i<n;i++) cleanU32[i]=clean[i];
+    uint32_t ca=0,cb=0;
+    bool ok = ks_km2(cleanU32, n, ca, cb);
+    uint32_t tS = (ca<cb)?ca:cb;
+    uint8_t e2=0,m2=0;
+    uint8_t o2[64];
+    int n2 = ok ? ks_ccEncodeFrame(clean, n, true, tS, o2, 64) : 0;
+    /* Decode the level runs back into widths. A faithful on-grid encode reproduces the
+       exact T / 2T sequence, so the width counts come back equal. */
+    int mismatches = 0, hiCount = 0;
+    if(n2 > 0){
+      int totalbits = n2*8;
+      int cur = (o2[0] >> 7) & 1, run = 0;
+      uint32_t widths[512]; int nw = 0;
+      for(int i=0;i<totalbits && nw<511;i++){
+        int v = (o2[i>>3] >> (7-(i&7))) & 1;
+        if(v==cur) run++;
+        else { widths[nw++] = (uint32_t)run; cur=v; run=1; }
+      }
+      widths[nw++] = (uint32_t)run;
+      /* Compare the first n-1 runs. A run per source pulse, but the FINAL run can absorb
+         the encoder's byte-alignment padding (the packet is a whole number of bytes, and
+         trailing 0 bits extend a final low run), which is not a fidelity loss. Every other
+         compared width must be exactly T or 2T in microseconds. */
+      for(int i=0;i<n-1 && i<nw;i++){
+        uint32_t wus = widths[i]*tS;
+        if(wus==T) hiCount++;
+        else if(wus==T*2){}
+        else mismatches++;
+      }
+    }
+    printf("clean_fit=%d clean_mismatches=%d\n", n2>0?1:0, mismatches);
+  }
   return 0;
 }
 """
@@ -261,8 +321,97 @@ int main(void){
             S = int(mm.group(1))
             check(S == teS if mt else True,
                   f"chosen symbol {S} us equals the clustered te, not a multiple of min()")
+        # §6: an ON-GRID frame must encode with no quantisation loss, because the
+        # card's packet TX is the only transmit path on this board and a lossy encode sends a
+        # DIFFERENT frame (hardware: stored 0x98A26162 came back 0x19232862 from a jittery
+        # capture). If this ever reports mismatches, the TX path is altering frames.
+        mc = re.search(r"clean_fit=(\d+) clean_mismatches=(\d+)", out)
+        check(mc is not None, "the on-grid quantisation check ran")
+        if mc:
+            fit, mism = int(mc.group(1)), int(mc.group(2))
+            check(fit == 1, "a synthetic jitter-free frame encodes at some resolution")
+            check(mism == 0,
+                  f"an on-grid frame encodes with ZERO quantisation mismatches (got {mism})")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    print("\n=== ks_snapGrid normalises a jittery body onto its own T/2T grid ===")
+    snap = extract_fn(src, "ks_snapGrid")
+    check(snap is not None, "ks_snapGrid extracted")
+    if snap and km2:
+        harness2 = r"""
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+#include <cstdlib>
+#define CAP_SZ 512
+""" + km2 + "\n" + snap + r"""
+static uint16_t JIT[300];
+static uint16_t OUT[300];
+int main(void){
+  /* Build a T/2T PWM frame with realistic capture jitter: T=180, 2T=360, +/- 40 us. */
+  uint32_t T=180, te=0;
+  int n=0;
+  /* preamble pairs first, as a real frame carries, so clustering locks on T/2T */
+  for(int i=0;i<8;i++){ JIT[n++]=T; JIT[n++]=T*2; }
+  uint32_t bits=0xC0FFEE11u;
+  for(int i=0;i<60;i++){
+    int b=(bits>>(i&31))&1;
+    int lo,hi;
+    if(b){ lo=T; hi=T*2; } else { lo=T*2; hi=T; }
+    int jl=(i*37)%81-40, jh=(i*53)%81-40;      /* deterministic pseudo-jitter */
+    lo+=jl; hi+=jh;
+    JIT[n++]=(uint16_t)lo; JIT[n++]=(uint16_t)hi;
+  }
+  int ns=ks_snapGrid(JIT,n,OUT,300);
+  if(ns<=0){ printf("SNAP_NONE n=%d\n",n); return 3; }
+  /* Every output value must be a whole multiple of the recovered te. */
+  uint32_t cA=0,cB=0; uint32_t ub[300];
+  for(int i=0;i<ns;i++) ub[i]=OUT[i];
+  int bad=0; uint32_t t=0;
+  if(ks_km2(ub,ns,cA,cB)){ t=(cA<cB)?cA:cB; }
+  for(int i=0;i<ns;i++){
+    if(t==0){ bad++; continue; }
+    if(OUT[i]%t != 0) bad++;
+    if(!(OUT[i]==t || OUT[i]==2*t)) bad++;
+  }
+  printf("SNAP n=%d te=%u offgrid=%d\n", ns, t, bad);
+  /* Idempotence: snapping an already-snapped body must report no change (returns 0). */
+  int again=ks_snapGrid(OUT,ns,OUT,300);
+  printf("SNAP_IDEMPOTENT again=%d\n", again);
+  return 0;
+}
+"""
+        tmp2 = Path(tempfile.mkdtemp())
+        try:
+            c2 = tmp2 / "s.cpp"
+            c2.write_text(harness2, encoding="utf-8")
+            cc = (shutil.which("c++") or shutil.which("clang++") or shutil.which("g++")
+                  or shutil.which("cc"))
+            r2 = subprocess.run([cc, "-O0", "-o", str(tmp2 / "s"), str(c2)],
+                                capture_output=True, text=True)
+            if r2.returncode != 0:
+                print("  FAIL snap harness did not compile:\n" + r2.stderr[:700])
+                FAILS.append("snap harness compile")
+            else:
+                p2 = subprocess.run([str(tmp2 / "s")], capture_output=True, text=True)
+                for line in p2.stdout.strip().splitlines():
+                    print("    " + line)
+                ms = re.search(r"SNAP n=(\d+) te=(\d+) offgrid=(\d+)", p2.stdout)
+                check(ms is not None, "the snap produced a body")
+                if ms:
+                    check(int(ms.group(1)) > 100, "the snapped body kept its length")
+                    check(int(ms.group(3)) == 0,
+                          f"every snapped pulse is a whole T or 2T (off-grid = {ms.group(3)})")
+                mi = re.search(r"SNAP_IDEMPOTENT again=(\d+)", p2.stdout)
+                check(mi is not None, "idempotence reported")
+                if mi:
+                    check(int(mi.group(1)) == 0,
+                          "re-snapping an on-grid body is a no-op (returns 0)")
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
 
     print("\n=== the replay path is wired and reports honestly ===")
     rr = extract_fn(src, "replayRaw")

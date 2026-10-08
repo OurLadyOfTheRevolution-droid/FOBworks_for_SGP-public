@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // FOBworks for SGP — firmware for the SGP Card Mini
-// Version  : FOBworks for SGP v4.05
+// Version  : FOBworks for SGP v4.09
 // Board    : May 2026 stock, ESP32-S3-MINI-1-N8, 8 MB flash, no PSRAM
 // Radio    : CC1101, OOK and 2FSK, 300–928 MHz
 // Dashboard: http://192.168.4.1; per-device Wi-Fi credentials are printed over USB
@@ -195,6 +195,96 @@
 //     (raw_bits and predicted_next stripped to stay within quota; cap 300 signals)
 //
   // ── CHANGELOG ─────────────────────────────────────────────────────────────────
+  // v4.09 (2026-10-08) — A capture refuses a latched front end, and the transmit snap
+  //   is recorded as a negative result rather than shipped as a fix.
+  //
+  //   [CORE] captureSignal() samples 304/315/434/868 before arming; when every band
+  //   reads within 2 dB AND that flat level is <= -95 dBm the front end is latched
+  // and the capture refuses with `capture_refused`, naming cc_reinit,
+  //   instead of arming on nothing. A healthy bench shows band structure, so the gate
+  //   only fires on the flat case. {"cmd":"capgate"} toggles it; ships on.
+  //
+  //   [NEGATIVE] ks_snapGrid() normalises a body onto its own T/2T grid, but MEASURED
+  //   it does not cure the jitter round-trip: the packet encoder already quantises to
+  //   the same grid, so the snap is redundant and, where it fired, produced a body the
+  //   receiver did not decode at all. It never changes a frame's identity, so it is
+  //   safe; it ships OFF (replaySnapDefault=false) behind {"cmd":"snapgrid"} so the
+  //   hypothesis stays testable. The real limit is capture quality — a jittery capture
+  // clusters its short symbol onto the wrong te.
+  //
+  //   [EVIDENCE] The CDC wedge of 108/109 does not reproduce: 68 asserted staging
+  //   batches (sizes 4-504, paced and unpaced, interleaved with captures) all passed
+  //   with every fbk_pulses_add reporting the full count. The readback that detects a
+  // silent drop is what should have existed all along.
+  //
+  // v4.08 (2026-10-08) — Replay can snap a body onto its own symbol grid.
+  //
+  //   [CORE] ks_snapGrid() normalises a pulse body onto its own T/2T grid — the same grid
+  //   the packet encoder and the receiver both re-derive. On an already on-grid frame it
+  //   is a no-op (returns 0, caller keeps the original); on a jittery one it removes the
+  //   boundary pulses that the decoder mis-splits, which is what made a round-trip decode
+  // a different frame (jittery 0xC5030B10 vs its snapped grid 0x9CA26962,
+  //   §6). Only applied when the clusters look like a real 1:2 PWM protocol, so a
+  //   fixed-code or off-ratio frame is left untouched.
+  //
+  //   [CORE] replayViaFifo/replayRaw take a snapGrid flag. fbk_replay snaps when the
+  //   knob is on (overridable per call with {"snap":0|1}) and reports "snapped",
+  //   identifying the snapped body so the echoed hop is the one actually sent.
+  //   {"cmd":"snapgrid","en":0|1} flips the default between runs.
+  //
+  // v4.07 (2026-10-08) — A stored frame can be read back, so a replay is no longer a
+  //   guess about which frame went out. The envelope-depth sweep in v4.06 could not be
+  //   trusted per level: the staged frame drifted between imports (the chunked-import
+  //   flakiness of the CDC wedge), so a "level 0x80 fails" reading could have been the
+  //   wrong frame rather than the shallow envelope. The fix is a first-class readback.
+  //
+  //   [CORE] FbkEntry carries the frame's identity (idHop/idSn/idBtn/idCtr/idOk),
+  //   derived from the STORED PULSES by fbkIdentify() — the same k-means centroids,
+  //   candidate TE list and ks_klPwm/ks_parseKL path decodeSignal uses, so the readback
+  //   agrees with a live decode instead of being a separate opinion.
+  //
+  //   [CORE] {"cmd":"fbk_ident"[,"n":idx]} reports what the entry holds WITHOUT
+  //   transmitting. fbk_replay now echoes the identity it actually sent, fbk_status
+  //   lists it per entry, and fbk_pulses_end returns it in the staging reply. Any of
+  //   these proves which frame is in the buffer without a second round trip.
+  //
+  //   [HONEST] A silently dropped chunk during a chunked import is the underlying
+  //   hazard (id of the CDC-wedge work). Until that is cured at the transport, the
+  //   readback is what makes the failure visible: assert fbk_pulses_add added the
+  //   expected count AND check fbk_ident/fbk_pulses_end ident_ok before trusting a
+  //   replay. The card cannot detect a dropped chunk on its own — it only ever sees the
+  //   pulses that arrived.
+  //
+  // v4.06 (2026-10-08) — The OOK transmit stage gets an envelope, and the card
+  //   round-trips through the air. A replay reported ok:true while radiating no
+  //   modulation: PATABLE was {0xC0,0xC0}, so OOK logic 0 and logic 1 both took
+  //   full power from their respective indices and the PA never keyed down — a
+  //   flat carrier, zero pulses. That was a regression from the zero-power fix in
+  //   v4.02 (PATABLE[1]=0x00), which set index 1 and took index 0 up with it, and
+  //   the old PA_LEVELS_PRESENT verdict could not see it because both levels were
+  //   non-zero, which is the opposite of what OOK needs.
+  //
+  //   [CORE] The pair lives in ookPatLow/ookPatHigh (default 0x00/0xC0), written by
+  //   both cc_init and cc_armOokPA. The arm guard now refuses a pair whose two
+  //   levels are equal, so an envelope can never be silently collapsed.
+  //
+  //   [CORE] pa_check reports envelope_ok and a OOK_LEVELS_EQUAL_NO_ENVELOPE verdict
+  //   for the collapsed case; PA_LEVELS_PRESENT now means the levels are set AND
+  //   differ.
+  //
+  //   [CORE] {"cmd":"ookpa","low":L,"high":H} sets the pair live, refuses L==H, and
+  //   restores the previous pair if the write did not read back. With it the card
+  //   transmits a stored frame, Flipper2 captures it, and the card decodes its own
+  //   transmission to the identical serial, button and counter — the loop closes
+  //   with no Flipper as the source.
+  //
+  //   [MEASURED] Envelope-depth boundary, high=0xC0, captured on Flipper2 rx_raw:
+  //   a frame resolves at low 0x00..0x70 (three bursts, full pulse count) and is
+  //   GONE at low 0x80 and 0xA0 (zero bursts, no pulses), reproduced across two
+  //   sweeps. So a receiver tolerates roughly a 25% depth reduction and nothing
+  //   more — which is why a relay that compresses the envelope is fatal, and why
+  //   the off/on pair matters far more than raw power.
+  //
   // v4.05 (2026-10-07) — The gate decoders stop claiming noise. The corpus regression
   //   found ks_decodeSomfy, ks_decodeNice and ks_decodeFAAC64 committing on captures of
   //   other brands — including the same Tesla files, where Somfy and Nice then reported
@@ -1758,6 +1848,10 @@
 //   {"cmd":"scan"}                  — report current sweep statistics
 //   {"cmd":"scan_toggle"}           — pause / resume auto-scan sweep
 //   {"cmd":"setfreq","f":868.35}    — lock RF to a specific frequency
+//   {"cmd":"cc_reinit","f":315}     — re-run CC1101 bring-up (floor spread before/after)
+//   {"cmd":"capture","trig":-60}    — capture with an explicit trigger level (dBm)
+//   {"cmd":"capture","ms":60}       — cap the edge-recording window (ms, 20-3000)
+//   {"cmd":"gain","target":0..7}    — AGCCTRL2 front-end gain for captures (-1 = default)
 //   {"cmd":"squelch","dbm":-60}     — set auto-capture threshold (dBm)
 //   {"cmd":"key_recover"}           — attempt full MFR-key search (needs 2+ frames)
 //   {"cmd":"hop_xor"}               — key-independent hop-XOR telemetry over held frames
@@ -1981,7 +2075,7 @@ struct RcProbe { int16_t off; uint8_t kind, reply; int8_t mark; };
 #define RGB_N             1
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-#define FW_VER        "FOBworks for SGP v4.05"
+#define FW_VER        "FOBworks for SGP v4.09"
 // Minimum battery voltage under which a CC1101 TX burst is refused (PA current spike
 // can otherwise sag a weak pack below the MCU brown-out threshold mid-transmission).
 #define TX_BATT_FLOOR_V 3.30f
@@ -2146,7 +2240,15 @@ struct FbkEntry { uint16_t w[CAP_SZ]; int len; float freq; uint32_t ts; bool sh;
                   // correct when this is true, which is why rbArm/rjArm gate on it and
                   // report "untrimmed-block" rather than failing silently
                   //
-                  bool trimmed; };
+                  bool trimmed;
+                  // Identity read STRAIGHT FROM THE STORED PULSES, not from the decode
+                  // string at store time. The bench needs to know which frame a replay
+                  // will send, and the only honest answer is one derived from e.w itself
+                  // (§5: the staged frame can differ from what a caller
+                  // believes it staged). ok=false means the stored body is not a KeeLoq
+                  // frame this build can parse.
+                  uint32_t idHop; uint32_t idSn; uint8_t idBtn; uint32_t idCtr;
+                  bool idOk; };
 static FbkEntry fbkBuf[FBK_MAX];
 static int      fbkCount = 0;
 static bool     fbkArmed = false;
@@ -2160,12 +2262,22 @@ void startJam(float mhz);
 void stopJam();
 void jamTick();          // keeps a FIFO-driven jam alive; called from loop()
 static void cc_setCaptureOOK();
-bool replayRaw(float mhz,uint16_t* data,int len,int reps,bool startHigh);
-bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int reps);
+bool replayRaw(float mhz,uint16_t* data,int len,int reps=3,bool startHigh=true,bool snapGrid=false);
+bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int reps,bool snapGrid=false);
 // Extra wall-clock budget for the EDGE phase only (ms). 0 = the 3000 ms default.
 // Set immediately before a capture that needs a short window, then it self-clears on
 // the next capture. See the note at the head of captureSignal().
 uint32_t capMaxMsOverride = 0;
+
+// Optional explicit signal trigger (dBm) for the NEXT capture. 0 = derive from the floor.
+//
+// The default trigger is floor+10, and this bench's ambient peaks sit exactly at that
+// level: the 64-sample floor average read -82 while the ambient peaked at -71, so the
+// capture fired on the ambient, not the signal, and recorded 23-39 edges of noise against
+// a frame of 177 pulses. A transmitter that couples cleanly reaches -36 to -53 dBm here,
+// so an explicit threshold above the ambient lets the capture wait for the real burst.
+// Self-clears, like capMaxMsOverride, so one raise cannot strand later captures.
+int capTrigDb = 0;
 
 // Whether this board revision actually routes the CC1101's GDO0 to a readable GPIO. Off by
 // default, because on this revision it does not: GPIO 48 is the SX1278's DIO0, so a pin that
@@ -2233,6 +2345,12 @@ bool     lastCapGapArm   = false;  // last capture armed on the gap signature (t
 // and the noisier the floor. Default 16 = today's behavior, exactly.
 uint8_t  agcFilterLen   = 16;     // samples: 8, 16 (default), 32, or 64
 bool     lastCapAgc      = false;  // true when the last capture ran a non-default filter
+// AGCCTRL2 MAGN_TARGET (0-7), the front-end gain target. -1 = leave the cc_init() value
+// (3). A transmitter a few centimetres away drives the LNA/DVGA into saturation and the
+// envelope stops resolving individual OOK pulses — the frame merges into a handful of very
+// long held pulses. Lowering the target lowers the front-end gain, which is the bench-side
+// fix short of moving the radios apart.
+int8_t   capMagnTarget   = -1;
 
 
 bool captureSignal(uint16_t timeoutMs,uint32_t gapUs);
@@ -2312,8 +2430,8 @@ static String   rbLastJson = "{\"event\":\"rollback\",\"state\":\"idle\"}";
 // so the sequencer below can call it without moving either one; the Arduino
 // auto-prototype block does not cover this because it is emitted above the first
 // function, which is after this point.
-bool replayRaw(float mhz,uint16_t* data,int len,int reps,bool startHigh);
-bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int reps);
+bool replayRaw(float mhz,uint16_t* data,int len,int reps,bool startHigh,bool snapGrid);
+bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int reps,bool snapGrid);
 // buildForProto() is defined with the TX helpers far below; the brute sequencers
 // (bruteTick and friends, ~line 4720) call it, so declare it here too.
 static int buildForProto(const String& proto, uint32_t sn, uint32_t newCtr,
@@ -3580,6 +3698,38 @@ uint8_t cc_readStatus(uint8_t a){ cc_cs(true); cc_waitMISO(); cc_xfer(a|0xC0); u
 // Forward declaration: cc_init() programs the PA table before this is defined below.
 void cc_writeBurst(uint8_t addr,const uint8_t* p,uint8_t n);
 
+// OOK power levels, as PATABLE index 0 (logic 0) and index 1 (logic 1). Default is a
+// true off/on pair: level 0 is zero power, level 1 is the 315/433 MHz max-power
+// setting. They must stay unequal — equal values key the PA at one power for every
+// bit and the chip sends a flat carrier with no envelope (see cc_armOokPA). The
+// `ookpa` serial command can retune the pair for a level sweep.
+uint8_t ookPatLow =0x00;   // PATABLE[0] — logic 0
+uint8_t ookPatHigh=0xC0;   // PATABLE[1] — logic 1, datasheet Table 39 max power at 315/433 MHz
+
+// Default for the replay snap: normalise a body onto its own T/2T grid before packet-mode
+// transmit. MEASURED, this does NOT cure the jitter round-trip and is left OFF (
+// §6). It never changes a frame's identity — snap on and snap off both echo the same hop — so
+// it is safe to enable, but it is redundant with the packet encoder's own quantisation, and on
+// the jittery seed tested it produced a body the receiver did not decode at all, where the
+// unsnapped body at least decoded (to a different frame). The real limit is capture quality:
+// a jittery capture's short cluster lands on the wrong te, so both the encoder and any snap
+// build the frame on the wrong grid. Kept as a live knob (the `snapgrid` command) to make the
+// hypothesis testable rather than assumed.
+bool replaySnapDefault=false;
+
+// Capture front-end latch gate. The receiver can latch into a flat, insensitive state that
+// reads the SAME floor on every band (measured -101 dBm across 304/315/434/868),
+// and when it does, capture arms on nothing and returns no-signal to everything — a bench
+// failure that looks like a dead transmitter. cc_reinit cures it, but a capture that silently
+// proceeds on a latched front end wastes a run. When capLatchedGate is on, captureSignal
+// samples the four bands, and if they are all within 2 dB AND that flat level is at or below
+// -95 dBm, refuses and names the latch (with the cc_reinit hint) instead of recording garbage.
+// A genuinely quiet bench still shows a few dB of spread, so this refuses only the flat case.
+bool capLatchedGate=true;
+int  lastCapSpreadDb=0;      // spread of the last gate sample (for reporting)
+int  lastCapGateLevel=0;     // mean level of the last gate sample
+bool lastCapGateRefused=false;
+
 // ─── Packet-mode TX over the FIFO ────────────────────────────────────────────
 // The CC1101's GDO0 is not routed on this board, so async bit-bang TX cannot drive
 // the PA. Packet mode sends data from the chip's FIFO and does not need GDO0. It can
@@ -3592,12 +3742,48 @@ void cc_writeBurst(uint8_t addr,const uint8_t* p,uint8_t n){
   cc_cs(false);
 }
 
+// ─── PA guard: restore the OOK output stage before any transmission ──────────
+// FREND0 (PA_POWER, index 1 for OOK) and PATABLE are register state that survives
+// every reset path short of a full cc_init(). If they are left unprogrammed, a
+// logic 1 goes out at zero power and every TX "succeeds" with no RF radiated, while
+// the FIFO still drains. Re-writing them is cheap (a handful of register writes, all
+// inside an already-open transaction) so it runs on every TX path rather than being
+// trusted to survive from boot. Returns true once the OOK stage is armed.
+//
+// The catch the bench found: an OOK envelope needs the two power levels to DIFFER.
+// The datasheet (§24) has logic 0 and logic 1 take their power from PATABLE index 0
+// and index 1 respectively, so the table must be an off/on pair, not one value
+// written twice. Writing {0xC0,0xC0} puts both levels at full power, the PA then
+// never keys down, and the chip radiates an unmodulated carrier instead of pulses
+// (measured: Flipper2 saw a continuous ~2 s field, zero edges, on fbk_replay). It
+// also silently defeats the earlier zero-power guard by making lvl1 non-zero.
+// The pair below is level 0 = index 0 (off), level 1 = index 1 (full power). Both
+// entries live in the two bytes FREND0.PA_POWER=1 selects between (indices 0 and 1),
+// so no burst-read past index 1 is needed.
+bool cc_armOokPA(){
+  uint8_t pat[2]={ookPatLow,ookPatHigh};
+  cc_writeBurst(0x3E,pat,2);          // PATABLE burst: index 0 = logic 0, index 1 = logic 1
+  cc_writeReg(0x22,0x11);             // FREND0: PA_POWER=1, so OOK selects PATABLE index 1
+  // Read back FREND0 and both PATABLE levels the same way pa_check does, so the
+  // caller can refuse to claim success when the stage did not take the configuration.
+  uint8_t frend0=cc_readReg(0x22);
+  uint8_t pa[2]={0,0};
+  cc_cs(true); cc_waitMISO();
+  cc_xfer(0x3E|0xC0);                 // burst-read PATABLE from index 0
+  pa[0]=cc_xfer(0); pa[1]=cc_xfer(0);
+  cc_cs(false);
+  // Success needs the pair to have landed as written AND to still be an envelope:
+  // the two levels must differ, or OOK degenerates to that flat carrier again.
+  return (frend0==0x11 && pa[0]==ookPatLow && pa[1]==ookPatHigh && pa[0]!=pa[1]);
+}
+
 // Transmit one packet and wait, with a deadline, for the TX FIFO to drain. Always
 // return the chip to idle and restore the receive configuration afterward.
 bool cc_txPacket(float mhz,const uint8_t* payload,uint8_t n,uint8_t chan){
   if(n==0||n>64) return false;        // CC1101 FIFO is 64 B
   SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
   cc_setFreq(mhz);
+  if(!cc_armOokPA()){ SPI.endTransaction(); return false; } // PA can drift; refuse rather than transmit at zero power
   cc_writeReg(0x0A,chan);             // CHANNR
   // Fixed-length packet mode; no whitening or CRC. (0x30 is async serial and needs GDO0.)
   cc_writeReg(0x08,0x00);
@@ -3652,6 +3838,7 @@ bool cc_txCarrier(float mhz,uint16_t ms){
   // At ~8.9 kBaud, 64 bytes is ~58 ms of carrier, so polling every few ms keeps it fed.
   SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
   cc_setFreq(mhz);
+  if(!cc_armOokPA()){ SPI.endTransaction(); return false; } // PA can drift; refuse rather than key a dead stage
   cc_writeReg(0x02,0x2E);             // GDO0 high-Z: not our data path, must not be driven
   cc_writeReg(0x12,0x30);             // MDMCFG2: ASK/OOK, SYNC_MODE=0 (no preamble/sync)
   cc_writeReg(0x08,0x00);             // PKTCTRL0: FORMAT=00 FIFO, CRC off, FIXED length
@@ -3792,9 +3979,15 @@ bool cc_init(float mhz){
   // RF radiates. Measured: patable read back "c0,0,0,0,0,0,0,0", FREND0.PA_POWER=1.
   // Both levels must be written, and reaching index 1 needs a BURST write, because the
   // PATABLE index counter only advances within a burst (and resets when CSn goes high).
-  // 0xC0 is the datasheet's 315/433 MHz max-power setting (Table 39); using it for both
-  // levels gives an unshaped OOK envelope at full power.
-  { uint8_t pat[2]={0xC0,0xC0}; cc_writeBurst(0x3E,pat,2); }
+  //
+  // And the two levels must DIFFER. The fix for the zero-power case wrote 0xC0 to both
+  // indices, which put logic 0 and logic 1 at the same full power: the PA then never
+  // keys down and the chip radiates an unmodulated carrier with no envelope at all
+  // (measured on fbk_replay — Flipper2 saw a continuous ~2 s field, zero pulses). The
+  // pair is now an off/on level: PATABLE[0]=0x00 (logic 0 silent) and PATABLE[1]=0xC0,
+  // the datasheet's Table 39 max-power setting for 315/433 MHz. ookPatLow/ookPatHigh
+  // hold the pair so cc_armOokPA and the `ookpa` command agree on it.
+  { uint8_t pat[2]={ookPatLow,ookPatHigh}; cc_writeBurst(0x3E,pat,2); }
   cc_strobe(0x36); delay(2); cc_strobe(0x34); delay(5);
   uint8_t pn  = cc_readStatus(0x30); // PARTNUM — CC1101 always returns 0x00
   uint8_t ver = cc_readStatus(0x31); // VERSION — CC1101A returns 0x14
@@ -6014,6 +6207,80 @@ static bool ks_consFAAC64(const uint32_t* b,int n,uint32_t& sn,uint8_t& btn,uint
 // The counter recorded here is what lets rbArm refuse a pair that is really the same
 // code twice (§2.5). A capture whose decode carried no counter leaves hasCtr false,
 // and rbArm falls back to the byte-identity check.
+// Derive a stored frame's identity from its own pulses. Returns true only when one of
+// the candidate TE values makes a KeeLoq parse commit, using the SAME k-means centroids,
+// candidate list and ks_klPwm/ks_parseKL path decodeSignal uses — so the id agrees with a
+// live decode rather than being a separate opinion. The candidate TE list is copied from
+// decodeSignal's KeeLoq block; if that list changes, change it here too. The parse itself
+// has no side effects (it writes only to `f`), so calling it for a readback is safe.
+static bool fbkIdentify(const uint16_t* w,int len,float mhz,
+                        uint32_t& hop,uint32_t& sn,uint8_t& btn,uint32_t& ctr){
+  if(len<4 || len>(int)CAP_SZ) return false;
+  static uint32_t buf[CAP_SZ];
+  static uint32_t kbuf[CAP_SZ];
+  for(int i=0;i<len;i++) buf[i]=w[i];
+  int kn=0;
+  for(int i=0;i<len;i++) if(buf[i]<=5000) kbuf[kn++]=buf[i];
+  uint32_t cA=0,cB=0;
+  if(!ks_km2(kn>=6?kbuf:buf, kn>=6?kn:len, cA, cB)) return false;
+  uint32_t teCand[4]; uint8_t nTe=0;
+  teCand[nTe++]=cA;
+  if(cB>0) teCand[nTe++]=cB>>1;
+  teCand[nTe++]=(mhz<320.f)?200:400;
+  teCand[nTe++]=(cA+((mhz<320.f)?200:400))>>1;
+  static char klb[CAP_SZ/2+1];
+  static char klm[CAP_SZ/4+1];
+  for(uint8_t t=0;t<nTe;t++){
+    if(teCand[t]<60||teCand[t]>1000) continue;
+    uint16_t klLen=ks_klPwm(buf,len,teCand[t],klb);
+    KLFrame f;
+    if(klLen>=66 && ks_parseKL(klb,klLen,f)){ hop=f.hop; sn=f.sn; btn=f.btn; ctr=f.rawCtr; return true; }
+    if(klLen>=66){
+      uint16_t ml=ks_manchester(klb,klLen,klm);
+      if(ml>=66 && ks_parseKL(klm,ml,f)){ hop=f.hop; sn=f.sn; btn=f.btn; ctr=f.rawCtr; return true; }
+    }
+  }
+  return false;
+}
+
+// Snap a pulse body onto the protocol's own T/2T grid. The packet encoder already rounds
+// each pulse to the nearest whole symbol of its own teShort, so on an on-grid frame this is
+// a no-op; its value is on a JITTERY capture, where the decoder's k-means split can land the
+// midpoint between two clusters in the wrong place and read a different frame (measured:
+// a jittery capture decoded 0xC5030B10, the same frame snapped to its grid decoded
+// 0x9CA26962). Normalising to the grid the receiver will re-derive makes the stored frame
+// self-consistent, which is what makes a later replay lossless.
+//
+// Returns the output length, or 0 when no snap was applied (clustering failed, or the
+// frame is not a 1:2 PWM protocol) so the caller keeps the original body untouched.
+static int ks_snapGrid(const uint16_t* in,int n,uint16_t* out,int cap){
+  if(n<4 || n>cap) return 0;
+  static uint32_t ubuf[CAP_SZ];
+  int un=(n<(int)CAP_SZ)?n:(int)CAP_SZ;
+  for(int i=0;i<un;i++) ubuf[i]=in[i];
+  uint32_t cA=0,cB=0;
+  if(!ks_km2(ubuf,un,cA,cB) || cA==0 || cB==0) return 0;
+  uint32_t te=(cA<cB)?cA:cB;
+  if(te<40) return 0;
+  // Only snap a frame whose two clusters actually look like a 1:2 PWM protocol. On anything
+  // else (a single-width fixed code, or a protocol with a different ratio) snapping would
+  // invent structure rather than recover it.
+  double ratio=(double)((cA<cB)?cB:cA)/(double)te;
+  if(ratio<1.6 || ratio>2.6) return 0;
+  int moved=0;
+  for(int i=0;i<n;i++){
+    uint32_t w=in[i];
+    if(w==0){ out[i]=0; continue; }
+    uint32_t k=(w+te/2)/te;                 // nearest whole number of symbols
+    if(k<1) k=1;
+    uint32_t nw=k*te;
+    if(nw>60000) nw=60000;
+    if(nw!=w) moved++;
+    out[i]=(uint16_t)nw;
+  }
+  return moved>0 ? n : 0;                   // 0 when already on-grid -> caller keeps original
+}
+
 static bool fbkAppend(const uint16_t* w,int len,float mhz,bool startHigh,const String& decode){
   if(len<1 || len>CAP_SZ || fbkCount>=FBK_MAX) return false;
   // Trim to ONE frame before storing. A capture is not one code: captureSignal fills
@@ -6045,6 +6312,9 @@ static bool fbkAppend(const uint16_t* w,int len,float mhz,bool startHigh,const S
   e.hasCtr = fbkParseCtr(decode,c);
   e.ctr    = c;
   e.ts     = millis();
+  // Identity straight from the stored pulses, so a later replay can be checked against the
+  // frame actually held rather than against what a caller believes it staged.
+  e.idOk = fbkIdentify(e.w, e.len, mhz, e.idHop, e.idSn, e.idBtn, e.idCtr);
   fbkCount++;
   return true;
 }
@@ -9736,6 +10006,13 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     cc_writeReg(0x1D, agc0);                   // AGCCTRL0
     lastCapAgc = (agcFilterLen != 16);
   }
+  // AGCCTRL2 MAGN_TARGET: -1 keeps the cc_init() value. Lowering it lowers the front-end
+  // gain, which is the only front-end lever against saturation from a nearby transmitter.
+  if(capMagnTarget>=0 && capMagnTarget<=7){
+    cc_writeReg(0x1B,(uint8_t)(0x40|(uint8_t)capMagnTarget));  // keep MAX_LNA/DVGA bits
+  } else {
+    cc_writeReg(0x1B,0x43);                                    // MAGN_TARGET=3, cc_init default
+  }
   cc_strobe(0x3A); delay(1); cc_strobe(0x34); delay(10);
   addLog("[CAP] Capturing on "+String(curFreq,2)+" MHz…");
   setLed(255,255,0); rfLen=0; rfFreq=curFreq;
@@ -9754,10 +10031,20 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   if(noiseMax>-60) noiseMax=-75; // cap: fob was transmitting during measurement
   // Trigger at floor +10 dBm. The former +14 margin missed weak signals near -65 dBm.
   int trigThr=noiseMax+10;
+  // Optional explicit trigger from the capture command ({"cmd":"capture","trig":-60}).
+  // Consumed here so it governs this capture only; the edge threshold follows the same
+  // floor-derived value as the default path.
+  int capTrig=capTrigDb; capTrigDb=0;
   // Toyota-band captures use floor +5 for edge detection (floor +8 elsewhere).
   // This gives weak signals more margin after the +10 dBm trigger has fired.
   bool _toyBand=(curFreq>=309.0f&&curFreq<=316.0f);
   int edgeThr=noiseMax+(_toyBand?5:8);
+  // An explicit trigger also lifts the EDGE threshold, or the ambient defeats it. With
+  // trig=-60 the trigger correctly waits for the burst, but edgeThr stayed at floor+8
+  // (-74) — below the -71 ambient — so the ambient kept generating edges between frames
+  // and consumed the edge buffer. Dropping edgeThr a few dB under the trigger puts it
+  // between the ambient and the signal, so only the OOK envelope is recorded.
+  if(capTrig!=0){ trigThr=capTrig; edgeThr=capTrig-5; }
   addLog("  Floor: "+String(noiseMax)+" dBm  Trig: "+String(trigThr)+" / Edge: "+String(edgeThr)+" dBm"+(_toyBand?" (Toyota –3dB)":""));
   // Feed the idle-window floor to the parked RollJam detector. This is the one
   // reading of the quiet band the capture path already takes; the detector
@@ -9765,6 +10052,53 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
   // possible held jammer.
   p5IdleFloorDbm = noiseMax;
   p5IdleFloorDelta = p5FeedFloor(noiseMax);
+
+  // ── Front-end latch gate ──────────────────────────────────────
+  // A latched front end reads the same floor on every band, and capture then arms on
+  // nothing. Sample the four bench bands; if they are all within 2 dB AND that flat level
+  // is at or below -95 dBm, the receiver is latched, so refuse and name the cure rather
+  // than record a run that cannot succeed. A genuinely quiet bench still shows a few dB of
+  // spread, so this refuses only the flat case (a working receiver has band-to-band
+  // structure even with no transmitter present).
+  if(capLatchedGate){
+    const float gf[4]={304.0f,315.0f,434.075f,868.0f};
+    int gl[4]; int gmin=999,gmax=-999; long gsum=0;
+    for(int i=0;i<4;i++){
+      cc_setFreq(gf[i]); cc_strobe(0x36); delay(1); cc_strobe(0x3A); delay(1);
+      cc_strobe(0x34); delay(6);
+      long s=0; int m=0; unsigned long tg=micros();
+      while((int)(micros()-tg)<2500){ s+=cc_fastRSSI(); m++; }
+      gl[i]=m?(int)(s/m):-127;
+      if(gl[i]<gmin)gmin=gl[i]; if(gl[i]>gmax)gmax=gl[i]; gsum+=gl[i];
+    }
+    int gspread=gmax-gmin; int gmean=(int)(gsum/4);
+    lastCapSpreadDb=gspread; lastCapGateLevel=gmean;
+    // restore the working frequency the capture was asked for
+    cc_setFreq(curFreq); cc_strobe(0x36); delay(1); cc_strobe(0x3A);
+    cc_writeReg(0x12, fskCapMode?0x00:0x30);
+    cc_writeReg(0x15, fskCapMode?0x47:0x00);
+    cc_strobe(0x34); delay(10);
+    if(gspread<=2 && gmean<=-95){
+      lastCapGateRefused=true;
+      SPI.endTransaction();
+      addLog("[CAP] Refused: front end looks latched ("+String(gspread)+" dB spread at "
+             +String(gmean)+" dBm across 304/315/434/868). Run cc_reinit.");
+      serialEmit(String("{\"event\":\"capture_refused\",\"reason\":\"front_end_latched\",")+
+        "\"spread_db\":"+String(gspread)+",\"mean_dbm\":"+String(gmean)+
+        ",\"bands\":["+String(gl[0])+","+String(gl[1])+","+String(gl[2])+","+String(gl[3])+"]"+
+        ",\"detail\":\"every band reads the same flat floor, so nothing would be captured; "+
+        "call cc_reinit to re-run the CC1101 bring-up\"}");
+
+      return false;
+    }
+    lastCapGateRefused=false;
+    // The gate retuned the chip, so re-derive the floor at the working frequency rather
+    // than trusting the pre-gate average.
+    long _nsum2=0; for(int i=0;i<48;i++){ _nsum2+=cc_fastRSSI(); delayMicroseconds(500); }
+    noiseMax=(int)(_nsum2/48); if(noiseMax>-60) noiseMax=-75;
+    trigThr=noiseMax+10; edgeThr=noiseMax+(_toyBand?5:8);
+    if(capTrig!=0){ trigThr=capTrig; edgeThr=capTrig-5; }
+  }
   SPI.endTransaction();
 
   // First half of timeout: wait at the current frequency before sweeping all channels.
@@ -9800,6 +10134,7 @@ bool captureSignal(uint16_t timeoutMs,uint32_t gapUs=350000){
     { long _ns2=0; for(int i=0;i<32;i++){_ns2+=cc_fastRSSI();delayMicroseconds(500);}
       noiseMax=(int)(_ns2/32); if(noiseMax>-60) noiseMax=-75; }
     trigThr=noiseMax+10; edgeThr=noiseMax+8;
+    if(capTrig!=0){ trigThr=capTrig; edgeThr=capTrig-5; }   // keep the explicit trigger authoritative through the fallback
     SPI.endTransaction();
     long rem=max(1000L,(long)timeoutMs-(long)(millis()-t0));
     unsigned long t1=millis();
@@ -10354,6 +10689,7 @@ static bool ks_ccSendEncoded(float mhz,uint8_t* bytes,uint8_t n,uint8_t dE,uint8
   if(n==0||n>64) return false;              // one packet: the FIFO is 64 bytes
   SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
   cc_setFreq(mhz);
+  if(!cc_armOokPA()){ SPI.endTransaction(); return false; } // PA can drift; refuse rather than send at zero power
   cc_writeReg(0x02,0x2E);                   // GDO0 high-Z: not our data path here
   cc_writeReg(0x12,0x30);                   // ASK/OOK, SYNC_MODE=0 (no preamble/sync)
   cc_writeReg(0x08,0x00);                   // FIFO, CRC off, fixed length
@@ -10386,10 +10722,17 @@ static bool ks_ccSendEncoded(float mhz,uint8_t* bytes,uint8_t n,uint8_t dE,uint8
 
 // Packet-mode replay of a pulse frame, used when GDO0 is not available.
 // Returns false if the frame cannot be represented at a usable rate or does not fit.
-bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int reps){
+// When snapGrid is true the body is first normalised onto its own T/2T grid (ks_snapGrid),
+// which is what makes the transmit lossless on a jittery capture.
+bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int reps,bool snapGrid){
   if(len<10) return false;
   if(reps<1) reps=1;
   if(reps>5) reps=5;
+  static uint16_t snapped[CAP_SZ];
+  if(snapGrid){
+    int sn=ks_snapGrid(data,len,snapped,CAP_SZ);
+    if(sn>0){ data=snapped; len=sn; }
+  }
 
   // ── Symbol period from the protocol's te, not from min(data) ────────────────
   // Deriving S from the shortest pulse is what §2 caught: a real Kia V3 frame
@@ -10563,7 +10906,7 @@ bool replayViaFifo(float mhz,const uint16_t* data,int len,bool startHigh,int rep
   return ok;
 }
 
-bool replayRaw(float mhz,uint16_t* data,int len,int reps=3,bool startHigh=true){
+bool replayRaw(float mhz,uint16_t* data,int len,int reps,bool startHigh,bool snapGrid){
   if(len<10) return false;
   // TX brownout guard: the CC1101 PA current spike can sag a weak pack below the MCU
   // brown-out threshold mid-burst, corrupting the transmission or resetting the device.
@@ -10602,7 +10945,7 @@ bool replayRaw(float mhz,uint16_t* data,int len,int reps=3,bool startHigh=true){
     // No GDO0: packet mode is the only way out of this board. Try it once, then report
     // honestly. Repetition is handled inside the encoder's packet, so `reps` is not applied
     // here — a packet already contains the whole frame once.
-    bool ok=replayViaFifo(mhz,data,len,startHigh,reps);
+    bool ok=replayViaFifo(mhz,data,len,startHigh,reps,snapGrid);
     lastReplayPath = ok ? REPLAY_VIA_FIFO : REPLAY_NONE;
     if(!ok){
       serialEmit("{\"event\":\"tx_blocked\",\"reason\":\"tx_path_dead\","
@@ -12214,10 +12557,19 @@ void setupRoutes(){
     if(srv.hasArg("gap_ms")){
       int g=srv.arg("gap_ms").toInt(); if(g>0&&g<=3000) delay(g);
     }
-    bool ok=replayRaw(fbkBuf[n].freq, fbkBuf[n].w, fbkBuf[n].len, 3, fbkBuf[n].sh);
+    bool snap = srv.hasArg("snap") ? (srv.arg("snap").toInt()!=0) : replaySnapDefault;
+    bool ok=replayRaw(fbkBuf[n].freq, fbkBuf[n].w, fbkBuf[n].len, 3, fbkBuf[n].sh, snap);
+    // Echo the identity actually held in the entry, read from its pulses, so the caller can
+    // verify which frame went out rather than assuming.
+    char ih[12]; snprintf(ih,12,"0x%08lX",(unsigned long)fbkBuf[n].idHop);
     srv.send(200,"application/json",
       String("{\"ok\":")+( ok?"true":"false")+
-      ",\"idx\":"+String(n)+",\"freq\":"+String(fbkBuf[n].freq,2)+"}");
+      ",\"idx\":"+String(n)+",\"freq\":"+String(fbkBuf[n].freq,2)+
+      ",\"pulses\":"+String(fbkBuf[n].len)+
+      ",\"ident_ok\":"+(fbkBuf[n].idOk?"true":"false")+
+      (fbkBuf[n].idOk? (String(",\"hop\":\"")+ih+"\",\"sn\":"+String(fbkBuf[n].idSn)+
+                        ",\"btn\":"+String(fbkBuf[n].idBtn)+",\"ctr\":"+String(fbkBuf[n].idCtr)) : String(""))+
+      "}");
   });
 
   protectedRoute("/api/dual_band_replay",[](){
@@ -13138,6 +13490,18 @@ static void processCommandLine(const String& ln){
       String am=jcmd["arm"]|String("");
       gapArmPerCapture = (am=="gap") ? 1 : 0;
     } else gapArmPerCapture = -1;
+    // Optional explicit trigger: { "cmd":"capture", "trig":-60 } (dBm). Stays above a hot
+    // ambient that the floor+10 default would fire on; self-clears after this capture.
+    capTrigDb = jcmd.containsKey("trig") ? (int)jcmd["trig"] : 0;
+    if(capTrigDb!=0 && (capTrigDb>-20 || capTrigDb<-110)) capTrigDb=0;   // sane range or ignore
+    // Optional recording-window override: { "cmd":"capture", "ms":60 } (ms of EDGE
+    // recording, 20-3000). The default is 3 s, which for a repeating transmitter fills
+    // the 512-edge buffer across several frames. A short window that starts on the
+    // trigger onset records one frame and ends before the next.
+    if(jcmd.containsKey("ms")){
+      int mm=(int)jcmd["ms"];
+      if(mm>=20&&mm<=3000) capMaxMsOverride=(uint32_t)mm;
+    }
     SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
     cc_setFreq(curFreq); cc_strobe(0x34);
     SPI.endTransaction();
@@ -13234,7 +13598,14 @@ static void processCommandLine(const String& ln){
       j+="{\"idx\":"+String(i)+",\"freq\":"+String(fbkBuf[i].freq,2)+
          ",\"len\":"+String(fbkBuf[i].len)+
          ",\"trimmed\":"+(fbkBuf[i].trimmed?"true":"false")+
-         ",\"has_ctr\":"+(fbkBuf[i].hasCtr?"true":"false")+"}";
+         ",\"has_ctr\":"+(fbkBuf[i].hasCtr?"true":"false")+
+         ",\"ident_ok\":"+(fbkBuf[i].idOk?"true":"false");
+      if(fbkBuf[i].idOk){
+        char ih[12]; snprintf(ih,12,"0x%08lX",(unsigned long)fbkBuf[i].idHop);
+        j+=",\"hop\":\""+String(ih)+"\",\"sn\":"+String(fbkBuf[i].idSn)+
+           ",\"btn\":"+String(fbkBuf[i].idBtn)+",\"ctr\":"+String(fbkBuf[i].idCtr);
+      }
+      j+="}";
     }
     j+="]}";
     serialEmit(j);
@@ -13246,10 +13617,60 @@ static void processCommandLine(const String& ln){
       } else {
         int gap=(int)(jcmd["gap_ms"]|0); if(gap>0&&gap<=3000) delay(gap);
         bool wasScanFb=scanActive; scanActive=false;
-        bool ok=replayRaw(fbkBuf[n].freq, fbkBuf[n].w, fbkBuf[n].len, 3, fbkBuf[n].sh);
+        bool snap = jcmd.containsKey("snap") ? (bool)jcmd["snap"] : replaySnapDefault;
+        // The frame the snap produces is what will actually go out, so identify THAT and
+        // report it, rather than the pre-snap body.
+        uint32_t rHop=fbkBuf[n].idHop; uint32_t rSn=fbkBuf[n].idSn;
+        uint8_t rBtn=fbkBuf[n].idBtn; uint32_t rCtr=fbkBuf[n].idCtr; bool rOk=fbkBuf[n].idOk;
+        bool snapped=false;
+        static uint16_t snapBuf[CAP_SZ];
+        if(snap){
+          int sn=ks_snapGrid(fbkBuf[n].w, fbkBuf[n].len, snapBuf, CAP_SZ);
+          if(sn>0){
+            snapped=true;
+            uint32_t h,s,c; uint8_t b;
+            if(fbkIdentify(snapBuf,(int)sn,fbkBuf[n].freq,h,s,b,c)){ rHop=h; rSn=s; rBtn=b; rCtr=c; rOk=true; }
+            else rOk=false;
+          }
+        }
+        bool ok = snapped
+          ? replayRaw(fbkBuf[n].freq, snapBuf, fbkBuf[n].len, 3, fbkBuf[n].sh, false)
+          : replayRaw(fbkBuf[n].freq, fbkBuf[n].w, fbkBuf[n].len, 3, fbkBuf[n].sh, snap);
         scanActive=wasScanFb;
+        // Echo the identity of the frame actually transmitted, read from the stored pulses
+        // (not assumed from what was staged). This is what lets a bench confirm WHICH frame
+        // went out, which the earlier sweep had to infer.
+        char ih[12]; snprintf(ih,12,"0x%08lX",(unsigned long)rHop);
         serialEmit(String("{\"cmd\":\"fbk_replay\",\"ok\":")+( ok?"true":"false")+
-        ",\"idx\":"+String(n)+",\"freq\":"+String(fbkBuf[n].freq,2)+"}");
+        ",\"idx\":"+String(n)+",\"freq\":"+String(fbkBuf[n].freq,2)+
+        ",\"pulses\":"+String(fbkBuf[n].len)+
+        ",\"snapped\":"+(snapped?"true":"false")+
+        ",\"ident_ok\":"+(rOk?"true":"false")+
+        (rOk? (String(",\"hop\":\"")+ih+"\",\"sn\":"+String(rSn)+
+               ",\"btn\":"+String(rBtn)+",\"ctr\":"+String(rCtr)) : String(""))+
+        "}");
+    }
+  }
+  // {\"cmd\":\"fbk_ident\"[, \"n\":idx]} — report what frame the stored entry holds,
+  // WITHOUT transmitting. This is the readback the sweep needed: after a chunked import the
+  // bench decodes the buffer to confirm which frame is staged, then replays it and can check
+  // the two agree. n defaults to the most recent entry. Reads the pulses, so it is honest
+  // about what a replay would send.
+  else if(op=="fbk_ident"){
+    int n=jcmd.containsKey("n")?(int)jcmd["n"]:(fbkCount-1);
+    if(n<0||n>=fbkCount){
+      serialEmit("{\"cmd\":\"fbk_ident\",\"ok\":false,\"error\":\"idx-out-of-range\",\"count\":"+String(fbkCount)+"}");
+    } else {
+      FbkEntry& e=fbkBuf[n];
+      char ih[12]; snprintf(ih,12,"0x%08lX",(unsigned long)e.idHop);
+      serialEmit(String("{\"cmd\":\"fbk_ident\",\"ok\":true,\"idx\":")+String(n)+
+        ",\"freq\":"+String(e.freq,2)+",\"pulses\":"+String(e.len)+
+        ",\"trimmed\":"+(e.trimmed?"true":"false")+
+        ",\"has_ctr\":"+(e.hasCtr?"true":"false")+",\"ctr\":"+String(e.ctr)+
+        ",\"ident_ok\":"+(e.idOk?"true":"false")+
+        (e.idOk? (String(",\"hop\":\"")+ih+"\",\"sn\":"+String(e.idSn)+
+                  ",\"btn\":"+String(e.idBtn)+",\"ctr\":"+String(e.idCtr)) : String(""))+
+        "}");
     }
   }
   // Serial mirror of /api/decode — the last decode, including fail_reason. The
@@ -13395,7 +13816,13 @@ static void processCommandLine(const String& ln){
       body+=",\"idx\":"+String(fbkCount-1)+",\"len\":"+String(e.len)+
             ",\"trimmed\":"+String(e.trimmed?"true":"false")+
             ",\"has_ctr\":"+String(e.hasCtr?"true":"false")+
-            ",\"ctr\":"+String(e.ctr);
+            ",\"ctr\":"+String(e.ctr)+
+            ",\"ident_ok\":"+String(e.idOk?"true":"false");
+      if(e.idOk){
+        char ih[12]; snprintf(ih,12,"0x%08lX",(unsigned long)e.idHop);
+        body+=",\"hop\":\""+String(ih)+"\",\"sn\":"+String(e.idSn)+
+              ",\"btn\":"+String(e.idBtn)+",\"id_ctr\":"+String(e.idCtr);
+      }
     }
     body+=",\"anchor_index\":"+String(impLastAnchor)+
           ",\"payload_pulses\":"+String(fbkCount>0?fbkBuf[fbkCount-1].len:0)+"}";
@@ -13466,7 +13893,15 @@ static void processCommandLine(const String& ln){
         body+=",\"idx\":"+String(fbkCount-1)+",\"len\":"+String(e.len)+
               ",\"trimmed\":"+String(e.trimmed?"true":"false")+
               ",\"has_ctr\":"+String(e.hasCtr?"true":"false")+
-              ",\"ctr\":"+String(e.ctr);
+              ",\"ctr\":"+String(e.ctr)+
+              ",\"ident_ok\":"+String(e.idOk?"true":"false");
+        // The staged frame's identity, read from its own pulses, so the sender learns WHICH
+        // frame is now in the buffer without a second round trip.
+        if(e.idOk){
+          char ih[12]; snprintf(ih,12,"0x%08lX",(unsigned long)e.idHop);
+          body+=",\"hop\":\""+String(ih)+"\",\"sn\":"+String(e.idSn)+
+                ",\"btn\":"+String(e.idBtn)+",\"id_ctr\":"+String(e.idCtr);
+        }
       }
       body+=",\"anchor_index\":"+String(impLastAnchor)+
             ",\"payload_pulses\":"+String(fbkCount>0?fbkBuf[fbkCount-1].len:0)+"}";
@@ -14991,7 +15426,22 @@ static void processCommandLine(const String& ln){
     bool ookOn=((mdmcfg2&0x70)==0x30);         // MOD_FORMAT=011 -> ASK/OOK
     // With PA_POWER=1 and OOK, level 0 comes from index 0 and level 1 from index 1.
     uint8_t lvl0=pa[0], lvl1=pa[1];
-    bool bothProgrammed=(lvl0!=0 && lvl1!=0);
+    // A usable OOK stage needs level 1 radiating (non-zero) AND the two levels to
+    // differ, so the PA actually keys between them. Level 1 at zero = logic 1 goes out
+    // silent; level 1 equal to level 0 = no envelope, a flat carrier however the FIFO
+    // drains. Both are transmit-blocking faults and are reported as such.
+    bool envOk=(lvl1!=0 && lvl0!=lvl1);
+    String paVerdict = !ookOn ? "NOT_OOK"
+                     : (lvl1==0 ? "OOK_LEVEL1_UNPROGRAMMED"
+                     : (lvl0==lvl1 ? "OOK_LEVELS_EQUAL_NO_ENVELOPE"
+                     : "OOK_LEVELS_PRESENT"));
+    String paNote = !ookOn
+      ? "modulation is not OOK, so the two-level PA rule below does not apply"
+      : (lvl1==0
+         ? "OOK level 1 comes from PATABLE[1], which reads 0x00: a logic 1 would be transmitted at zero power, so the FIFO can drain with little or no RF radiated. Program PATABLE as a burst (levels 0 and 1) before trusting any TX result"
+         : (lvl0==lvl1
+            ? "PATABLE[0] and PATABLE[1] hold the same value, so the PA never keys down: OOK degenerates to an unmodulated carrier and no pulse frame is transmitted, even though the FIFO drains and MARCSTATE shows TX. The levels must differ (level 0 silent, level 1 at power)"
+            : "both OOK levels are set and they differ, so the PA can key between them: a drained FIFO should mean a real modulated burst"));
     serialEmit(String("{\"cmd\":\"pa_check\",")+
       "\"frend0\":\""+String(frend0,HEX)+"\",\"pa_power\":"+String(paPower)+
       ",\"pktctrl0\":\""+String(pktctrl0,HEX)+"\","+
@@ -14999,14 +15449,112 @@ static void processCommandLine(const String& ln){
       "\"patable\":\""+String(pa[0],HEX)+","+String(pa[1],HEX)+","+String(pa[2],HEX)+","+String(pa[3],HEX)+
       ","+String(pa[4],HEX)+","+String(pa[5],HEX)+","+String(pa[6],HEX)+","+String(pa[7],HEX)+"\","+
       "\"lvl0\":\""+String(lvl0,HEX)+"\",\"lvl1\":\""+String(lvl1,HEX)+"\","+
-      "\"verdict\":\""+String(!ookOn?"NOT_OOK":
-         (bothProgrammed?"PA_LEVELS_PRESENT":
-          (lvl1==0?"OOK_LEVEL1_UNPROGRAMMED":"PA_LEVELS_LOW")))+"\","+
-      "\"note\":\""+String(!ookOn
-        ? "modulation is not OOK, so the two-level PA rule below does not apply"
-        : (bothProgrammed
-           ? "both OOK power levels are non-zero: the PA has something to transmit with, so a drained FIFO should mean real RF"
-           : "OOK level 1 comes from PATABLE[1], which reads 0x00: a logic 1 would be transmitted at zero power, so the FIFO can drain with little or no RF radiated. Program PATABLE as a burst (levels 0 and 1) before trusting any TX result")) +"\"}");
+      "\"envelope_ok\":"+String(envOk?"true":"false")+",\"verdict\":\""+paVerdict+"\","
+      "\"note\":\""+paNote+"\"}");
+  }
+
+  // {"cmd":"ookpa","low":0,"high":192} — set the OOK power-level pair (PATABLE 0/1).
+  //
+  // The OOK envelope is the DIFFERENCE between the two PATABLE entries. Level 0 takes
+  // PATABLE[0] and level 1 takes PATABLE[1]. Writing the same value to both makes the
+  // PA key at one power for every bit and the chip emits a flat carrier — the state the
+  // card was found in ("c0,c0"), which decoded as a continuous field, zero pulses. This
+  // lets the pair be set without a reflash and read back, so the envelope can be proven
+  // present before a replay is trusted. Level 0 defaults to 0x00 (silence) but may be
+  // raised toward level 1 to soften the envelope if a receiver over-saturates; they must
+  // never be exactly equal.
+  // {\"cmd\":\"snapgrid\"[,\"en\":0|1]} — get/set the default replay snap. When on, a replay
+  // normalises the stored body onto its own T/2T grid before packet-mode transmit, so a
+  // jittery capture sends the frame it decodes to. A per-call
+  // {\"cmd\":\"fbk_replay\",\"snap\":0|1} overrides this default for one transmission.
+  // {\"cmd\":\"capgate\"[,\"en\":0|1]} — get/set the capture front-end latch gate. When on
+  // (default), captureSignal samples 304/315/434/868 and refuses when every band reads the
+  // same flat floor (a latched front end), naming cc_reinit as the cure,
+  // instead of arming on nothing. Reports the last gate sample so a caller can see it.
+  else if(op=="capgate"){
+    if(jcmd.containsKey("en")) capLatchedGate=(bool)jcmd["en"];
+    serialEmit(String("{\"cmd\":\"capgate\",\"ok\":true,\"enabled\":")+
+      (capLatchedGate?"true":"false")+
+      ",\"last_spread_db\":"+String(lastCapSpreadDb)+
+      ",\"last_mean_dbm\":"+String(lastCapGateLevel)+
+      ",\"last_refused\":"+(lastCapGateRefused?"true":"false")+"}");
+  }
+  else if(op=="snapgrid"){
+    if(jcmd.containsKey("en")) replaySnapDefault=(bool)jcmd["en"];
+    serialEmit(String("{\"cmd\":\"snapgrid\",\"ok\":true,\"enabled\":")+
+      (replaySnapDefault?"true":"false")+"}");
+  }
+  else if(op=="ookpa"){
+    int lo=jcmd.containsKey("low") ?(int)jcmd["low"] :(int)ookPatLow;
+    int hi=jcmd.containsKey("high")?(int)jcmd["high"]:(int)ookPatHigh;
+    if(lo<0)lo=0; if(lo>0xFF)lo=0xFF;
+    if(hi<0)hi=0; if(hi>0xFF)hi=0xFF;
+    if(lo==hi){
+      serialEmit("{\"cmd\":\"ookpa\",\"ok\":false,\"error\":\"levels-equal\","
+                 "\"detail\":\"level 0 and level 1 must differ or OOK becomes a flat carrier with no envelope\"}");
+    } else {
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      // Commit only after the pair lands, so a failed write cannot leave the two levels
+      // equal (arm uses the new values, and its own read-back rejects an equal pair).
+      uint8_t prevLo=ookPatLow, prevHi=ookPatHigh;
+      ookPatLow=(uint8_t)lo; ookPatHigh=(uint8_t)hi;
+      bool okArm=cc_armOokPA();
+      uint8_t pat[2]={0,0};
+      cc_cs(true); cc_waitMISO(); cc_xfer(0x3E|0xC0);
+      pat[0]=cc_xfer(0); pat[1]=cc_xfer(0);
+      cc_cs(false);
+      SPI.endTransaction();
+      if(!okArm){ ookPatLow=prevLo; ookPatHigh=prevHi; }
+      serialEmit(String("{\"cmd\":\"ookpa\",\"ok\":")+(okArm?"true":"false")+
+        ",\"requested_low\":"+String(lo)+",\"requested_high\":"+String(hi)+
+        ",\"read_low\":\""+String(pat[0],HEX)+"\",\"read_high\":\""+String(pat[1],HEX)+
+        "\",\"envelope_ok\":"+String((pat[0]!=pat[1]&&pat[1]!=0)?"true":"false")+
+        ",\"note\":\""+String(okArm
+          ? "OOK level pair set and read back; a replay now has an envelope to transmit"
+          : "the pair did not take on read-back, so the previous values were restored: TX would be unreliable")+"\"}");
+    }
+  }
+  // {"cmd":"cc_reinit","f":315.0} — re-run the full CC1101 bring-up without a power cycle.
+  //
+  // The receiver can latch into a flat, insensitive state (every band reading the same
+  // -101 dBm with zero span, and capture reporting no-signal to everything), and the PA
+  // registers can drift so OOK logic 1 transmits at zero power. Both are cured by
+  // cc_init(), which the /api/reinit route already calls over HTTP. On the USB-serial
+  // bench there is no network, so a latch meant a physical unplug until now. This exposes
+  // the same bring-up over serial, and reports the receiver floor across the four bench
+  // bands before and after so a caller can see the retune actually moved the readings.
+  else if(op=="cc_reinit"){
+    float f=jcmd.containsKey("f")?(float)jcmd["f"]:curFreq;
+    if(!(f>=200&&f<=950)) f=curFreq;
+    bool wasScan=scanActive; scanActive=false;
+    int before[4]; const float bf[4]={304.0f,315.0f,434.075f,868.0f};
+    auto readFloor=[&](float mhz)->int{
+      SPI.beginTransaction(SPISettings(6000000,MSBFIRST,SPI_MODE0));
+      cc_setFreq(mhz);
+      cc_strobe(0x36); delay(1); cc_strobe(0x3A); delay(1); cc_strobe(0x34); delay(6);
+      long sum=0; int n=0; unsigned long t0=micros();
+      while((int)(micros()-t0)<3000){ sum+=cc_fastRSSI(); n++; }
+      SPI.endTransaction();
+      return n?(int)(sum/n):-127;
+    };
+    for(int i=0;i<4;i++) before[i]=readFloor(bf[i]);
+    // cc_init() runs its own SPI transaction (and its own 1 MHz bring-up rate), so it is
+    // called bare here rather than nested inside one.
+    bool ok=cc_init(f);
+    int after[4];
+    for(int i=0;i<4;i++) after[i]=readFloor(bf[i]);
+    int loB=999,hiB=-999,loA=999,hiA=-999;
+    for(int i=0;i<4;i++){ if(before[i]<loB)loB=before[i]; if(before[i]>hiB)hiB=before[i];
+                          if(after[i]<loA)loA=after[i]; if(after[i]>hiA)hiA=after[i]; }
+    int bSpread=hiB-loB, aSpread=hiA-loA;
+    serialEmit(String("{\"cmd\":\"cc_reinit\",\"ok\":")+(ok?"true":"false")+
+      ",\"freq\":"+String(f,2)+
+      ",\"before\":["+String(before[0])+","+String(before[1])+","+String(before[2])+","+String(before[3])+"]"+
+      ",\"after\":["+String(after[0])+","+String(after[1])+","+String(after[2])+","+String(after[3])+"]"+
+      ",\"spread_before_db\":"+String(bSpread)+",\"spread_after_db\":"+String(aSpread)+
+      ",\"verdict\":\""+String(!ok?"CC1101_NOT_RESPONDING":
+         (aSpread>=3?"WOKEN_BANDS_DIFFER":"STILL_FLAT_MAY_BE_LATCHED"))+"\"}");
+    scanActive=wasScan;
   }
   // {"cmd":"tx_carrier_test","ms":1500} — hold a CONTINUOUS carrier, for jamming.
   //
@@ -15146,6 +15694,18 @@ static void processCommandLine(const String& ln){
     }
     serialEmit(String("{\"cmd\":\"agc\",\"filter\":")+String(agcFilterLen)
       +",\"last_nondefault\":"+String(lastCapAgc?"true":"false")+"}");
+  }
+  // {"cmd":"gain","target":0..7} — AGCCTRL2 MAGN_TARGET for captures, the front-end gain.
+  // A nearby transmitter saturates the LNA/DVGA and the OOK envelope stops resolving
+  // pulses, so a 177-pulse frame arrives as a handful of long held runs. Lowering the
+  // target lowers the gain. -1 (or omit) restores the cc_init() value of 3.
+  else if(op=="gain"){
+    if(jcmd.containsKey("target")){
+      int t=(int)jcmd["target"];
+      if(t>=-1&&t<=7) capMagnTarget=(int8_t)t;
+    }
+    serialEmit(String("{\"cmd\":\"gain\",\"target\":")+String(capMagnTarget)
+      +",\"effective\":"+String(capMagnTarget>=0?capMagnTarget:3)+"}");
   }
   // {"cmd":"rssi_scope","f":315.0,"ms":2000} — what does the edge detector actually see?
   //

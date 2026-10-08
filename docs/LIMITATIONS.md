@@ -13,6 +13,8 @@ do" and the hardware-limits section of `README.md`.
 | SX1278 CW at 433.92 MHz lifts the CC1101 floor >60 dB on-channel, ~18 dB at 8 MHz | `research/88_SX1278_SELFJAM_MEASURED.md`, `lora_cw_probe` / `lora_power_floor` |
 | 315 MHz capture failures track latched modem / AGC state, not a hard band guard | `research/56_315_FALSE_ELEVATED_FLOOR.md`, `research/58_LATCHED_FRONTEND_STATE.md`, `research/59_BAND_TILT_IS_CONFIGURATION.md` |
 | Of 44 decoders, 35 never fire on the 301-capture corpus; 270 captures match none | `docs/CORPUS_SCORECARD.md` |
+| A flat four-band floor (spread ≤2 dB, ≤ −95 dBm) is a latched front end, and capture refuses with `capture_refused` instead of arming on nothing | `research/114_TX_SNAP_CAPTURE_GATE_CDC.md`, `cc_reinit` / `capgate` |
+| Pre-snapping a body onto its own T/2T grid does not cure the jitter round-trip; the packet encoder already quantises to that grid | `research/114_TX_SNAP_CAPTURE_GATE_CDC.md`, `snapgrid` |
 
 ## Host-verified, not car-verified
 
