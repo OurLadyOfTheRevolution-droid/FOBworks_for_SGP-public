@@ -1,6 +1,6 @@
 # Citations and references
 
-This list covers the sources used for FOBworks for SGP v4.05, which targets the May 2026 SGP Card Mini. It includes the KeeLoq references, radio and board datasheets, the board's own vendor documentation and firmware, documentation for the WebSocket transport, and the repositories this project drew protocol work from.
+This list covers the sources used for FOBworks for SGP v4.09, which targets the May 2026 SGP Card Mini. It includes the KeeLoq references, radio and board datasheets, the board's own vendor documentation and firmware, documentation for the WebSocket transport, and the repositories this project drew protocol work from.
 
 ## KeeLoq
 

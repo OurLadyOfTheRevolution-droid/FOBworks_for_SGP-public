@@ -283,6 +283,39 @@ def main():
         check("lastCapGdo0" in body_c2,
               "the uniform check is gated on the RSSI fallback (not applied to GDO0 captures)")
 
+    print("\n=== the OOK PA pair is an off/on envelope, not one value twice ===")
+    # The fault 113 records: PATABLE written {0xC0,0xC0} put OOK logic 0 and logic 1 at the
+    # same full power, so the PA never keyed down and the chip radiated a flat carrier with
+    # no modulation while every layer reported ok. An OOK envelope needs the two entries to
+    # DIFFER, and the guard must refuse a request that would collapse them.
+    arm = extract_fn(src, "cc_armOokPA")
+    check(arm is not None, "cc_armOokPA extracted")
+    if arm:
+        body_a = re.sub(r"//.*", "", arm)
+        check(re.search(r"\{\s*ookPatLow\s*,\s*ookPatHigh\s*\}", body_a) is not None,
+              "the PA table is written from the ookPatLow/ookPatHigh pair, not a literal")
+        check("pa[0]!=pa[1]" in body_a.replace(" ", ""),
+              "the read-back refuses a pair whose two levels are equal")
+    check("ookPatLow" in src and "ookPatHigh" in src,
+          "the OOK level pair exists as settings the boot and TX paths share")
+    check(re.search(r"uint8_t\s+ookPatLow\s*=\s*0x00", src) is not None
+          and re.search(r"uint8_t\s+ookPatHigh\s*=\s*0xC0", src) is not None,
+          "the pair defaults to an off/on level (0x00 / 0xC0), which differ")
+    # cc_init must write the same pair, not a literal that could drift from the guard's.
+    ci = extract_fn(src, "cc_init")
+    if ci:
+        check(re.search(r"\{\s*ookPatLow\s*,\s*ookPatHigh\s*\}", re.sub(r"//.*", "", ci)) is not None,
+              "cc_init writes the same OOK pair as the TX guard")
+    # pa_check must expose the envelope verdict, and the live setter must refuse L==H.
+    check('envelope_ok' in src, "pa_check reports envelope_ok")
+    check("OOK_LEVELS_EQUAL_NO_ENVELOPE" in src,
+          "pa_check names the equal-levels (flat-carrier) fault, which PA_LEVELS_PRESENT missed")
+    check('op=="ookpa"' in src, "the ookpa command exists to set the pair live")
+    op = src.find('op=="ookpa"')
+    seg_op = src[op:op+1600] if op != -1 else ""
+    check("levels-equal" in seg_op,
+          "ookpa refuses a request whose levels are equal rather than flattening the envelope")
+
     print("\n=== changelog records the packet-mode round ===")
     # Version-agnostic: the packet-mode round introduced this content, and it must still be
     # documented under SOME changelog header. Pinning v3.72 broke the moment v3.73 was

@@ -1,10 +1,10 @@
 # FOBworks for SGP
 
-FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 4.05.
+FOBworks for SGP is standalone firmware for the SGP Card Mini, a third-party board. Version 4.09.
 
 The published tree is a disclosure variant of the development tree: manufacturer-key literals are masked, the private engineering worklog stays private, and a measured-limits subset of research notes plus the corpus scorecard ship so the claims in `PROMO.md` and the hardware-limits section are checkable. See `docs/PUBLISHING.md` and `docs/LIMITATIONS.md`.
 
-This build targets the SGP Card Mini stock acquired in May 2026: an ESP32-S3-MINI-1-N8 with a dual-core LX7 at 240 MHz, 8 MB quad flash, no PSRAM, Wi-Fi 802.11 b/g/n, and BLE 5. The sub-GHz radio is the onboard CC1101, using OOK and 2FSK across the 39 channels listed in the sketch between 300–348, 387–464, and 779–928 MHz. The board also has a Ra-02 SX1278 LoRa module. GPIO 48 is connected to the SX1278's DIO0 AND the CC1101's GDO0. Many difficulties in the development of the firmware are on account of the shared GPIO 48. It is my understanding that this has been remedied in later iterations of the device, but I am unable to confirm. Resetting or sleeping the SX1278 does not provide a CC1101 data connection. GPIO 26 is reserved on the PCB for a future SX1262 and is unused. The MAX17048 fuel gauge is at I2C address `0x36`. Kept decodes are written to the microSD card as FOBworks RAW files, which the dashboard can read back. The firmware accepts CC1101 version-register values `0x04` and `0x14`; the detected value appears in the status chip.
+This build targets the SGP Card Mini stock acquired in May 2026: an ESP32-S3-MINI-1-N8 with a dual-core LX7 at 240 MHz, 8 MB quad flash, no PSRAM, Wi-Fi 802.11 b/g/n, and BLE 5. The sub-GHz radio is the onboard CC1101, using OOK and 2FSK across the 39 channels listed in the sketch between 300–348, 387–464, and 779–928 MHz. The board also has a Ra-02 SX1278 LoRa module. GPIO 48 is connected to the SX1278's DIO0; the CC1101's GDO0 is not routed to a readable GPIO. Resetting or sleeping the SX1278 does not provide a CC1101 data connection. GPIO 26 is reserved on the PCB for a future SX1262 and is unused. The MAX17048 fuel gauge is at I2C address `0x36`. Kept decodes are written to the microSD card as FOBworks RAW files, which the dashboard can read back. The firmware accepts CC1101 version-register values `0x04` and `0x14`; the detected value appears in the status chip.
 
 The card serves its own dashboard. A separate React dashboard can run on a computer. Both connect to the same firmware and require the same access code.
 
@@ -95,7 +95,7 @@ When the dashboard is served over **HTTPS**, browsers block the card's plain `ws
 | `CITATIONS_AND_REFERENCES.md` | Sources for the firmware's protocol, board, and radio details. |
 | `LICENSE` | GNU General Public License v3.0. |
 | `bench_*.py` | Serial-side bench helpers: `bench_serial_log.py` logs and filters the card's JSON stream, `bench_send.py` sends commands, `bench_c2_capture.py` drives a capture. |
-| `test_*.py` | 46 host-side checks. See **Tests** below. |
+| `test_*.py` | 48 host-side checks. See **Tests** below. |
 
 This repository contains neither the React dashboard nor its source archive. The connection steps above apply when the dashboard source is available separately and unpacked into `FOBworks_SGP_Dashboard/`. The firmware can be flashed and used over Wi-Fi without it; the card serves its own dashboard.
 
@@ -130,13 +130,13 @@ Libraries: Adafruit NeoPixel 1.12 or newer, ArduinoJson 7.x. SD, SPI, Wire, Pref
 
 Open `FOBworks_for_SGP.ino` from this folder and upload it to the SGP Card Mini. Keep `loop_stack.cpp` beside it; otherwise, the build will not link.
 
-Current build: **58% flash, 49% RAM.**
+Last verified build (v4.07): **59% flash, 53% RAM.**
 
 ## First run
 
 Plug the card into USB and open the serial log at 115200 baud to get the Wi-Fi credentials and access code. Then join `SGP Card Mini` and open `http://192.168.4.1`. The separate React dashboard, when available, can connect to the card instead.
 
-The home screen offers four modes: FOBscan, FOBclone, FOBcatch, and FOBback. FOBscan's tabs are Capture, Scan, Decode, Predict, Keys, Library, and Instruments — the last drawing the claim trace, resync curve and parked RollJam IDS. Bluetooth scanning and pairing are reached over the HTTP API rather than through the card dashboard: `GET /api/ble_scan`, `GET /api/ble_results`, and the `/api/ble_pair_start`, `/api/ble_pair_status`, `/api/ble_pair_stop`, and `/api/ble_paired_devices` routes. See `PROMO.md` for an overview of each mode.
+The home screen offers four modes: FOBscan, FOBclone, FOBcatch, and FOBback. FOBscan's tabs are Capture, Scan, Decode, Predict, Keys, Library, and Instruments — the last drawing the claim trace, the resync curve, the parked RollJam IDS, and the clone-chip classifier. Bluetooth scanning and pairing are reached over the HTTP API rather than through the card dashboard: `GET /api/ble_scan`, `GET /api/ble_results`, and the `/api/ble_pair_start`, `/api/ble_pair_status`, `/api/ble_pair_stop`, and `/api/ble_paired_devices` routes. See `PROMO.md` for an overview of each mode.
 
 Serial commands are JSON and carry the same access code:
 
@@ -152,13 +152,13 @@ The mode commands include `capture`, `decode`, `replay`, `replay_predicted`, `re
 
 **Key recovery:** `key_recover_start`, `key_recover_cancel`, `key_probe`, and `key_recover_offline`. The last command takes a comma-separated hop list and runs recovery without the radio.
 
-**FOBback / RollBack:** `fbk_arm`, `fbk_disarm`, `fbk_status`, `fbk_replay`, and `fbk_import`. The import command accepts a FOBworks RAW file or `.sub` capture body and loads a stored frame into the replay buffer for testing without a live capture. It searches the full body and returns `no-frame-in-body` if it finds no frame. Over serial, a large body should arrive in chunks: `fbk_pulses_begin` (with `freq`), then `fbk_pulses_add` with `pulses` slices of up to 48 values (each line stays ~240 bytes, half the measured heap boundary), then `fbk_pulses_end` to run the import over the assembled body. The one-shot `fbk_import` form is heap-bound near ~130 pulses. An add that carries a `pulses` field but stages none replies `ok:false` with `reason:"empty-pulses"` rather than passing silently.
+**FOBback / RollBack:** `fbk_arm`, `fbk_disarm`, `fbk_status`, `fbk_replay`, `fbk_ident`, and `fbk_import`. The import command accepts a FOBworks RAW file or `.sub` capture body and loads a stored frame into the replay buffer for testing without a live capture. It searches the full body and returns `no-frame-in-body` if it finds no frame. Over serial, a large body should arrive in chunks: `fbk_pulses_begin` (with `freq`), then `fbk_pulses_add` with `pulses` slices of up to 48 values (each line stays ~240 bytes, half the measured heap boundary), then `fbk_pulses_end` to run the import over the assembled body. The one-shot `fbk_import` form is heap-bound near ~130 pulses. An add that carries a `pulses` field but stages none replies `ok:false` with `reason:"empty-pulses"` rather than passing silently. `fbk_ident` reports the identity a stored entry actually holds, derived from its own pulses, without transmitting; `fbk_replay`, `fbk_status`, and `fbk_pulses_end` echo the same fields (`idHop`/`idSn`/`idBtn`/`idCtr`/`idOk`), so a replay is checked against the frame held rather than the frame requested.
 
 **C2 RollBack:** `rollback_arm`, `rollback_fire`, and `rollback_status`. Sends two held codes in order, with a configurable gap.
 
 **C1 RollJam:** `rolljam_arm`, `rolljam_start`, `rolljam_abort`, `rolljam_status`, and `rolljam_replay`.
 
-**Diagnostics:** `rssi_path_check`, `rx_floor_check`, `tx_fifo_test`, `pa_check`, `jam_status`, `gdo0_probe`, `gdo0_isolate`, `gdo0_rail_test`, and `gdo0_signal`. The GDO0 set exists because this board does **not** route the CC1101's GDO0 to a readable GPIO. `gdo0_signal` is the decisive one: it cuts the LoRa's power so the SX1278's DIO0 is gone, then asks the CC1101 to emit its crystal clock on GDO0 and counts edges on pin 48 — the only test that can tell "unrouted" apart from "the LoRa was masking it". It is documented in **Hardware limits** below.
+**Diagnostics:** `rssi_path_check`, `rx_floor_check`, `tx_fifo_test`, `pa_check`, `jam_status`, `cc_reinit`, `capgate`, `snapgrid`, `gdo0_probe`, `gdo0_isolate`, `gdo0_rail_test`, and `gdo0_signal`. `cc_reinit` re-runs `cc_init` and reports the four-band floor before and after with a latch verdict, so a latched front end is cleared without a physical replug. `capgate` toggles the capture latch gate — when it is on, a capture whose four bands read flat within 2 dB refuses with `capture_refused` rather than arming on nothing. `snapgrid` flips the transmit-snap default; the snap normalises a body onto its own T/2T grid but is a recorded negative result (it never changes a frame's identity) and ships off. The GDO0 set exists because this board does **not** route the CC1101's GDO0 to a readable GPIO. `gdo0_signal` is the decisive one: it cuts the LoRa's power so the SX1278's DIO0 is gone, then asks the CC1101 to emit its crystal clock on GDO0 and counts edges on pin 48 — the only test that can tell "unrouted" apart from "the LoRa was masking it". It is documented in **Hardware limits** below.
 
 **Instrumentation:** `claim_trace` (with `clear`) reports the last eight decodes — timing, gate, spread, and the protocol each claimed — and `GET /api/claim_trace` serves the same. `resync_curve`, `resync_curve_status`, `resync_mark`, and `resync_curve_clear` drive the resync-window profiler (`GET /api/resync_curve`). `p5_ids` arms, clears, or reports the parked RollJam watchdog (`GET /api/p5_ids`). `lora_cw_probe` keys the SX1278 as a continuous-wave carrier and measures the rise at the CC1101; release of the reset line is required first, the mode writes are read back one step each (STANDBY then TX), and a `meter_pegged` flag marks a reading at the RSSI rail. `clone_class` classifies the held KeeLoq frames as a clone chip or a cipher-running part without the key, key-free — counter-linearity is a proof, hop-XOR sparsity a statistic (`GET /api/clone_class`). The hop-XOR strip appears on each KeeLoq decode as `hop_xor`, and the same decode carries `clone_class`. The Instruments tab draws the claim trace, the resync curve, the RollJam IDS read-out, and the clone-chip classifier directly from those endpoints.
 
@@ -166,7 +166,7 @@ The mode commands include `capture`, `decode`, `replay`, `replay_predicted`, `re
 
 ## Tests
 
-The 46 Python test suites run on the host; they do not require the card or a network connection. Depending on the test, they inspect or extract code from the firmware, compile state-machine logic against a mock radio, or check recorded captures. `test_serial_fuzz.py` additionally drives the card over USB when one is attached; `python3 test_serial_fuzz.py host` runs its source-level half alone.
+The 48 Python test suites run on the host; they do not require the card or a network connection. Depending on the test, they inspect or extract code from the firmware, compile state-machine logic against a mock radio, or check recorded captures. `test_serial_fuzz.py` additionally drives the card over USB when one is attached; `python3 test_serial_fuzz.py host` runs its source-level half alone.
 
 ```bash
 cd FOBworks_for_SGP
@@ -179,7 +179,9 @@ for t in test_*.py; do python3 "$t"; done
 | `test_keeloq_key_table.py` | KeeLoq boot self-test against published vectors; the 73-entry key table matches the public reference corpus; version strings agree |
 | `test_tx_packet_mode.py` | Packet-mode TX registers: MARCSTATE constants, FIFO bounds, PA table levels |
 | `test_frame_trim.py` | Frame trimming against a real capture, 161 frames |
-| `test_replay_encode.py` | The FIFO frame encoder: symbol period from `te`, ratio preserved |
+| `test_replay_encode.py` | The FIFO frame encoder: symbol period from `te`, ratio preserved; the on-grid snap (`ks_snapGrid`) is pinned (whole-symbol output, idempotent) |
+| `test_replay_capture_preset.py` | The replay driver reads a RAW file's `Preset:` header and selects the capture modulation to match, so a 2-FSK recording is not fired into an OOK capture path |
+| `test_fbk_ident.py` | A stored frame's identity is read back from its own pulses (`fbkIdentify`/`fbk_ident`), so a replay can be checked against the frame actually held |
 | `test_rolljam_exec.py`, `test_rollback_exec.py` | C1/C2 state machines, extracted and compiled against a mock radio |
 | `test_rollback_c2.py` | C2 guard rails, sequencing, and dashboard labels |
 | `test_rollback_samecode.py` | C2 refuses a same-code pair |
@@ -189,6 +191,7 @@ for t in test_*.py; do python3 "$t"; done
 | `test_a2_reporting.py` | The Kia V3/V4 verdict is not overstated; duplicates collapse |
 | `test_decoder_false_positives.py` | Decoder guards against cross-brand false positives on the corpus |
 | `test_gate_decoder_false_positives.py` | Somfy/Nice/FAAC64 gates no longer claim other brands' captures; genuine frames still decode |
+| `test_secplus2_framing.py` | Security+ 2.0 is unreachable because the capture front end frames the window wrongly, not because the gate is too wide: the shipped `ml>=124` requirement and 1.5–2.5 ratio window are unchanged, the decoder itself decodes a well-formed 124-bit Manchester stream |
 | `test_toyota_reachability.py` | The Toyota decoder fires on its own captures, not only foreign ones |
 | `test_review_v373_fixes.py` | Source-level checks for review fixes; hardware behavior is not proved by these checks |
 | `test_hexstr_bounds.py`, `test_sub_replay_body_limit.py` | Buffer bounds |
@@ -233,7 +236,7 @@ The CC1101's GDO0 output is not connected to a readable GPIO on this board. GPIO
 
 **The board's only other radio is a 13.56 MHz HF front end, and it is not an LF path.** A PN532 sits on the shared I2C bus at address 0x24, alongside the MAX17048 gauge at 0x36, and the stock tool for it drives ISO14443A passive-target reads. That is 13.56 MHz, an order of magnitude above the 125 kHz the automotive immobilisers use, so it does not read Hitag2, Megamos or DST40 and does not provide the LF leg of a passive-entry relay — those need a 125 kHz coil, which this revision does not have. Nothing in FOBworks touches the PN532, and no command, decode or replay path depends on it. If 13.56 MHz NFC is wanted here, it is a separate feature rather than an extension of the sub-GHz work.
 
-The current build uses **49% of RAM** for statics. The decode path and WebSocket inbound queue are the largest consumers. Runtime idle heap was 62,188 B after BLE was made lazy (v3.95) — before that, the BLE stack alone took ~71 KB and left ~1 KB, so no command could be parsed. Check `stack_hwm` and `heap_free` in the `status` response before extending the decode path.
+The current build uses **53% of RAM** for statics (last measured at v4.07). The decode path and WebSocket inbound queue are the largest consumers. Runtime idle heap was 62,188 B after BLE was made lazy (v3.95) — before that, the BLE stack alone took ~71 KB and left ~1 KB, so no command could be parsed. Check `stack_hwm` and `heap_free` in the `status` response before extending the decode path.
 
 ## Development notes
 

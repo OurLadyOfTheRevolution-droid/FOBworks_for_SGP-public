@@ -53,8 +53,9 @@ if [ -d "$HERE/docs" ]; then
   mkdir -p "$OUT/docs"
   cp -R "$HERE/docs/." "$OUT/docs/"
 fi
-for f in PROMO.md README.md CITATIONS_AND_REFERENCES.md; do
+for f in PROMO.md README.md CITATIONS_AND_REFERENCES.md research/sources/captures/flipper_sd/MANIFEST.json; do
   if [ -f "$HERE/$f" ]; then
+    mkdir -p "$OUT/$(dirname "$f")"
     cp "$HERE/$f" "$OUT/$f"
   fi
 done
@@ -67,6 +68,14 @@ done
 
 rm -f "$OUT/research/sources/keeloq_mfcodes_public.txt"
 rm -f "$OUT/research/sources/corpus_regression_result.json"
+# The frame-less multi-MB bench recordings are false-positive corpora held in the
+# development tree only. The manifest lists them with shipped_in_public false, so
+# dropping the bytes keeps the published tree consistent with its own inventory.
+# Named explicitly: RAW-20260926-211319.sub is a small STRONG-repeat fixture that
+# does ship, and a RAW-2026* glob would take it too.
+for f in RAW-20260927-091503.sub RAW-20260930-111914.sub RAW-20261005-100939.sub; do
+  rm -f "$OUT/research/sources/captures/flipper_sd/$f"
+done
 
 # Published .gitignore and the mask helper. Prefer the tracked copies on this
 # branch; fall back to the publish branch when an older ref is staged.

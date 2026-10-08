@@ -106,7 +106,7 @@ for site, marker in (
     assert marker in src, f"{site} still selects the async path from a bare toggle (finding 2)"
 
 # The FIFO path must remain the default in both.
-assert "bool ok=replayViaFifo(mhz,data,len,startHigh,reps);" in src, \
+assert "bool ok=replayViaFifo(mhz,data,len,startHigh,reps,snapGrid);" in src, \
     "the packet-mode fallback is gone (finding 2)"
 assert "jamUseFifo" in src, "the FIFO jam path is gone (finding 2)"
 
