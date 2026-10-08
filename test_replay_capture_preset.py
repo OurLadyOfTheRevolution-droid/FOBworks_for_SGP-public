@@ -2,7 +2,7 @@
 """Guard the replay-modulation detection in tools/replay_capture.py.
 
 The tool used to force `cap_mode fsk=False` for every replay. Half the Kia/Hyundai RAW
-corpus is recorded 2-FSK , and an OOK capture path cannot slice a 2-FSK
+corpus is recorded 2-FSK, and an OOK capture path cannot slice a 2-FSK
 transmission — the envelope is constant and there are no amplitude edges to trigger on
 . Firing a 2-FSK file into an OOK capture produced a clean 0/4 that read like a
 link problem and was not one.

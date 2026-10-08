@@ -10,7 +10,7 @@ bench tools use) and sends it as the command token. It does not print it.
 
 Why the sequence matters:
   * `cap_mode` is applied FIRST. Without it the front end can be left reading ~35 dB high
-    , which makes every capture at 315 fail for the wrong reason.
+, which makes every capture at 315 fail for the wrong reason.
   * `cap_mode` must MATCH the replay file's modulation. An OOK capture path demodulating a
     2-FSK transmission sees a constant envelope with no amplitude edges to slice — the
     modulation carries its data in frequency, so the RSSI envelope is flat.

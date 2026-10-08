@@ -1107,7 +1107,7 @@
 //
 //     1. The jam was owned by the browser. Closing the tab or losing Wi-Fi
 //        mid-sequence left the carrier running with nothing to stop it — the same
-// class of failure as the reset-path jam , one layer up.
+// class of failure as the reset-path jam, one layer up.
 //     2. No deadline and no single-shot lockout. The JS re-armed itself on replay,
 //        so a duplicate tap could re-fire.
 //     3. No check that the two banked "codes" were two different codes — the defect
@@ -16171,7 +16171,7 @@ void setup(){
   // created. Measured on the bench, a 889-char line worked and 1050 was silent -- a ~1 KB
   // boundary, not the requested size -- so the return value is logged rather than assumed.
   // The SIZE ITSELF matters to the heap layout, not just to line capacity: measured
-  // on the bench , a 2560-byte queue here -- allocated before WiFi/BLE --
+  // on the bench, a 2560-byte queue here -- allocated before WiFi/BLE --
   // left the post-boot heap fragmented into slivers (free 160 B, largest chunk 76 B)
   // and every deserializeJson failed with NoMemory, while the original 8192-byte queue
   // at the same point left a workable ~6.5 KB contiguous. Keep the proven 8192 until

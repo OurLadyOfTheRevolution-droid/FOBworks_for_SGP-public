@@ -110,7 +110,7 @@ def main():
     print(out.stdout.strip())
     if "total key hits: 0" in out.stdout:
         print("\nNo dictionary key reproduces the hop. The keyed structure remains the")
-        print("standing hypothesis for Renault V1 , but this fob's key is")
+        print("standing hypothesis for Renault V1, but this fob's key is")
         print("private — as expected for a 2011 vehicle — so recovery needs extraction")
         print("(side-channel) or a different attack, not a wider search.")
     return 0

@@ -115,7 +115,7 @@ The evidence points at the AGC/FREND state rather than the PLL or the frequency 
 
 **This is inference, not measurement.** What is measured is that the rail cycle creates it and the
 modem writes remove it. The register-level mechanism is the most consistent reading of the
-induce/clear pair and , and it is recorded as that.
+induce/clear pair, and it is recorded as that.
 
 ## 5. Correction to 57
 

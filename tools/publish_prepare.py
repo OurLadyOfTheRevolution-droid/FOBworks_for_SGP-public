@@ -504,6 +504,17 @@ _TIDY = [
     (re.compile(r"([,;])[ \t]*(?=[,;])"), r"\1"),   # ", ," -> ","
     (re.compile(r",[ \t]*\)"), ")"),              # "(v3.95,)" -> "(v3.95)"
     (re.compile(r"[ \t]+([:;])"), r"\1"),         # "closure :" -> "closure:"
+    # A reference that sat between a conjunction and the comma that followed it leaves
+    # the conjunction stranded: "A and (research/11), and B" collapses to a bare "and"
+    # dangling against the comma. Drop that stranded "and" so the punctuation reads as a
+    # single comma. Placed before the generic space-before-comma rule below so the pair
+    # collapses in one pass.
+    (re.compile(r"[ \t]+and[ \t]*,([ \t]+and\b)"), r",\1"),
+    # A space left before a comma once a parenthetical came out: "pair and (research/48),
+    # and it" reached the reader with a gap between the word and its comma. A comma binds
+    # tight on its left, so the space goes; the preceding word is untouched, which is why
+    # the run-collapse rule further down cannot be used for this.
+    (re.compile(r"[ \t]+,"), ","),
     # Stranded connective after a clause was removed: "...establish that, and"
     (re.compile(r",[ \t]+and[ \t]*$"), "."),
     (re.compile(r"[ \t]+and[ \t]*$"), ""),

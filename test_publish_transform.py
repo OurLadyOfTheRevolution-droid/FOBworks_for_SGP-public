@@ -130,6 +130,34 @@ def main():
         check(f"tidy preserves: {why}", pp._tidy(src) == src,
               f"{src!r} -> {pp._tidy(src)!r}")
 
+    print("\n=== the tidy rule closes a gap left before a comma (the scrub artifact) ===")
+    # Removing a parenthetical or a bracketed citation that sat left of a comma leaves a
+    # space before it, which reached the reader as a word followed by a floating comma and,
+    # where a conjunction preceded the removed clause, as a stranded conjunction against
+    # the comma. Both are now closed. The `\x20` is written as an escape on purpose: this
+    # file must not itself contain the space-before-comma pattern it guards against, or the
+    # artifact scan flags the guard. The before-strings stand in for the transform's output.
+    for src, want, why in [
+        ("induce/clear pair and\x20, and it is recorded",
+         "induce/clear pair, and it is recorded", "space before the comma goes"),
+        ("the jam\x20, one layer up",
+         "the jam, one layer up", "trailing space before a comma goes"),
+        ("carry A and\x20, and B",
+         "carry A, and B", "a stranded conjunction is dropped"),
+    ]:
+        got = pp._tidy(src)
+        check(f"tidy closes the gap: {why}", got == want, f"{src!r} -> {got!r}")
+    # and the space-before-comma rule must not touch a comma that already binds tight, nor
+    # disturb alignment inside code (the indentation survives because no run is collapsed
+    # after a comma that has no leading space).
+    for src, why in [
+        ("x, y = 1, 2", "a tight comma in code"),
+        ("assert a, b", "an assertion message"),
+        ("    if x, then", "leading indentation preserved"),
+    ]:
+        check(f"tidy preserves: {why}", pp._tidy(src) == src,
+              f"{src!r} -> {pp._tidy(src)!r}")
+
     print("\n=== no published suite can assert on a worklog without being gated ===")
     # Every test file that carries a "research/NN present" assertion gets the
     # skip-gate treatment. If a file is missed, its check line is scrubbed as prose
